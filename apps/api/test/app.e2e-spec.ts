@@ -114,6 +114,13 @@ describe('AppController (e2e)', () => {
       .expect('Moeen API is running');
   });
 
+  it('GET /health returns an unauthenticated ok status', () => {
+    return request(app.getHttpServer())
+      .get('/health')
+      .expect(200)
+      .expect({ status: 'ok' });
+  });
+
   it('sets baseline security and non-cache headers on API responses', () => {
     return request(app.getHttpServer())
       .get('/')

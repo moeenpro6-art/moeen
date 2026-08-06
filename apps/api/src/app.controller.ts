@@ -46,6 +46,11 @@ export class AppController {
     return this.appService.getHello();
   }
 
+  @Get('health')
+  getHealth(): { status: string } {
+    return { status: 'ok' };
+  }
+
   @Get('services')
   getLaunchServices(): LaunchService[] {
     return this.appService.getLaunchServices();

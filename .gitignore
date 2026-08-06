@@ -17,3 +17,12 @@ build/
 *.tmp
 *.tmp.*
 .hermes-tmp.*
+
+# Secrets, credentials, logs, and data dumps (defense in depth)
+*.pem
+*.key
+*.p12
+*.jks
+*.log
+*.sql
+uploads/
