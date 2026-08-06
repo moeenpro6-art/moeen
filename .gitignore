@@ -12,9 +12,8 @@ build/
 .vscode/
 *.iml
 
-# Local tooling artifacts and screenshots (not part of the product)
+# Local tooling artifacts (not part of the product)
 .hermes/
-*.png
 *.tmp
 *.tmp.*
 .hermes-tmp.*
