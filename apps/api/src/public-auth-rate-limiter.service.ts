@@ -1,10 +1,15 @@
 import { createHash } from 'node:crypto';
-import { HttpException, HttpStatus, Inject, Injectable, Optional } from '@nestjs/common';
+import {
+  HttpException,
+  HttpStatus,
+  Inject,
+  Injectable,
+  Optional,
+} from '@nestjs/common';
 import { StaffAuthRepository } from './staff-auth.repository';
 
 export type PublicAuthAttemptScope =
-  | 'customer_otp_request'
-  | 'customer_otp_verification';
+  'customer_otp_request' | 'customer_otp_verification';
 
 export interface PublicAuthAttemptStore {
   reservePublicAuthAttempt(

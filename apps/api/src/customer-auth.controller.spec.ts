@@ -26,7 +26,7 @@ describe('AppController customer OTP integration', () => {
       {} as StaffAuthService,
       {} as StaffAuditService,
       customerAuthService as unknown as CustomerAuthService,
-      undefined as never,
+      undefined,
       publicAuthRateLimiter as never,
     );
 

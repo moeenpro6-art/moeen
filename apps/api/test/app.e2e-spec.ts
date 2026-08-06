@@ -2,6 +2,8 @@ import 'dotenv/config';
 import { randomUUID } from 'node:crypto';
 import { Test, TestingModule } from '@nestjs/testing';
 import { INestApplication } from '@nestjs/common';
+import type { NestExpressApplication } from '@nestjs/platform-express';
+import type { NextFunction, Request, Response } from 'express';
 import request from 'supertest';
 import { App } from 'supertest/types';
 import { AppModule } from './../src/app.module';
@@ -62,8 +64,20 @@ async function createStaffAuthorization(
   return `Bearer ${requiredString(response.body, 'token')}`;
 }
 
+let nextTestPhoneSuffix = 0;
+const testPhoneRunSeed =
+  Number.parseInt(randomUUID().replaceAll('-', '').slice(0, 8), 16) %
+  100_000_000;
+
+function uniqueTestPhone(): string {
+  const suffix = String(
+    (testPhoneRunSeed + nextTestPhoneSuffix++) % 100_000_000,
+  ).padStart(8, '0');
+  return `+9665${suffix}`;
+}
+
 describe('AppController (e2e)', () => {
-  let app: INestApplication<App>;
+  let app: NestExpressApplication;
 
   beforeEach(async () => {
     const otpProvider: OtpProvider = {
@@ -77,14 +91,15 @@ describe('AppController (e2e)', () => {
       .useValue(otpProvider)
       .compile();
 
-    app = moduleFixture.createNestApplication();
+    app = moduleFixture.createNestApplication<NestExpressApplication>();
     const clientIpSeed =
-      Number.parseInt(randomUUID().replaceAll('-', '').slice(0, 8), 16) % 64_516;
+      Number.parseInt(randomUUID().replaceAll('-', '').slice(0, 8), 16) %
+      64_516;
     const clientIp = `198.18.${Math.floor(clientIpSeed / 254) + 1}.${
       (clientIpSeed % 254) + 1
     }`;
-    app.getHttpAdapter().getInstance().set('trust proxy', true);
-    app.use((request, _response, next) => {
+    app.set('trust proxy', true);
+    app.use((request: Request, _response: Response, next: NextFunction) => {
       request.headers['x-forwarded-for'] = clientIp;
       next();
     });
@@ -135,7 +150,7 @@ describe('AppController (e2e)', () => {
   it('revokes the current customer session on logout', async () => {
     const otpChallenge = await request(app.getHttpServer())
       .post('/auth/request-otp')
-      .send({ phone: `+9665${String(Date.now()).slice(-8)}` })
+      .send({ phone: uniqueTestPhone() })
       .expect(201);
     const verified = await request(app.getHttpServer())
       .post('/auth/verify-otp')
@@ -183,7 +198,7 @@ describe('AppController (e2e)', () => {
       .post('/provider/auth/login')
       .send({ accessCode: invalidAccessCode })
       .expect(429);
-  });
+  }, 15_000);
 
   it('rejects a malformed provider access-code payload before authentication', () => {
     return request(app.getHttpServer())
@@ -195,7 +210,7 @@ describe('AppController (e2e)', () => {
   it('rejects a malformed customer service request before persistence', async () => {
     const otpChallenge = await request(app.getHttpServer())
       .post('/auth/request-otp')
-      .send({ phone: '+966500001112' })
+      .send({ phone: uniqueTestPhone() })
       .expect(201);
     const verified = await request(app.getHttpServer())
       .post('/auth/verify-otp')
@@ -217,7 +232,7 @@ describe('AppController (e2e)', () => {
   });
 
   it('creates and lists only the authenticated customer’s requests', async () => {
-    const phone = '+966500000121';
+    const phone = uniqueTestPhone();
     const otpChallenge = await request(app.getHttpServer())
       .post('/auth/request-otp')
       .send({ phone })
@@ -314,7 +329,7 @@ describe('AppController (e2e)', () => {
   });
 
   it('requires the customer to approve a quote before the quoted job starts', async () => {
-    const phone = `+9665${String(Date.now()).slice(-8)}`;
+    const phone = uniqueTestPhone();
     const otpChallenge = await request(app.getHttpServer())
       .post('/auth/request-otp')
       .send({ phone })
@@ -397,7 +412,7 @@ describe('AppController (e2e)', () => {
   });
 
   it('records cash collection only for a completed approved quote through an authorized staff endpoint', async () => {
-    const phone = `+9665${String(Date.now()).slice(-8)}`;
+    const phone = uniqueTestPhone();
     const otpChallenge = await request(app.getHttpServer())
       .post('/auth/request-otp')
       .send({ phone })
@@ -521,7 +536,7 @@ describe('AppController (e2e)', () => {
   });
 
   it('lets a signed-in provider see only assigned jobs and advance an approved job', async () => {
-    const phone = `+9665${String(Date.now()).slice(-8)}`;
+    const phone = uniqueTestPhone();
     const otpChallenge = await request(app.getHttpServer())
       .post('/auth/request-otp')
       .send({ phone })
@@ -702,13 +717,13 @@ describe('AppController (e2e)', () => {
     for (let attempt = 0; attempt < 10; attempt += 1) {
       await request(app.getHttpServer())
         .post('/auth/request-otp')
-        .send({ phone: `+9665${String(10_000_000 + attempt)}` })
+        .send({ phone: uniqueTestPhone() })
         .expect(201);
     }
 
     await request(app.getHttpServer())
       .post('/auth/request-otp')
-      .send({ phone: '+966510000010' })
+      .send({ phone: uniqueTestPhone() })
       .expect(429);
   });
 

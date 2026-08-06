@@ -54,9 +54,7 @@ export class AppController {
   @Post('auth/request-otp')
   async requestOtp(@Req() request: Request, @Body() body: unknown) {
     const phone = this.requiredString(body, 'phone', 13, 13);
-    await this.publicAuthRateLimiter.reserveOtpRequest(
-      this.clientIp(request),
-    );
+    await this.publicAuthRateLimiter.reserveOtpRequest(this.clientIp(request));
     return this.customerAuthService.requestOtp(phone);
   }
 

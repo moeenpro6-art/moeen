@@ -12,9 +12,9 @@ describe('PublicAuthRateLimiter', () => {
     };
     const limiter = new PublicAuthRateLimiter(store, () => 0);
 
-    await expect(limiter.reserveOtpRequest('198.51.100.7')).rejects.toMatchObject<
-      HttpException
-    >({ status: 429 });
+    await expect(
+      limiter.reserveOtpRequest('198.51.100.7'),
+    ).rejects.toMatchObject<HttpException>({ status: 429 });
     expect(reservePublicAuthAttempt).toHaveBeenCalledWith(
       'customer_otp_request',
       expect.stringMatching(/^[a-f0-9]{64}$/),

@@ -17,12 +17,8 @@ describe('StaffAuthRepository', () => {
   });
 
   it('atomically counts public auth attempts within their fixed window', async () => {
-    const subjectHash = createHash('sha256')
-      .update(randomUUID())
-      .digest('hex');
-    const windowStartedAt = new Date(
-      Date.now() - (Date.now() % 600_000),
-    );
+    const subjectHash = createHash('sha256').update(randomUUID()).digest('hex');
+    const windowStartedAt = new Date(Date.now() - (Date.now() % 600_000));
 
     const concurrentAttemptCounts = await Promise.all(
       Array.from({ length: 10 }, () =>
