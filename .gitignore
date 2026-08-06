@@ -1,0 +1,20 @@
+node_modules/
+.next/
+dist/
+coverage/
+.env
+.env.*
+!.env.example
+.dart_tool/
+.packages
+build/
+.idea/
+.vscode/
+*.iml
+
+# Local tooling artifacts and screenshots (not part of the product)
+.hermes/
+*.png
+*.tmp
+*.tmp.*
+.hermes-tmp.*

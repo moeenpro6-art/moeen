@@ -1,0 +1,2 @@
+pilot_order_reference,request_id,received_at,service_category,coverage_zone,requested_timing,provider_reference,provider_contacted_at,provider_accepted_at,customer_updated_at,quote_required,quoted_price_sar,customer_approved_quote_at,service_started_at,service_completed_at,final_price_sar,payment_method,payment_state,physical_cash_status,payment_action_audit_at,reconciled_at,discrepancy_owner,next_action,customer_rating,complaint_or_rework,status,operations_owner,notes
+PILOT-ORDER-001,,,,,,,,,,,,,,,,,,,,,,,,,pending,,

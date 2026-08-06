@@ -1,0 +1,52 @@
+.page { min-height: 100vh; max-width: 1180px; margin: 0 auto; padding: 32px 24px 64px; }
+.header, .hero, .sectionTitle, .job { display: flex; align-items: center; justify-content: space-between; gap: 24px; }
+.header { margin-bottom: 44px; }
+.header h1 { color: #0b6e69; font-size: 32px; }
+.eyebrow { color: #66807d; font-size: 14px; margin-bottom: 6px; }
+.page button { border: 0; background: #0b6e69; color: #fff; border-radius: 10px; padding: 12px 18px; font: inherit; cursor: pointer; }
+.hero { border-radius: 20px; padding: 34px; color: #fff; background: linear-gradient(135deg, #0b6e69, #17413e); }
+.hero h2 { font-size: clamp(27px, 5vw, 44px); max-width: 540px; }
+.hero > p { max-width: 310px; color: #d9f0ed; line-height: 1.7; }
+.accessError { margin: 0; padding: 10px 12px; border-radius: 9px; background: #7f1d1d; color: #fff !important; }
+.metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin: 28px 0 46px; }
+.metrics article { border: 1px solid #dce8e5; border-radius: 16px; padding: 20px; background: #fff; }
+.metrics span { display: block; color: #66807d; margin-bottom: 10px; }
+.metrics strong { font-size: 30px; color: #17312e; }
+.sectionTitle { margin-bottom: 16px; }
+.sectionTitle h2 { color: #17312e; }
+.secondary { color: #0b6e69; background: #e5f3f1; }
+.table { border: 1px solid #dce8e5; border-radius: 16px; overflow: hidden; background: #fff; }
+.job { padding: 20px; border-bottom: 1px solid #edf2f1; }
+.job:last-child { border-bottom: 0; }
+.job div { display: grid; gap: 4px; }
+.jobId, .job > span { color: #66807d; font-size: 14px; }
+.status { color: #0b6e69 !important; border-radius: 999px; background: #e5f3f1; padding: 7px 11px; }
+.liveIndicator { color: #0b6e69; border-radius: 999px; background: #e5f3f1; padding: 9px 12px; font-size: 14px; font-weight: 700; }
+.assignment { display: flex; gap: 8px; align-items: center; }
+.assignment select, .assignment input { border: 1px solid #cddbd8; border-radius: 9px; background: #fff; color: #17312e; padding: 9px; font: inherit; }
+.accessCodeHint { margin: 0; color: #66807d; font-size: 12px; line-height: 1.5; }
+.assignment button { padding: 9px 12px; white-space: nowrap; }
+.empty { padding: 36px 20px; color: #66807d; text-align: center; }
+.history { min-width: 190px; color: #17312e; }
+.history summary { color: #0b6e69; cursor: pointer; font-size: 14px; font-weight: 700; }
+.history ol { display: grid; gap: 8px; margin: 12px 0 0; padding: 0 18px 0 0; }
+.history li { display: grid; gap: 3px; color: #17312e; font-size: 13px; }
+.history time { color: #66807d; font-size: 12px; }
+.quote { min-width: 220px; padding: 12px; border: 1px solid #cfe6e2; border-radius: 12px; background: #f3fbfa; }
+.quote strong { color: #17312e; }
+.quote span { color: #506764; font-size: 13px; }
+.quotePending { color: #9a6700 !important; font-weight: 700; }
+.quoteApproved { color: #0b6e69 !important; font-weight: 700; }
+.quoteRejected { color: #b42318 !important; font-weight: 700; }
+.payment { min-width: 220px; padding: 12px; border: 1px solid #e6d5a8; border-radius: 12px; background: #fffaf0; }
+.payment strong { color: #17312e; }
+.payment span { display: block; margin-top: 4px; font-size: 13px; }
+.paymentDue { color: #9a6700 !important; font-weight: 700; }
+.paymentCollected { color: #0b6e69 !important; font-weight: 700; }
+.paymentRefunded { color: #4b5563 !important; font-weight: 700; }
+.paymentHint { margin: 8px 0 0; color: #506764; font-size: 12px; line-height: 1.5; }
+.payment .assignment { margin-top: 10px; }
+.quoteForm { display: grid; grid-template-columns: minmax(125px, 0.55fr) minmax(180px, 1fr) auto; gap: 8px; align-items: center; min-width: 360px; }
+.quoteForm input { min-width: 0; border: 1px solid #cddbd8; border-radius: 9px; background: #fff; color: #17312e; padding: 9px; font: inherit; }
+.quoteForm button { padding: 9px 12px; white-space: nowrap; }
+@media (max-width: 700px) { .page { padding: 20px 16px 40px; } .hero, .header, .sectionTitle, .job { align-items: flex-start; flex-direction: column; } .metrics { grid-template-columns: repeat(2, 1fr); } .hero { padding: 26px; } .quoteForm { width: 100%; min-width: 0; grid-template-columns: 1fr; } .quote { width: 100%; } }

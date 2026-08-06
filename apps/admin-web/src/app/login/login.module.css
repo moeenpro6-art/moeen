@@ -1,0 +1,83 @@
+.page {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: radial-gradient(circle at top, #18425f 0, #0c1c2a 48%, #07121d 100%);
+  color: #f8fafc;
+}
+
+.card {
+  width: min(100%, 430px);
+  padding: 34px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 20px;
+  background: rgba(11, 31, 46, 0.92);
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.32);
+}
+
+.eyebrow {
+  margin: 0 0 10px;
+  color: #7dd3fc;
+  font-size: 0.85rem;
+  font-weight: 700;
+}
+
+.card h1 {
+  margin: 0;
+  font-size: 2.2rem;
+}
+
+.subtitle {
+  margin: 10px 0 24px;
+  color: #cbd5e1;
+}
+
+.error {
+  margin: 0 0 18px;
+  padding: 12px;
+  border-radius: 10px;
+  background: rgba(220, 38, 38, 0.18);
+  color: #fecaca;
+  font-size: 0.92rem;
+}
+
+.form {
+  display: grid;
+  gap: 16px;
+}
+
+.form label {
+  display: grid;
+  gap: 8px;
+  color: #e2e8f0;
+  font-weight: 600;
+}
+
+.form input {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 46px;
+  padding: 10px 12px;
+  border: 1px solid #4b6578;
+  border-radius: 10px;
+  background: #fff;
+  color: #172033;
+  font: inherit;
+}
+
+.form button {
+  min-height: 48px;
+  margin-top: 6px;
+  border: 0;
+  border-radius: 10px;
+  background: #18a99a;
+  color: #042a2e;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 800;
+}
+
+.form button:hover {
+  background: #5eead4;
+}
