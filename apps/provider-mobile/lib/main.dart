@@ -31,6 +31,10 @@ class ProviderApiException implements Exception {
   const ProviderApiException();
 }
 
+class ProviderUnauthorizedException implements Exception {
+  const ProviderUnauthorizedException();
+}
+
 class ProviderApiConfig {
   const ProviderApiConfig(this.baseUrl);
 
@@ -164,12 +168,14 @@ String providerActionLabel(ProviderJob job) {
 }
 
 class ProviderApi {
-  ProviderApi({http.Client? client}) : _client = client ?? http.Client();
+  ProviderApi({http.Client? client, String? baseUrl})
+      : _client = client ?? http.Client(),
+        _config = ProviderApiConfig(baseUrl ?? _defaultBaseUrl);
+
+  static const _defaultBaseUrl = String.fromEnvironment('MOEEN_API_BASE_URL');
 
   final http.Client _client;
-  static const _config = ProviderApiConfig(
-    String.fromEnvironment('MOEEN_API_BASE_URL'),
-  );
+  final ProviderApiConfig _config;
 
   Future<ProviderLoginResult> login(String accessCode) async {
     final response = await _client.post(
@@ -199,6 +205,9 @@ class ProviderApi {
       _config.endpoint('/provider/service-requests'),
       headers: _authorization(token),
     );
+    if (response.statusCode == 401) {
+      throw const ProviderUnauthorizedException();
+    }
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw const ProviderApiException();
     }
@@ -251,6 +260,9 @@ class ProviderApi {
   };
 
   Map<String, dynamic> _responseObject(http.Response response) {
+    if (response.statusCode == 401) {
+      throw const ProviderUnauthorizedException();
+    }
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw const ProviderApiException();
     }
@@ -328,15 +340,20 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
       }
       await _loadDashboard(token);
     } catch (_) {
-      await widget._sessionStore.clearToken();
-      if (mounted) {
-        setState(() {
-          _token = null;
-          _provider = null;
-          _jobs = const [];
-          _loading = false;
-        });
-      }
+      await _expireSession();
+    }
+  }
+
+  Future<void> _expireSession() async {
+    await widget._sessionStore.clearToken();
+    if (mounted) {
+      setState(() {
+        _token = null;
+        _provider = null;
+        _jobs = const [];
+        _loading = false;
+        _error = null;
+      });
     }
   }
 
@@ -373,6 +390,10 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
       if (mounted) {
         setState(() => _error = 'لم يتم ضبط رابط النظام لهذا الإصدار.');
       }
+    } on ProviderUnauthorizedException {
+      if (mounted) {
+        setState(() => _error = 'رمز الوصول غير صحيح أو الحساب غير معتمد.');
+      }
     } on ProviderApiException {
       if (mounted) {
         setState(() => _error = 'رمز الوصول غير صحيح أو الحساب غير معتمد.');
@@ -394,6 +415,8 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
     setState(() => _submitting = true);
     try {
       await _loadDashboard(token);
+    } on ProviderUnauthorizedException {
+      await _expireSession();
     } catch (_) {
       if (mounted) setState(() => _error = 'تعذر تحديث الطلبات.');
     } finally {
@@ -408,6 +431,8 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
     try {
       final provider = await widget._api.updateAvailability(token, available);
       if (mounted) setState(() => _provider = provider);
+    } on ProviderUnauthorizedException {
+      await _expireSession();
     } catch (_) {
       if (mounted) setState(() => _error = 'تعذر تحديث حالة التوفر.');
     } finally {
@@ -423,6 +448,8 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
     try {
       await widget._api.updateJobStatus(token, job.id, status);
       await _loadDashboard(token);
+    } on ProviderUnauthorizedException {
+      await _expireSession();
     } on ProviderApiException {
       if (mounted) {
         setState(
