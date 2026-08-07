@@ -3,6 +3,8 @@ import type { AppService } from './app.service';
 import type { StaffAuditService } from './staff-audit.service';
 import type { StaffAuthService } from './staff-auth.service';
 import type { CustomerAuthService } from './customer-auth.service';
+import type { ProviderAuthService } from './provider-auth.service';
+import { ProviderUnavailableForApprovalError } from './service-request.repository';
 
 const actor = {
   id: 'STF-1001',
@@ -423,5 +425,154 @@ describe('AppController staff audit integration', () => {
       oldState: { status: 'assigned' },
       newState: { status: 'on_the_way' },
     });
+  });
+
+  it('rejects invalid provider invitation input before the store and records the audit trail', async () => {
+    const appService = { inviteProvidersToRequest: jest.fn() };
+    const staffAuthService = {
+      getCurrentStaff: jest.fn().mockResolvedValue(actor),
+    };
+    const auditService = { record: jest.fn().mockResolvedValue(undefined) };
+    const controller = new AppController(
+      appService as unknown as AppService,
+      staffAuthService as unknown as StaffAuthService,
+      auditService as unknown as StaffAuditService,
+      {} as CustomerAuthService,
+    );
+    const inviteController = controller as unknown as {
+      inviteProviders: (
+        authorization: string,
+        requestId: string,
+        body: unknown,
+      ) => Promise<unknown[]>;
+    };
+
+    await expect(
+      inviteController.inviteProviders('Bearer staff-session', 'MOE-1048', {
+        providerIds: [],
+      }),
+    ).rejects.toThrow('providerIds must not be empty');
+    await expect(
+      inviteController.inviteProviders('Bearer staff-session', 'MOE-1048', {
+        providerIds: 'provider-1',
+      }),
+    ).rejects.toThrow('providerIds must be an array of strings');
+    expect(appService.inviteProvidersToRequest).not.toHaveBeenCalled();
+  });
+
+  it('records a provider invitation in the staff audit trail', async () => {
+    const opportunity = {
+      requestId: 'MOE-1048',
+      serviceId: 'ac-cleaning',
+      timing: 'as-soon-as-possible' as const,
+      opportunityStatus: 'invited' as const,
+    };
+    const appService = {
+      inviteProvidersToRequest: jest.fn().mockResolvedValue([opportunity]),
+    };
+    const staffAuthService = {
+      getCurrentStaff: jest.fn().mockResolvedValue(actor),
+    };
+    const auditService = { record: jest.fn().mockResolvedValue(undefined) };
+    const controller = new AppController(
+      appService as unknown as AppService,
+      staffAuthService as unknown as StaffAuthService,
+      auditService as unknown as StaffAuditService,
+      {} as CustomerAuthService,
+    );
+    const inviteController = controller as unknown as {
+      inviteProviders: (
+        authorization: string,
+        requestId: string,
+        body: { providerIds: string[] },
+      ) => Promise<unknown[]>;
+    };
+
+    await expect(
+      inviteController.inviteProviders('Bearer staff-session', 'MOE-1048', {
+        providerIds: ['provider-1', 'provider-1'],
+      }),
+    ).resolves.toEqual([opportunity]);
+    expect(appService.inviteProvidersToRequest).toHaveBeenCalledWith(
+      'MOE-1048',
+      ['provider-1', 'provider-1'],
+    );
+    expect(auditService.record).toHaveBeenCalledWith(
+      actor,
+      expect.objectContaining({
+        action: 'request.opportunities_invited',
+        subjectId: 'MOE-1048',
+      }),
+    );
+  });
+
+  it('returns a generic 404 for every provider quote withdrawal failure', async () => {
+    const appService = {
+      withdrawProviderQuote: jest
+        .fn()
+        .mockRejectedValue(new Error('Pending provider quote not found')),
+    };
+    const providerAuthService = {
+      getCurrentProvider: jest
+        .fn()
+        .mockResolvedValue({ id: 'provider-1', name: 'مقدم' }),
+    };
+    const controller = new AppController(
+      appService as unknown as AppService,
+      {} as StaffAuthService,
+      {} as StaffAuditService,
+      {} as CustomerAuthService,
+      providerAuthService as unknown as ProviderAuthService,
+    );
+    const withdrawController = controller as unknown as {
+      withdrawMyProviderQuote: (
+        authorization: string,
+        quoteId: string,
+      ) => Promise<unknown>;
+    };
+
+    await expect(
+      withdrawController.withdrawMyProviderQuote(
+        'Bearer provider-session',
+        'QTE-7',
+      ),
+    ).rejects.toThrow('Quote is not available for withdrawal');
+    expect(appService.withdrawProviderQuote).toHaveBeenCalledWith(
+      'provider-1',
+      'QTE-7',
+    );
+  });
+
+  it('maps an unavailable winning provider to a customer-safe 409 on decision', async () => {
+    const appService = {
+      decideMyQuote: jest
+        .fn()
+        .mockRejectedValue(new ProviderUnavailableForApprovalError()),
+    };
+    const controller = new AppController(
+      appService as unknown as AppService,
+      {} as StaffAuthService,
+      {} as StaffAuditService,
+      {} as CustomerAuthService,
+    );
+    const decisionController = controller as unknown as {
+      decideMyQuote: (
+        authorization: string,
+        requestId: string,
+        quoteId: string,
+        body: { decision: 'approved' | 'rejected' },
+      ) => Promise<unknown>;
+    };
+
+    await expect(
+      decisionController.decideMyQuote(
+        'Bearer customer-session',
+        'MOE-1048',
+        'QTE-7',
+        { decision: 'approved' },
+      ),
+    ).rejects.toThrow(
+      'The selected provider is not available; please choose another quote',
+    );
   });
 });

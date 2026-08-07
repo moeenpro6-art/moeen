@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import { randomUUID } from 'node:crypto';
+import { Pool } from 'pg';
 import { Test, TestingModule } from '@nestjs/testing';
 import { INestApplication } from '@nestjs/common';
 import type { NestExpressApplication } from '@nestjs/platform-express';
@@ -62,6 +63,76 @@ async function createStaffAuthorization(
     .send({ email, password })
     .expect(201);
   return `Bearer ${requiredString(response.body, 'token')}`;
+}
+
+async function createProviderAuthorization(
+  app: INestApplication<App>,
+  specialties: string[],
+): Promise<{ providerId: string; authorization: string }> {
+  const adminAuthorization = await createStaffAuthorization(app, 'admin');
+  const created = await request(app.getHttpServer())
+    .post('/providers')
+    .set('Authorization', adminAuthorization)
+    .send({
+      name: `مقدم E2E ${randomUUID().slice(0, 8)}`,
+      specialties,
+      serviceZone: 'بريدة',
+    })
+    .expect(201);
+  const providerId = requiredString(created.body, 'id');
+  await request(app.getHttpServer())
+    .patch(`/providers/${providerId}/verification`)
+    .set('Authorization', adminAuthorization)
+    .expect(200);
+  const accessCode = `provider-access-${randomUUID()}`;
+  await request(app.getHttpServer())
+    .post(`/providers/${providerId}/access-code`)
+    .set('Authorization', adminAuthorization)
+    .send({ accessCode })
+    .expect(201);
+  const login = await request(app.getHttpServer())
+    .post('/provider/auth/login')
+    .send({ accessCode })
+    .expect(201);
+  return {
+    providerId,
+    authorization: `Bearer ${requiredString(login.body, 'token')}`,
+  };
+}
+
+async function createCustomerAuthorization(
+  app: INestApplication<App>,
+): Promise<string> {
+  const phone = uniqueTestPhone();
+  const otpChallenge = await request(app.getHttpServer())
+    .post('/auth/request-otp')
+    .send({ phone })
+    .expect(201);
+  const verified = await request(app.getHttpServer())
+    .post('/auth/verify-otp')
+    .send({
+      challengeId: requiredString(otpChallenge.body, 'challengeId'),
+      otp: '123456',
+    })
+    .expect(201);
+  return `Bearer ${requiredString(verified.body, 'token')}`;
+}
+
+async function createCustomerServiceRequest(
+  app: INestApplication<App>,
+  customerAuthorization: string,
+): Promise<string> {
+  const created = await request(app.getHttpServer())
+    .post('/service-requests')
+    .set('Authorization', customerAuthorization)
+    .send({
+      serviceId: 'ac-cleaning',
+      address: 'حي الصفراء، بريدة',
+      details: 'معلومات حساسة للخصوصية',
+      timing: 'as-soon-as-possible',
+    })
+    .expect(201);
+  return requiredString(created.body, 'id');
 }
 
 let nextTestPhoneSuffix = 0;
@@ -205,7 +276,7 @@ describe('AppController (e2e)', () => {
       .post('/provider/auth/login')
       .send({ accessCode: invalidAccessCode })
       .expect(429);
-  }, 15_000);
+  }, 60_000);
 
   it('rejects a malformed provider access-code payload before authentication', () => {
     return request(app.getHttpServer())
@@ -738,7 +809,490 @@ describe('AppController (e2e)', () => {
     return request(app.getHttpServer()).get('/my/service-requests').expect(401);
   });
 
+  it('lets staff invite eligible providers and keeps provider opportunities privacy-safe', async () => {
+    const customerAuthorization = await createCustomerAuthorization(app);
+    const requestId = await createCustomerServiceRequest(
+      app,
+      customerAuthorization,
+    );
+    const providerA = await createProviderAuthorization(app, ['ac-cleaning']);
+    const providerB = await createProviderAuthorization(app, ['ac-cleaning']);
+    const dispatcherAuthorization = await createStaffAuthorization(
+      app,
+      'dispatcher',
+    );
+
+    await request(app.getHttpServer())
+      .post(`/service-requests/${requestId}/opportunities`)
+      .set('Authorization', dispatcherAuthorization)
+      .send({ providerIds: [providerA.providerId, providerB.providerId] })
+      .expect(201);
+
+    const supportAuthorization = await createStaffAuthorization(
+      app,
+      'support_agent',
+    );
+    await request(app.getHttpServer())
+      .post(`/service-requests/${requestId}/opportunities`)
+      .set('Authorization', supportAuthorization)
+      .send({ providerIds: [providerA.providerId] })
+      .expect(403);
+    await request(app.getHttpServer())
+      .get('/provider/opportunities')
+      .expect(401);
+
+    const opportunities = await request(app.getHttpServer())
+      .get('/provider/opportunities')
+      .set('Authorization', providerA.authorization)
+      .expect(200);
+    const body = opportunities.body as Record<string, unknown>[];
+    expect(body).toHaveLength(1);
+    expect(Object.keys(body[0]).sort()).toEqual([
+      'opportunityStatus',
+      'requestId',
+      'serviceId',
+      'timing',
+    ]);
+    const serialized = JSON.stringify(body);
+    expect(serialized).not.toContain('حي الصفراء');
+    expect(serialized).not.toContain('معلومات حساسة');
+  });
+
+  it('rejects invalid provider invitation inputs and deduplicates ids', async () => {
+    const customerAuthorization = await createCustomerAuthorization(app);
+    const requestId = await createCustomerServiceRequest(
+      app,
+      customerAuthorization,
+    );
+    const dispatcherAuthorization = await createStaffAuthorization(
+      app,
+      'dispatcher',
+    );
+    const provider = await createProviderAuthorization(app, ['ac-cleaning']);
+
+    await request(app.getHttpServer())
+      .post(`/service-requests/${requestId}/opportunities`)
+      .set('Authorization', dispatcherAuthorization)
+      .send({ providerIds: [] })
+      .expect(400);
+    await request(app.getHttpServer())
+      .post(`/service-requests/${requestId}/opportunities`)
+      .set('Authorization', dispatcherAuthorization)
+      .send({ providerIds: 'provider-1' })
+      .expect(400);
+    const invited = await request(app.getHttpServer())
+      .post(`/service-requests/${requestId}/opportunities`)
+      .set('Authorization', dispatcherAuthorization)
+      .send({ providerIds: [provider.providerId, provider.providerId] })
+      .expect(201);
+    expect(invited.body).toHaveLength(1);
+  });
+
+  it('lets an invited provider submit one quote and rejects duplicates, strangers, and malformed amounts', async () => {
+    const customerAuthorization = await createCustomerAuthorization(app);
+    const requestId = await createCustomerServiceRequest(
+      app,
+      customerAuthorization,
+    );
+    const dispatcherAuthorization = await createStaffAuthorization(
+      app,
+      'dispatcher',
+    );
+    const provider = await createProviderAuthorization(app, ['ac-cleaning']);
+    const stranger = await createProviderAuthorization(app, ['ac-cleaning']);
+    await request(app.getHttpServer())
+      .post(`/service-requests/${requestId}/opportunities`)
+      .set('Authorization', dispatcherAuthorization)
+      .send({ providerIds: [provider.providerId] })
+      .expect(201);
+
+    const quote = await request(app.getHttpServer())
+      .post(`/provider/opportunities/${requestId}/quotes`)
+      .set('Authorization', provider.authorization)
+      .send({ amountHalalas: 15000, scope: 'تنظيف شامل للمكيفات' })
+      .expect(201);
+    expect(quote.body).toEqual(
+      expect.objectContaining({
+        providerId: provider.providerId,
+        status: 'proposed',
+      }),
+    );
+
+    await request(app.getHttpServer())
+      .post(`/provider/opportunities/${requestId}/quotes`)
+      .set('Authorization', provider.authorization)
+      .send({ amountHalalas: 9000, scope: 'عرض أرخص' })
+      .expect(409);
+    await request(app.getHttpServer())
+      .post(`/provider/opportunities/${requestId}/quotes`)
+      .set('Authorization', stranger.authorization)
+      .send({ amountHalalas: 9000, scope: 'عرض غريب' })
+      .expect(409);
+    await request(app.getHttpServer())
+      .post(`/provider/opportunities/${requestId}/quotes`)
+      .set('Authorization', provider.authorization)
+      .send({ amountHalalas: -5, scope: 'تنظيف' })
+      .expect(400);
+    await request(app.getHttpServer())
+      .post(`/provider/opportunities/${requestId}/quotes`)
+      .set('Authorization', provider.authorization)
+      .send({ amountHalalas: 15000, scope: '' })
+      .expect(400);
+    await request(app.getHttpServer())
+      .post(`/provider/opportunities/${requestId}/quotes`)
+      .set('Authorization', provider.authorization)
+      .send({ amountHalalas: Number.MAX_SAFE_INTEGER + 1, scope: 'تنظيف' })
+      .expect(400);
+  });
+
+  it('withdraws only the provider own proposed quote and returns a generic 404 otherwise', async () => {
+    const customerAuthorization = await createCustomerAuthorization(app);
+    const requestId = await createCustomerServiceRequest(
+      app,
+      customerAuthorization,
+    );
+    const dispatcherAuthorization = await createStaffAuthorization(
+      app,
+      'dispatcher',
+    );
+    const providerA = await createProviderAuthorization(app, ['ac-cleaning']);
+    const providerB = await createProviderAuthorization(app, ['ac-cleaning']);
+    await request(app.getHttpServer())
+      .post(`/service-requests/${requestId}/opportunities`)
+      .set('Authorization', dispatcherAuthorization)
+      .send({ providerIds: [providerA.providerId, providerB.providerId] })
+      .expect(201);
+    const quoteA = await request(app.getHttpServer())
+      .post(`/provider/opportunities/${requestId}/quotes`)
+      .set('Authorization', providerA.authorization)
+      .send({ amountHalalas: 15000, scope: 'عرض أ' })
+      .expect(201);
+    const quoteB = await request(app.getHttpServer())
+      .post(`/provider/opportunities/${requestId}/quotes`)
+      .set('Authorization', providerB.authorization)
+      .send({ amountHalalas: 12000, scope: 'عرض ب' })
+      .expect(201);
+    const quoteAId = requiredString(quoteA.body, 'id');
+    const quoteBId = requiredString(quoteB.body, 'id');
+
+    await request(app.getHttpServer())
+      .post(`/provider/quotes/${quoteAId}/withdraw`)
+      .set('Authorization', providerA.authorization)
+      .expect(201)
+      .expect(({ body }: { body: unknown }) => {
+        expect(body).toEqual(
+          expect.objectContaining({ id: quoteAId, status: 'withdrawn' }),
+        );
+      });
+
+    await request(app.getHttpServer())
+      .post(`/provider/quotes/${quoteAId}/withdraw`)
+      .set('Authorization', providerA.authorization)
+      .expect(404)
+      .expect(({ body }: { body: unknown }) => {
+        expect(body).toEqual(
+          expect.objectContaining({
+            message: 'Quote is not available for withdrawal',
+          }),
+        );
+      });
+    await request(app.getHttpServer())
+      .post(`/provider/quotes/${quoteAId}/withdraw`)
+      .set('Authorization', providerB.authorization)
+      .expect(404);
+    await request(app.getHttpServer())
+      .post(`/provider/quotes/${quoteBId}/withdraw`)
+      .set('Authorization', providerB.authorization)
+      .expect(201);
+  });
+
+  it('lets the customer see all provider quotes and approve exactly one, closing competitors', async () => {
+    const customerAuthorization = await createCustomerAuthorization(app);
+    const requestId = await createCustomerServiceRequest(
+      app,
+      customerAuthorization,
+    );
+    const dispatcherAuthorization = await createStaffAuthorization(
+      app,
+      'dispatcher',
+    );
+    const providerA = await createProviderAuthorization(app, ['ac-cleaning']);
+    const providerB = await createProviderAuthorization(app, ['ac-cleaning']);
+    await request(app.getHttpServer())
+      .post(`/service-requests/${requestId}/opportunities`)
+      .set('Authorization', dispatcherAuthorization)
+      .send({ providerIds: [providerA.providerId, providerB.providerId] })
+      .expect(201);
+    const quoteA = await request(app.getHttpServer())
+      .post(`/provider/opportunities/${requestId}/quotes`)
+      .set('Authorization', providerA.authorization)
+      .send({ amountHalalas: 15000, scope: 'عرض الفائز' })
+      .expect(201);
+    const quoteB = await request(app.getHttpServer())
+      .post(`/provider/opportunities/${requestId}/quotes`)
+      .set('Authorization', providerB.authorization)
+      .send({ amountHalalas: 12000, scope: 'عرض الخاسر' })
+      .expect(201);
+    const quoteAId = requiredString(quoteA.body, 'id');
+    const quoteBId = requiredString(quoteB.body, 'id');
+
+    const before = await request(app.getHttpServer())
+      .get('/my/service-requests')
+      .set('Authorization', customerAuthorization)
+      .expect(200);
+    const beforeRequest = (before.body as Record<string, unknown>[]).find(
+      (item) => item.id === requestId,
+    ) as Record<string, unknown>;
+    const beforeQuotes = beforeRequest.quotes as Record<string, unknown>[];
+    expect(beforeQuotes).toHaveLength(2);
+    expect(beforeQuotes.every((quote) => quote.status === 'proposed')).toBe(
+      true,
+    );
+    expect(beforeQuotes.every((quote) => !('providerId' in quote))).toBe(true);
+    expect(beforeRequest.quote).toBeDefined();
+
+    await request(app.getHttpServer())
+      .post(`/my/service-requests/${requestId}/quotes/${quoteAId}/decision`)
+      .set('Authorization', customerAuthorization)
+      .send({ decision: 'approved' })
+      .expect(201);
+
+    const after = await request(app.getHttpServer())
+      .get('/my/service-requests')
+      .set('Authorization', customerAuthorization)
+      .expect(200);
+    const afterRequest = (after.body as Record<string, unknown>[]).find(
+      (item) => item.id === requestId,
+    ) as Record<string, unknown>;
+    expect(afterRequest.status).toBe('assigned');
+    expect((afterRequest.assignedProvider as Record<string, unknown>).id).toBe(
+      providerA.providerId,
+    );
+    const afterQuotes = afterRequest.quotes as Record<string, unknown>[];
+    expect(afterQuotes).toHaveLength(2);
+    const approvedView = afterQuotes.find(
+      (quote) => quote.id === quoteAId,
+    ) as Record<string, unknown>;
+    expect(approvedView.status).toBe('approved');
+    expect(approvedView.amountHalalas).toBe(15000);
+    const rejectedView = afterQuotes.find(
+      (quote) => quote.id === quoteBId,
+    ) as Record<string, unknown>;
+    expect(rejectedView).toEqual({ id: quoteBId, status: 'rejected' });
+    expect(afterRequest.payment).toEqual(
+      expect.objectContaining({
+        method: 'cash_on_completion',
+        status: 'cash_due',
+        amountHalalas: 15000,
+      }),
+    );
+  });
+
+  it('fails safely when the winning provider becomes unavailable before approval', async () => {
+    const customerAuthorization = await createCustomerAuthorization(app);
+    const requestId = await createCustomerServiceRequest(
+      app,
+      customerAuthorization,
+    );
+    const dispatcherAuthorization = await createStaffAuthorization(
+      app,
+      'dispatcher',
+    );
+    const provider = await createProviderAuthorization(app, ['ac-cleaning']);
+    await request(app.getHttpServer())
+      .post(`/service-requests/${requestId}/opportunities`)
+      .set('Authorization', dispatcherAuthorization)
+      .send({ providerIds: [provider.providerId] })
+      .expect(201);
+    const quote = await request(app.getHttpServer())
+      .post(`/provider/opportunities/${requestId}/quotes`)
+      .set('Authorization', provider.authorization)
+      .send({ amountHalalas: 15000, scope: 'عرض' })
+      .expect(201);
+    const quoteId = requiredString(quote.body, 'id');
+
+    const adminAuthorization = await createStaffAuthorization(app, 'admin');
+    await request(app.getHttpServer())
+      .patch(`/providers/${provider.providerId}/suspension`)
+      .set('Authorization', adminAuthorization)
+      .expect(200);
+
+    await request(app.getHttpServer())
+      .post(`/my/service-requests/${requestId}/quotes/${quoteId}/decision`)
+      .set('Authorization', customerAuthorization)
+      .send({ decision: 'approved' })
+      .expect(409);
+
+    const after = await request(app.getHttpServer())
+      .get('/my/service-requests')
+      .set('Authorization', customerAuthorization)
+      .expect(200);
+    const afterRequest = (after.body as Record<string, unknown>[]).find(
+      (item) => item.id === requestId,
+    ) as Record<string, unknown>;
+    expect(afterRequest.status).toBe('pending_dispatch');
+    expect(afterRequest.assignedProvider).toBeUndefined();
+    expect(afterRequest.payment).toBeUndefined();
+    const quotes = afterRequest.quotes as Record<string, unknown>[];
+    expect(quotes[0].status).toBe('proposed');
+  });
+
+  it('concurrent approvals of two provider quotes select exactly one winner', async () => {
+    const customerAuthorization = await createCustomerAuthorization(app);
+    const requestId = await createCustomerServiceRequest(
+      app,
+      customerAuthorization,
+    );
+    const dispatcherAuthorization = await createStaffAuthorization(
+      app,
+      'dispatcher',
+    );
+    const providerA = await createProviderAuthorization(app, ['ac-cleaning']);
+    const providerB = await createProviderAuthorization(app, ['ac-cleaning']);
+    await request(app.getHttpServer())
+      .post(`/service-requests/${requestId}/opportunities`)
+      .set('Authorization', dispatcherAuthorization)
+      .send({ providerIds: [providerA.providerId, providerB.providerId] })
+      .expect(201);
+    const quoteA = await request(app.getHttpServer())
+      .post(`/provider/opportunities/${requestId}/quotes`)
+      .set('Authorization', providerA.authorization)
+      .send({ amountHalalas: 15000, scope: 'عرض أ' })
+      .expect(201);
+    const quoteB = await request(app.getHttpServer())
+      .post(`/provider/opportunities/${requestId}/quotes`)
+      .set('Authorization', providerB.authorization)
+      .send({ amountHalalas: 12000, scope: 'عرض ب' })
+      .expect(201);
+    const quoteAId = requiredString(quoteA.body, 'id');
+    const quoteBId = requiredString(quoteB.body, 'id');
+
+    const results = await Promise.allSettled([
+      request(app.getHttpServer())
+        .post(`/my/service-requests/${requestId}/quotes/${quoteAId}/decision`)
+        .set('Authorization', customerAuthorization)
+        .send({ decision: 'approved' })
+        .expect(201),
+      request(app.getHttpServer())
+        .post(`/my/service-requests/${requestId}/quotes/${quoteBId}/decision`)
+        .set('Authorization', customerAuthorization)
+        .send({ decision: 'approved' })
+        .expect(201),
+    ]);
+    expect(
+      results.filter((result) => result.status === 'fulfilled'),
+    ).toHaveLength(1);
+    expect(
+      results.filter((result) => result.status === 'rejected'),
+    ).toHaveLength(1);
+
+    const after = await request(app.getHttpServer())
+      .get('/my/service-requests')
+      .set('Authorization', customerAuthorization)
+      .expect(200);
+    const afterRequest = (after.body as Record<string, unknown>[]).find(
+      (item) => item.id === requestId,
+    ) as Record<string, unknown>;
+    expect(afterRequest.status).toBe('assigned');
+    const afterQuotes = afterRequest.quotes as Record<string, unknown>[];
+    expect(
+      afterQuotes.find((quote) => quote.status === 'approved'),
+    ).toBeDefined();
+    expect(
+      afterQuotes.find((quote) => quote.status === 'rejected'),
+    ).toBeDefined();
+  });
+
+  it('keeps the legacy staff quote flow unchanged when no opportunities exist', async () => {
+    const customerAuthorization = await createCustomerAuthorization(app);
+    const requestId = await createCustomerServiceRequest(
+      app,
+      customerAuthorization,
+    );
+    const staffAuthorization = await createStaffAuthorization(app);
+    await request(app.getHttpServer())
+      .patch(`/service-requests/${requestId}/assignment`)
+      .set('Authorization', staffAuthorization)
+      .send({ providerId: 'provider-1' })
+      .expect(200);
+    const proposed = await request(app.getHttpServer())
+      .post(`/service-requests/${requestId}/quotes`)
+      .set('Authorization', staffAuthorization)
+      .send({ amountHalalas: 10000, scope: 'عرض الموظف التقليدي' })
+      .expect(201);
+    const quoteId = requiredString(proposed.body, 'id');
+    await request(app.getHttpServer())
+      .post(`/my/service-requests/${requestId}/quotes/${quoteId}/decision`)
+      .set('Authorization', customerAuthorization)
+      .send({ decision: 'approved' })
+      .expect(201);
+
+    const view = await request(app.getHttpServer())
+      .get('/my/service-requests')
+      .set('Authorization', customerAuthorization)
+      .expect(200);
+    const myRequest = (view.body as Record<string, unknown>[]).find(
+      (item) => item.id === requestId,
+    ) as Record<string, unknown>;
+    expect(myRequest.quote).toEqual(
+      expect.objectContaining({ id: quoteId, status: 'approved' }),
+    );
+    expect(myRequest.quotes).toEqual([]);
+    expect(myRequest.payment).toEqual(
+      expect.objectContaining({ status: 'cash_due' }),
+    );
+  });
+
   afterEach(async () => {
     await app.close();
+  });
+
+  afterAll(async () => {
+    // Remove E2E-created pilot providers (and their dependent rows) so the
+    // provider-login scrypt loop stays bounded across runs.
+    const pool = new Pool({ connectionString: process.env.TEST_DATABASE_URL });
+    try {
+      await pool.query(
+        `DELETE FROM service_payments
+         WHERE service_request_id IN (
+           SELECT id FROM service_requests WHERE assigned_provider_id LIKE 'PILOT-%'
+         )
+            OR quote_id IN (
+           SELECT id FROM service_quotes WHERE provider_id LIKE 'PILOT-%'
+         )`,
+      );
+      await pool.query(
+        `DELETE FROM service_request_events
+         WHERE service_request_id IN (
+           SELECT id FROM service_requests WHERE assigned_provider_id LIKE 'PILOT-%'
+         )`,
+      );
+      await pool.query(
+        `DELETE FROM request_provider_opportunities
+         WHERE provider_id LIKE 'PILOT-%'
+            OR service_request_id IN (
+           SELECT id FROM service_requests WHERE assigned_provider_id LIKE 'PILOT-%'
+         )`,
+      );
+      await pool.query(
+        `DELETE FROM service_quotes
+         WHERE provider_id LIKE 'PILOT-%'
+            OR service_request_id IN (
+           SELECT id FROM service_requests WHERE assigned_provider_id LIKE 'PILOT-%'
+         )`,
+      );
+      await pool.query(
+        `DELETE FROM service_requests WHERE assigned_provider_id LIKE 'PILOT-%'`,
+      );
+      await pool.query(
+        `DELETE FROM provider_sessions WHERE provider_id LIKE 'PILOT-%'`,
+      );
+      await pool.query(
+        `DELETE FROM provider_access_credentials WHERE provider_id LIKE 'PILOT-%'`,
+      );
+      await pool.query(`DELETE FROM providers WHERE id LIKE 'PILOT-%'`);
+    } finally {
+      await pool.end();
+    }
   });
 });

@@ -112,6 +112,15 @@ export type ProviderOpportunity = {
   myQuote?: ServiceQuote;
 };
 
+export type CustomerQuoteView = {
+  id: string;
+  amountHalalas?: number;
+  scope?: string;
+  status: ServiceQuoteStatus;
+  proposedAt?: string;
+  decidedAt?: string;
+};
+
 export type ServicePaymentMethod = 'cash_on_completion' | 'paymob';
 export type ServicePaymentStatus =
   | 'cash_due'
@@ -138,6 +147,7 @@ export type ServiceRequest = CreateServiceRequest & {
   status: ServiceRequestStatus;
   assignedProvider?: Provider;
   quote?: ServiceQuote;
+  quotes?: CustomerQuoteView[];
   payment?: ServicePayment;
   rating?: number;
   ratingComment?: string;
@@ -258,6 +268,10 @@ export interface ServiceRequestStore {
     quoteId: string,
     providerId: string,
   ): Promise<ServiceQuote>;
+  closeProviderOpportunity(
+    requestId: string,
+    providerId: string,
+  ): Promise<{ closed: boolean }>;
   collectCashPayment(requestId: string): Promise<ServicePayment>;
   refundCashPayment(requestId: string): Promise<ServicePayment>;
   rateRequest(
@@ -566,7 +580,7 @@ export class AppService {
   ): Promise<ServiceQuote> {
     const normalizedScope = scope.trim();
     if (
-      !Number.isInteger(amountHalalas) ||
+      !Number.isSafeInteger(amountHalalas) ||
       amountHalalas <= 0 ||
       normalizedScope.length < 3
     ) {
@@ -585,6 +599,16 @@ export class AppService {
     quoteId: string,
   ): Promise<ServiceQuote> {
     return this.serviceRequestStore.withdrawProviderQuote(quoteId, providerId);
+  }
+
+  closeProviderOpportunity(
+    requestId: string,
+    providerId: string,
+  ): Promise<{ closed: boolean }> {
+    return this.serviceRequestStore.closeProviderOpportunity(
+      requestId,
+      providerId,
+    );
   }
 
   async collectCashPayment(requestId: string): Promise<ServicePayment> {

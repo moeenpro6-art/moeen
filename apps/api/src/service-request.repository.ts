@@ -24,6 +24,7 @@ import type {
   ServicePaymentStatus,
   ServiceQuote,
   ServiceQuoteStatus,
+  CustomerQuoteView,
   ProviderOpportunity,
   ProviderOpportunityStatus,
   ServiceRequestStore,
@@ -525,7 +526,89 @@ export class ServiceRequestRepository
        ORDER BY r.id DESC`,
       [this.toCustomerDatabaseId(customerId)],
     );
-    return result.rows.map((row) => this.toServiceRequest(row));
+    const requests = result.rows.map((row) => this.toServiceRequest(row));
+    const providerQuotesByRequest = await this.fetchProviderQuotesByRequest(
+      requests.map((request) => this.toRequestDatabaseId(request.id)),
+    );
+    return requests.map((request) => {
+      const providerQuotes = providerQuotesByRequest.get(request.id) ?? [];
+      return {
+        ...request,
+        quote: this.toCustomerQuote(request.quote),
+        quotes: this.toCustomerQuoteViews(request.id, providerQuotes),
+      };
+    });
+  }
+
+  private async fetchProviderQuotesByRequest(
+    requestDatabaseIds: number[],
+  ): Promise<Map<string, ServiceQuoteRow[]>> {
+    const result = new Map<string, ServiceQuoteRow[]>();
+    if (requestDatabaseIds.length === 0) return result;
+    const rows = await this.pool.query<
+      ServiceQuoteRow & { service_request_id: string }
+    >(
+      `SELECT id, provider_id, amount_halalas, scope, status, proposed_at, decided_at,
+               service_request_id
+        FROM service_quotes
+        WHERE service_request_id = ANY($1::bigint[]) AND provider_id IS NOT NULL
+        ORDER BY id DESC`,
+      [requestDatabaseIds],
+    );
+    for (const row of rows.rows) {
+      const requestId = `MOE-${1000 + Number(row.service_request_id)}`;
+      const list = result.get(requestId) ?? [];
+      list.push(row);
+      result.set(requestId, list);
+    }
+    return result;
+  }
+
+  private toCustomerQuote(
+    quote: ServiceQuote | undefined,
+  ): ServiceQuote | undefined {
+    if (!quote) return undefined;
+    return {
+      id: quote.id,
+      amountHalalas: quote.amountHalalas,
+      scope: quote.scope,
+      status: quote.status,
+      proposedAt: quote.proposedAt,
+      decidedAt: quote.decidedAt,
+    };
+  }
+
+  private toCustomerQuoteViews(
+    requestId: string,
+    providerQuotes: ServiceQuoteRow[],
+  ): CustomerQuoteView[] {
+    const approvedQuote = providerQuotes.find(
+      (quote) => quote.status === 'approved',
+    );
+    if (approvedQuote) {
+      return providerQuotes.map((quote) =>
+        quote.id === approvedQuote.id
+          ? {
+              id: `QTE-${quote.id}`,
+              amountHalalas: quote.amount_halalas,
+              scope: quote.scope,
+              status: quote.status,
+              proposedAt: quote.proposed_at.toISOString(),
+              decidedAt: quote.decided_at?.toISOString(),
+            }
+          : { id: `QTE-${quote.id}`, status: quote.status },
+      );
+    }
+    return providerQuotes
+      .filter((quote) => quote.status === 'proposed')
+      .map((quote) => ({
+        id: `QTE-${quote.id}`,
+        amountHalalas: quote.amount_halalas,
+        scope: quote.scope,
+        status: quote.status,
+        proposedAt: quote.proposed_at.toISOString(),
+        decidedAt: quote.decided_at?.toISOString(),
+      }));
   }
 
   async findByProviderId(providerId: string): Promise<ServiceRequest[]> {
@@ -1425,6 +1508,46 @@ export class ServiceRequestRepository
       'code' in error &&
       (error as { code?: unknown }).code === '23505'
     );
+  }
+
+  async closeProviderOpportunity(
+    requestId: string,
+    providerId: string,
+  ): Promise<{ closed: boolean }> {
+    const databaseId = this.toRequestDatabaseId(requestId);
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const request = await client.query<{ status: ServiceRequest['status'] }>(
+        'SELECT status FROM service_requests WHERE id = $1 FOR UPDATE',
+        [databaseId],
+      );
+      const requestStatus = request.rows[0]?.status;
+      if (!requestStatus) throw new Error('Service request not found');
+      const updated = await client.query<{ id: string }>(
+        `UPDATE request_provider_opportunities
+         SET status = 'closed'
+         WHERE service_request_id = $1 AND provider_id = $2
+           AND status IN ('invited', 'quoted')
+         RETURNING id`,
+        [databaseId, providerId],
+      );
+      const closed = updated.rows.length > 0;
+      if (closed) {
+        await client.query(
+          `INSERT INTO service_request_events (service_request_id, type, status)
+           VALUES ($1, 'opportunity_closed', $2)`,
+          [databaseId, requestStatus],
+        );
+      }
+      await client.query('COMMIT');
+      return { closed };
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   async collectCashPayment(requestId: string): Promise<ServicePayment> {

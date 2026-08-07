@@ -31,6 +31,54 @@ describe('ServiceRequestRepository', () => {
   });
 
   afterAll(async () => {
+    // Remove pilot providers created by these tests so the provider-login
+    // scrypt loop stays bounded across runs.
+    const cleanupPool = new Pool({
+      connectionString: resolveDatabaseConnectionString(),
+    });
+    try {
+      await cleanupPool.query(
+        `DELETE FROM service_payments
+         WHERE service_request_id IN (
+           SELECT id FROM service_requests WHERE assigned_provider_id LIKE 'PILOT-%'
+         )
+            OR quote_id IN (
+           SELECT id FROM service_quotes WHERE provider_id LIKE 'PILOT-%'
+         )`,
+      );
+      await cleanupPool.query(
+        `DELETE FROM service_request_events
+         WHERE service_request_id IN (
+           SELECT id FROM service_requests WHERE assigned_provider_id LIKE 'PILOT-%'
+         )`,
+      );
+      await cleanupPool.query(
+        `DELETE FROM request_provider_opportunities
+         WHERE provider_id LIKE 'PILOT-%'
+            OR service_request_id IN (
+           SELECT id FROM service_requests WHERE assigned_provider_id LIKE 'PILOT-%'
+         )`,
+      );
+      await cleanupPool.query(
+        `DELETE FROM service_quotes
+         WHERE provider_id LIKE 'PILOT-%'
+            OR service_request_id IN (
+           SELECT id FROM service_requests WHERE assigned_provider_id LIKE 'PILOT-%'
+         )`,
+      );
+      await cleanupPool.query(
+        `DELETE FROM service_requests WHERE assigned_provider_id LIKE 'PILOT-%'`,
+      );
+      await cleanupPool.query(
+        `DELETE FROM provider_sessions WHERE provider_id LIKE 'PILOT-%'`,
+      );
+      await cleanupPool.query(
+        `DELETE FROM provider_access_credentials WHERE provider_id LIKE 'PILOT-%'`,
+      );
+      await cleanupPool.query(`DELETE FROM providers WHERE id LIKE 'PILOT-%'`);
+    } finally {
+      await cleanupPool.end();
+    }
     await Promise.all([repository.close(), staffAuthRepository.close()]);
   });
 
@@ -712,7 +760,7 @@ describe('ServiceRequestRepository', () => {
       serviceId: 'upholstery',
       status: 'pending_dispatch',
     });
-    expect(requests).toContainEqual(created);
+    expect(requests).toContainEqual({ ...created, quotes: [] });
   });
 
   async function createVerifiedProvider(specialties: string[]) {

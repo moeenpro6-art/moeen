@@ -3,6 +3,7 @@ import {
   Body,
   ConflictException,
   Controller,
+  Delete,
   ForbiddenException,
   Get,
   Headers,
@@ -29,6 +30,13 @@ import {
   type StaffPrincipal,
   type StaffRole,
 } from './staff-auth.service';
+import {
+  ProviderOpportunityClosedError,
+  ProviderQuoteConflictError,
+  ProviderUnavailableForApprovalError,
+  StaffQuoteInMarketplaceFlowError,
+} from './service-request.repository';
+import type { ProviderOpportunity, ServiceQuote } from './app.service';
 
 @Controller()
 export class AppController {
@@ -373,18 +381,33 @@ export class AppController {
   }
 
   @Post('my/service-requests/:id/quotes/:quoteId/decision')
-  decideMyQuote(
+  async decideMyQuote(
     @Headers('authorization') authorization: string | undefined,
     @Param('id') requestId: string,
     @Param('quoteId') quoteId: string,
     @Body() body: { decision: 'approved' | 'rejected' },
-  ): Promise<import('./app.service').ServiceQuote> {
-    return this.appService.decideMyQuote(
-      this.extractBearerToken(authorization),
-      requestId,
-      quoteId,
-      body.decision,
-    );
+  ): Promise<ServiceQuote> {
+    try {
+      return await this.appService.decideMyQuote(
+        this.extractBearerToken(authorization),
+        requestId,
+        quoteId,
+        body.decision,
+      );
+    } catch (error) {
+      if (error instanceof ProviderUnavailableForApprovalError) {
+        throw new ConflictException(
+          'The selected provider is not available; please choose another quote',
+        );
+      }
+      if (
+        error instanceof Error &&
+        error.message === 'Pending customer quote not found'
+      ) {
+        throw new ConflictException(error.message);
+      }
+      throw error;
+    }
   }
 
   @Post('my/service-requests/:id/rating')
@@ -399,6 +422,74 @@ export class AppController {
       body.rating,
       body.comment,
     );
+  }
+
+  @Get('provider/opportunities')
+  async getMyProviderOpportunities(
+    @Headers('authorization') authorization: string | undefined,
+  ): Promise<ProviderOpportunity[]> {
+    const provider = await this.providerAuthService.getCurrentProvider(
+      this.extractBearerToken(authorization),
+    );
+    return this.appService.getProviderOpportunities(provider.id);
+  }
+
+  @Post('provider/opportunities/:requestId/quotes')
+  async submitMyProviderQuote(
+    @Headers('authorization') authorization: string | undefined,
+    @Param('requestId') requestId: string,
+    @Body() body: unknown,
+  ): Promise<ServiceQuote> {
+    const provider = await this.providerAuthService.getCurrentProvider(
+      this.extractBearerToken(authorization),
+    );
+    const amountHalalas = this.requiredAmountHalalas(body);
+    const scope = this.requiredString(body, 'scope', 3, 200);
+    try {
+      return await this.appService.submitProviderQuote(
+        provider.id,
+        requestId,
+        amountHalalas,
+        scope,
+      );
+    } catch (error) {
+      if (
+        error instanceof ProviderQuoteConflictError ||
+        error instanceof ProviderOpportunityClosedError ||
+        error instanceof StaffQuoteInMarketplaceFlowError
+      ) {
+        throw new ConflictException(error.message);
+      }
+      if (
+        error instanceof Error &&
+        error.message ===
+          'Provider quotes are only accepted while the request is pending dispatch'
+      ) {
+        throw new ConflictException(error.message);
+      }
+      if (
+        error instanceof Error &&
+        error.message === 'Service request not found'
+      ) {
+        throw new NotFoundException(error.message);
+      }
+      throw error;
+    }
+  }
+
+  @Post('provider/quotes/:quoteId/withdraw')
+  async withdrawMyProviderQuote(
+    @Headers('authorization') authorization: string | undefined,
+    @Param('quoteId') quoteId: string,
+  ): Promise<ServiceQuote> {
+    const provider = await this.providerAuthService.getCurrentProvider(
+      this.extractBearerToken(authorization),
+    );
+    try {
+      return await this.appService.withdrawProviderQuote(provider.id, quoteId);
+    } catch {
+      throw new NotFoundException('Quote is not available for withdrawal');
+    }
   }
 
   @Post('my/service-requests/:id/support')
@@ -512,6 +603,55 @@ export class AppController {
       },
     });
     return quote;
+  }
+
+  @Post('service-requests/:id/opportunities')
+  async inviteProviders(
+    @Headers('authorization') authorization: string | undefined,
+    @Param('id') requestId: string,
+    @Body() body: unknown,
+  ): Promise<ProviderOpportunity[]> {
+    const actor = await this.requireStaff(authorization, [
+      'admin',
+      'dispatcher',
+    ]);
+    const providerIds = this.requiredProviderIds(body);
+    const created = await this.appService.inviteProvidersToRequest(
+      requestId,
+      providerIds,
+    );
+    await this.staffAuditService.record(actor, {
+      action: 'request.opportunities_invited',
+      subjectType: 'service_request',
+      subjectId: requestId,
+      newState: {
+        invitedProviderIds: created.map((item) => item.requestId),
+      },
+    });
+    return created;
+  }
+
+  @Delete('service-requests/:id/opportunities/:providerId')
+  async closeProviderOpportunity(
+    @Headers('authorization') authorization: string | undefined,
+    @Param('id') requestId: string,
+    @Param('providerId') providerId: string,
+  ): Promise<{ closed: boolean }> {
+    const actor = await this.requireStaff(authorization, [
+      'admin',
+      'dispatcher',
+    ]);
+    const result = await this.appService.closeProviderOpportunity(
+      requestId,
+      providerId,
+    );
+    await this.staffAuditService.record(actor, {
+      action: 'request.opportunity_closed',
+      subjectType: 'service_request',
+      subjectId: requestId,
+      newState: { providerId, closed: result.closed },
+    });
+    return result;
   }
 
   @Post('service-requests/:id/payments/cash/collect')
@@ -709,6 +849,39 @@ export class AppController {
       value.length > maximumLength
     ) {
       throw new BadRequestException(`Invalid ${field}`);
+    }
+    return value;
+  }
+
+  private requiredProviderIds(body: unknown): string[] {
+    if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+      throw new BadRequestException('Invalid providerIds');
+    }
+    const value = (body as Record<string, unknown>).providerIds;
+    if (
+      !Array.isArray(value) ||
+      value.some((item) => typeof item !== 'string')
+    ) {
+      throw new BadRequestException('providerIds must be an array of strings');
+    }
+    const trimmed = value.map((item) => (item as string).trim());
+    if (trimmed.length === 0 || trimmed.every((item) => item === '')) {
+      throw new BadRequestException('providerIds must not be empty');
+    }
+    return trimmed;
+  }
+
+  private requiredAmountHalalas(body: unknown): number {
+    if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+      throw new BadRequestException('Invalid amountHalalas');
+    }
+    const value = (body as Record<string, unknown>).amountHalalas;
+    if (
+      typeof value !== 'number' ||
+      !Number.isSafeInteger(value) ||
+      value <= 0
+    ) {
+      throw new BadRequestException('amountHalalas must be a positive integer');
     }
     return value;
   }

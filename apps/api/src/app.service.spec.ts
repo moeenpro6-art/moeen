@@ -411,6 +411,14 @@ describe('AppService', () => {
     await expect(
       submitService.submitProviderQuote('provider-1', 'MOE-1042', -5, 'x'),
     ).rejects.toThrow('Invalid quote');
+    await expect(
+      submitService.submitProviderQuote(
+        'provider-1',
+        'MOE-1042',
+        Number.MAX_SAFE_INTEGER + 1,
+        'تنظيف',
+      ),
+    ).rejects.toThrow('Invalid quote');
   });
 
   it('withdraws a provider quote through the store', async () => {
