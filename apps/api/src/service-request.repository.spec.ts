@@ -595,4 +595,496 @@ describe('ServiceRequestRepository', () => {
     });
     expect(requests).toContainEqual(created);
   });
+
+  async function createVerifiedProvider(specialties: string[]) {
+    const provider = await repository.createPilotProvider({
+      name: `مقدم اختبار ${randomUUID().slice(0, 8)}`,
+      specialties,
+      serviceZone: 'بريدة',
+    });
+    return repository.updatePilotProviderVerification(provider.id, 'verified');
+  }
+
+  async function createPendingRequest(serviceId = 'ac-cleaning') {
+    const customer = await repository.upsertCustomer(
+      `+9665${String(Math.floor(10_000_000 + Math.random() * 89_999_999))}`,
+    );
+    const request = await repository.create(
+      {
+        serviceId,
+        address: 'حي الصفراء، بريدة',
+        details: 'تفاصيل حساسة للخصوصية',
+        timing: 'as-soon-as-possible',
+      },
+      customer.id,
+    );
+    return { request, customerId: customer.id };
+  }
+
+  async function readEventTypes(requestId: string): Promise<string[]> {
+    const probe = new Pool({
+      connectionString: resolveDatabaseConnectionString(),
+    });
+    try {
+      const result = await probe.query<{ type: string }>(
+        `SELECT type FROM service_request_events
+         WHERE service_request_id = $1 ORDER BY id`,
+        [Number(requestId.replace('MOE-', '')) - 1000],
+      );
+      return result.rows.map((row) => row.type);
+    } finally {
+      await probe.end();
+    }
+  }
+
+  it('invites only eligible providers and records opportunity events', async () => {
+    const eligible = await createVerifiedProvider(['ac-cleaning']);
+    const pending = await repository.createPilotProvider({
+      name: `مقدم معلق ${randomUUID().slice(0, 8)}`,
+      specialties: ['ac-cleaning'],
+      serviceZone: 'بريدة',
+    });
+    const suspended = await repository.updatePilotProviderVerification(
+      (await createVerifiedProvider(['ac-cleaning'])).id,
+      'suspended',
+    );
+    const wrongSpecialty = await createVerifiedProvider(['plumbing']);
+    const { request } = await createPendingRequest('ac-cleaning');
+
+    const created = await repository.inviteProvidersToRequest(request.id, [
+      eligible.id,
+      pending.id,
+      suspended.id,
+      wrongSpecialty.id,
+    ]);
+
+    expect(created.map((opportunity) => opportunity.requestId)).toEqual([
+      request.id,
+    ]);
+    expect(created[0]).toMatchObject({
+      serviceId: 'ac-cleaning',
+      opportunityStatus: 'invited',
+    });
+    expect(await readEventTypes(request.id)).toContain('opportunity_invited');
+    const opportunities = await repository.listProviderOpportunities(
+      eligible.id,
+    );
+    expect(opportunities).toHaveLength(1);
+    expect(opportunities[0].requestId).toBe(request.id);
+    await expect(
+      repository.listProviderOpportunities(wrongSpecialty.id),
+    ).resolves.toEqual([]);
+  });
+
+  it('rejects invitations when an active quote exists, on completed requests, and for empty lists', async () => {
+    const staffProvider = await createVerifiedProvider(['ac-cleaning']);
+    const quoteRequest = await createPendingRequest('ac-cleaning');
+    await repository.assignProvider(quoteRequest.request.id, staffProvider.id);
+    await repository.proposeQuote(
+      quoteRequest.request.id,
+      10_000,
+      'فحص وتنظيف',
+    );
+    await expect(
+      repository.inviteProvidersToRequest(quoteRequest.request.id, [
+        staffProvider.id,
+      ]),
+    ).rejects.toThrow(
+      'An active quote exists; provider invitations are not allowed',
+    );
+
+    const completed = await createPendingRequest('ac-cleaning');
+    const mover = await createVerifiedProvider(['ac-cleaning']);
+    await repository.assignProvider(completed.request.id, mover.id);
+    await repository.updateStatus(completed.request.id, 'on_the_way');
+    await repository.updateStatus(completed.request.id, 'in_progress');
+    await repository.updateStatus(completed.request.id, 'completed');
+    await expect(
+      repository.inviteProvidersToRequest(completed.request.id, [mover.id]),
+    ).rejects.toThrow('Request is not open for provider invitations');
+
+    await expect(
+      repository.inviteProvidersToRequest(completed.request.id, []),
+    ).rejects.toThrow('Provider invitation list is empty');
+  });
+
+  it('rejects staff quote proposals while provider opportunities exist', async () => {
+    const provider = await createVerifiedProvider(['ac-cleaning']);
+    const { request } = await createPendingRequest('ac-cleaning');
+    await repository.assignProvider(request.id, provider.id);
+    await repository.inviteProvidersToRequest(request.id, [provider.id]);
+
+    await expect(
+      repository.proposeQuote(request.id, 12_000, 'عرض من الموظف'),
+    ).rejects.toThrow(
+      'Request is in the marketplace quote flow; staff quotes are not allowed',
+    );
+  });
+
+  it('lets a provider submit one quote per opportunity and rejects a duplicate with a domain error', async () => {
+    const provider = await createVerifiedProvider(['ac-cleaning']);
+    const { request } = await createPendingRequest('ac-cleaning');
+    await repository.inviteProvidersToRequest(request.id, [provider.id]);
+
+    const quote = await repository.submitProviderQuote(
+      request.id,
+      provider.id,
+      15_000,
+      'تنظيف شامل للمكيفات',
+    );
+    expect(quote).toMatchObject({
+      providerId: provider.id,
+      amountHalalas: 15_000,
+      status: 'proposed',
+    });
+    const opportunities = await repository.listProviderOpportunities(
+      provider.id,
+    );
+    expect(opportunities[0].opportunityStatus).toBe('quoted');
+    expect(opportunities[0].myQuote?.id).toBe(quote.id);
+
+    await expect(
+      repository.submitProviderQuote(
+        request.id,
+        provider.id,
+        9_000,
+        'عرض أرخص',
+      ),
+    ).rejects.toThrow('You already have an active quote for this request');
+  });
+
+  it('allows two different providers to each hold an active quote for the same request', async () => {
+    const providerA = await createVerifiedProvider(['ac-cleaning']);
+    const providerB = await createVerifiedProvider(['ac-cleaning']);
+    const { request } = await createPendingRequest('ac-cleaning');
+    await repository.inviteProvidersToRequest(request.id, [
+      providerA.id,
+      providerB.id,
+    ]);
+    await repository.submitProviderQuote(
+      request.id,
+      providerA.id,
+      15_000,
+      'عرض المكيف',
+    );
+    await repository.submitProviderQuote(
+      request.id,
+      providerB.id,
+      12_000,
+      'عرض منافس',
+    );
+    const viewA = await repository.listProviderOpportunities(providerA.id);
+    const viewB = await repository.listProviderOpportunities(providerB.id);
+    expect(viewA[0].myQuote?.amountHalalas).toBe(15_000);
+    expect(viewB[0].myQuote?.amountHalalas).toBe(12_000);
+  });
+
+  it('rejects provider quotes when the request is not pending dispatch, without an opportunity, or while a staff quote is active', async () => {
+    const provider = await createVerifiedProvider(['ac-cleaning']);
+    const assignedRequest = await createPendingRequest('ac-cleaning');
+    await repository.inviteProvidersToRequest(assignedRequest.request.id, [
+      provider.id,
+    ]);
+    await repository.assignProvider(assignedRequest.request.id, provider.id);
+    await expect(
+      repository.submitProviderQuote(
+        assignedRequest.request.id,
+        provider.id,
+        10_000,
+        'عرض',
+      ),
+    ).rejects.toThrow(
+      'Provider quotes are only accepted while the request is pending dispatch',
+    );
+
+    const stranger = await createVerifiedProvider(['ac-cleaning']);
+    const { request } = await createPendingRequest('ac-cleaning');
+    await expect(
+      repository.submitProviderQuote(request.id, stranger.id, 10_000, 'عرض'),
+    ).rejects.toThrow('Provider opportunity is not open for quoting');
+
+    const staffRequest = await createPendingRequest('ac-cleaning');
+    const probe = new Pool({
+      connectionString: resolveDatabaseConnectionString(),
+    });
+    try {
+      const requestDatabaseId =
+        Number(staffRequest.request.id.replace('MOE-', '')) - 1000;
+      await probe.query(
+        `INSERT INTO request_provider_opportunities (service_request_id, provider_id)
+         VALUES ($1, $2)`,
+        [requestDatabaseId, provider.id],
+      );
+      await probe.query(
+        `INSERT INTO service_quotes (service_request_id, amount_halalas, scope, status)
+         VALUES ($1, 9999, 'عرض موظف مباشر', 'proposed')`,
+        [requestDatabaseId],
+      );
+    } finally {
+      await probe.end();
+    }
+    await expect(
+      repository.submitProviderQuote(
+        staffRequest.request.id,
+        provider.id,
+        10_000,
+        'عرض مقدم',
+      ),
+    ).rejects.toThrow(
+      'Request is in the marketplace quote flow; staff quotes are not allowed',
+    );
+  });
+
+  it('lets a provider withdraw only their own proposed quote', async () => {
+    const providerA = await createVerifiedProvider(['ac-cleaning']);
+    const providerB = await createVerifiedProvider(['ac-cleaning']);
+    const { request } = await createPendingRequest('ac-cleaning');
+    await repository.inviteProvidersToRequest(request.id, [
+      providerA.id,
+      providerB.id,
+    ]);
+    const quoteA = await repository.submitProviderQuote(
+      request.id,
+      providerA.id,
+      15_000,
+      'عرض أ',
+    );
+    await repository.submitProviderQuote(
+      request.id,
+      providerB.id,
+      12_000,
+      'عرض ب',
+    );
+
+    await expect(
+      repository.withdrawProviderQuote(quoteA.id, providerB.id),
+    ).rejects.toThrow('Pending provider quote not found');
+
+    const withdrawn = await repository.withdrawProviderQuote(
+      quoteA.id,
+      providerA.id,
+    );
+    expect(withdrawn.status).toBe('withdrawn');
+    const opportunities = await repository.listProviderOpportunities(
+      providerA.id,
+    );
+    expect(opportunities[0].opportunityStatus).toBe('withdrawn');
+    expect(opportunities[0].myQuote?.status).toBe('withdrawn');
+
+    await expect(
+      repository.withdrawProviderQuote(quoteA.id, providerA.id),
+    ).rejects.toThrow('Pending provider quote not found');
+  });
+
+  it('approving a provider quote atomically closes competitors and opportunities, assigns the winner, and moves the request to assigned', async () => {
+    const winner = await createVerifiedProvider(['ac-cleaning']);
+    const loser = await createVerifiedProvider(['ac-cleaning']);
+    const { request, customerId } = await createPendingRequest('ac-cleaning');
+    await repository.inviteProvidersToRequest(request.id, [
+      winner.id,
+      loser.id,
+    ]);
+    const winnerQuote = await repository.submitProviderQuote(
+      request.id,
+      winner.id,
+      15_000,
+      'عرض الفائز',
+    );
+    const loserQuote = await repository.submitProviderQuote(
+      request.id,
+      loser.id,
+      12_000,
+      'عرض الخاسر',
+    );
+
+    const approved = await repository.decideQuote(
+      request.id,
+      customerId,
+      winnerQuote.id,
+      'approved',
+    );
+    expect(approved).toMatchObject({
+      id: winnerQuote.id,
+      providerId: winner.id,
+      status: 'approved',
+    });
+
+    const customerView = await repository.findByCustomerId(customerId);
+    const updated = customerView.find((item) => item.id === request.id);
+    expect(updated?.status).toBe('assigned');
+    expect(updated?.assignedProvider?.id).toBe(winner.id);
+    expect(updated?.payment).toMatchObject({
+      method: 'cash_on_completion',
+      status: 'cash_due',
+      amountHalalas: 15_000,
+    });
+
+    const loserView = await repository.listProviderOpportunities(loser.id);
+    expect(loserView[0].opportunityStatus).toBe('closed');
+    expect(loserView[0].myQuote?.id).toBe(loserQuote.id);
+    expect(loserView[0].myQuote?.status).toBe('rejected');
+
+    const events = await readEventTypes(request.id);
+    expect(events).toContain('quote_approved');
+    expect(events).toContain('quote_rejected');
+    expect(events).toContain('opportunity_closed');
+    expect(events).toContain('provider_assigned');
+  });
+
+  it('approval fails safely when the winning provider is not available or verified, with no state changes', async () => {
+    for (const degradedStatus of ['suspended', 'pending'] as const) {
+      const provider = await createVerifiedProvider(['ac-cleaning']);
+      const { request, customerId } = await createPendingRequest('ac-cleaning');
+      await repository.inviteProvidersToRequest(request.id, [provider.id]);
+      const quote = await repository.submitProviderQuote(
+        request.id,
+        provider.id,
+        15_000,
+        'عرض',
+      );
+      await repository.updatePilotProviderVerification(
+        provider.id,
+        degradedStatus,
+      );
+
+      await expect(
+        repository.decideQuote(request.id, customerId, quote.id, 'approved'),
+      ).rejects.toThrow(
+        'The selected provider is not available; choose another quote',
+      );
+
+      const opportunities = await repository.listProviderOpportunities(
+        provider.id,
+      );
+      expect(opportunities[0].opportunityStatus).toBe('quoted');
+      expect(opportunities[0].myQuote?.status).toBe('proposed');
+      const customerView = await repository.findByCustomerId(customerId);
+      const requestView = customerView.find((item) => item.id === request.id);
+      expect(requestView?.status).toBe('pending_dispatch');
+      expect(requestView?.assignedProvider).toBeUndefined();
+      expect(requestView?.payment).toBeUndefined();
+      const events = await readEventTypes(request.id);
+      expect(events).not.toContain('quote_approved');
+      expect(events).not.toContain('provider_assigned');
+    }
+  });
+
+  it('concurrent approvals of two provider quotes select exactly one winner', async () => {
+    const providerA = await createVerifiedProvider(['ac-cleaning']);
+    const providerB = await createVerifiedProvider(['ac-cleaning']);
+    const { request, customerId } = await createPendingRequest('ac-cleaning');
+    await repository.inviteProvidersToRequest(request.id, [
+      providerA.id,
+      providerB.id,
+    ]);
+    const quoteA = await repository.submitProviderQuote(
+      request.id,
+      providerA.id,
+      15_000,
+      'عرض أ',
+    );
+    const quoteB = await repository.submitProviderQuote(
+      request.id,
+      providerB.id,
+      12_000,
+      'عرض ب',
+    );
+
+    const results = await Promise.allSettled([
+      repository.decideQuote(request.id, customerId, quoteA.id, 'approved'),
+      repository.decideQuote(request.id, customerId, quoteB.id, 'approved'),
+    ]);
+    expect(
+      results.filter((result) => result.status === 'fulfilled'),
+    ).toHaveLength(1);
+    expect(
+      results.filter((result) => result.status === 'rejected'),
+    ).toHaveLength(1);
+
+    const customerView = await repository.findByCustomerId(customerId);
+    const requestView = customerView.find((item) => item.id === request.id);
+    const winnerId = requestView?.assignedProvider?.id;
+    expect([providerA.id, providerB.id]).toContain(winnerId);
+    const viewA = await repository.listProviderOpportunities(providerA.id);
+    const viewB = await repository.listProviderOpportunities(providerB.id);
+    const winnerView = winnerId === providerA.id ? viewA[0] : viewB[0];
+    const loserView = winnerId === providerA.id ? viewB[0] : viewA[0];
+    expect(winnerView.myQuote?.status).toBe('approved');
+    expect(loserView.myQuote?.status).toBe('rejected');
+  });
+
+  it('keeps existing staff quote records and old event rows valid after the constraint extensions', async () => {
+    const provider = await createVerifiedProvider(['ac-cleaning']);
+    const { request, customerId } = await createPendingRequest('ac-cleaning');
+    await repository.assignProvider(request.id, provider.id);
+    const staffQuote = await repository.proposeQuote(
+      request.id,
+      10_000,
+      'عرض الموظف القديم',
+    );
+    const approved = await repository.decideQuote(
+      request.id,
+      customerId,
+      staffQuote.id,
+      'approved',
+    );
+    expect(approved.status).toBe('approved');
+    const customerView = await repository.findByCustomerId(customerId);
+    expect(
+      customerView.find((item) => item.id === request.id)?.payment,
+    ).toMatchObject({ status: 'cash_due' });
+
+    const probe = new Pool({
+      connectionString: resolveDatabaseConnectionString(),
+    });
+    try {
+      const requestDatabaseId = Number(request.id.replace('MOE-', '')) - 1000;
+      await probe.query(
+        `INSERT INTO service_quotes (service_request_id, amount_halalas, scope, status)
+         VALUES ($1, 5000, 'عرض قديم مرفوض', 'rejected')`,
+        [requestDatabaseId],
+      );
+      await probe.query(
+        `INSERT INTO service_request_events (service_request_id, type, status)
+         VALUES ($1, 'quote_proposed', 'assigned')`,
+        [requestDatabaseId],
+      );
+    } finally {
+      await probe.end();
+    }
+    expect(await readEventTypes(request.id)).toContain('quote_proposed');
+  });
+
+  it('never exposes address, details, or customer data through provider opportunities', async () => {
+    const provider = await createVerifiedProvider(['ac-cleaning']);
+    const customer = await repository.upsertCustomer(
+      `+9665${String(Math.floor(10_000_000 + Math.random() * 89_999_999))}`,
+    );
+    const request = await repository.create(
+      {
+        serviceId: 'ac-cleaning',
+        address: 'شارع الأمير سلطان، حي الصفراء، بريدة — منزل خاص',
+        details: 'معلومات حساسة جدًا مع رقم جوال في الملاحظات',
+        timing: 'as-soon-as-possible',
+      },
+      customer.id,
+    );
+    await repository.inviteProvidersToRequest(request.id, [provider.id]);
+
+    const opportunities = await repository.listProviderOpportunities(
+      provider.id,
+    );
+    expect(opportunities).toHaveLength(1);
+    const opportunity = opportunities[0];
+    expect(Object.keys(opportunity).sort()).toEqual([
+      'myQuote',
+      'opportunityStatus',
+      'requestId',
+      'serviceId',
+      'timing',
+    ]);
+    const serialized = JSON.stringify(opportunity);
+    expect(serialized).not.toContain('شارع الأمير سلطان');
+    expect(serialized).not.toContain('معلومات حساسة');
+  });
 });

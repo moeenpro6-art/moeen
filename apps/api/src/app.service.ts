@@ -88,15 +88,28 @@ export type ServiceRequestEvent = {
   createdAt: string;
 };
 
-export type ServiceQuoteStatus = 'proposed' | 'approved' | 'rejected';
+export type ServiceQuoteStatus =
+  'proposed' | 'approved' | 'rejected' | 'withdrawn';
 
 export type ServiceQuote = {
   id: string;
+  providerId?: string;
   amountHalalas: number;
   scope: string;
   status: ServiceQuoteStatus;
   proposedAt: string;
   decidedAt?: string;
+};
+
+export type ProviderOpportunityStatus =
+  'invited' | 'quoted' | 'withdrawn' | 'closed';
+
+export type ProviderOpportunity = {
+  requestId: string;
+  serviceId: string;
+  timing: ServiceRequest['timing'];
+  opportunityStatus: ProviderOpportunityStatus;
+  myQuote?: ServiceQuote;
 };
 
 export type ServicePaymentMethod = 'cash_on_completion' | 'paymob';
@@ -229,6 +242,21 @@ export interface ServiceRequestStore {
     customerId: string,
     quoteId: string,
     decision: Exclude<ServiceQuoteStatus, 'proposed'>,
+  ): Promise<ServiceQuote>;
+  inviteProvidersToRequest(
+    requestId: string,
+    providerIds: string[],
+  ): Promise<ProviderOpportunity[]>;
+  listProviderOpportunities(providerId: string): Promise<ProviderOpportunity[]>;
+  submitProviderQuote(
+    requestId: string,
+    providerId: string,
+    amountHalalas: number,
+    scope: string,
+  ): Promise<ServiceQuote>;
+  withdrawProviderQuote(
+    quoteId: string,
+    providerId: string,
   ): Promise<ServiceQuote>;
   collectCashPayment(requestId: string): Promise<ServicePayment>;
   refundCashPayment(requestId: string): Promise<ServicePayment>;
@@ -495,6 +523,68 @@ export class AppService {
       amountHalalas,
       normalizedScope,
     );
+  }
+
+  async inviteProvidersToRequest(
+    requestId: string,
+    providerIds: unknown,
+  ): Promise<ProviderOpportunity[]> {
+    return this.serviceRequestStore.inviteProvidersToRequest(
+      requestId,
+      this.normalizeProviderInvitationIds(providerIds),
+    );
+  }
+
+  private normalizeProviderInvitationIds(providerIds: unknown): string[] {
+    if (!Array.isArray(providerIds)) {
+      throw new Error('Provider invitation list must be an array');
+    }
+    const normalized = providerIds.map((providerId) => {
+      if (typeof providerId !== 'string') {
+        throw new Error(
+          'Provider invitation list must contain only provider ids',
+        );
+      }
+      return providerId.trim();
+    });
+    const uniqueProviderIds = [...new Set(normalized)];
+    if (uniqueProviderIds.length === 0) {
+      throw new Error('Provider invitation list is empty');
+    }
+    return uniqueProviderIds;
+  }
+
+  getProviderOpportunities(providerId: string): Promise<ProviderOpportunity[]> {
+    return this.serviceRequestStore.listProviderOpportunities(providerId);
+  }
+
+  async submitProviderQuote(
+    providerId: string,
+    requestId: string,
+    amountHalalas: number,
+    scope: string,
+  ): Promise<ServiceQuote> {
+    const normalizedScope = scope.trim();
+    if (
+      !Number.isInteger(amountHalalas) ||
+      amountHalalas <= 0 ||
+      normalizedScope.length < 3
+    ) {
+      throw new Error('Invalid quote');
+    }
+    return this.serviceRequestStore.submitProviderQuote(
+      requestId,
+      providerId,
+      amountHalalas,
+      normalizedScope,
+    );
+  }
+
+  withdrawProviderQuote(
+    providerId: string,
+    quoteId: string,
+  ): Promise<ServiceQuote> {
+    return this.serviceRequestStore.withdrawProviderQuote(quoteId, providerId);
   }
 
   async collectCashPayment(requestId: string): Promise<ServicePayment> {

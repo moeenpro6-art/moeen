@@ -22,6 +22,8 @@ import type {
   ServicePaymentStatus,
   ServiceQuote,
   ServiceQuoteStatus,
+  ProviderOpportunity,
+  ProviderOpportunityStatus,
   ServiceRequestStore,
   SupportCategory,
   SupportTicket,
@@ -66,12 +68,39 @@ type ServiceRequestEventRow = {
 
 type ServiceQuoteRow = {
   id: string;
+  provider_id: string | null;
   amount_halalas: number;
   scope: string;
   status: ServiceQuoteStatus;
   proposed_at: Date;
   decided_at: Date | null;
 };
+
+export class ProviderQuoteConflictError extends Error {
+  constructor() {
+    super('You already have an active quote for this request');
+  }
+}
+
+export class ProviderOpportunityClosedError extends Error {
+  constructor() {
+    super('Provider opportunity is not open for quoting');
+  }
+}
+
+export class StaffQuoteInMarketplaceFlowError extends Error {
+  constructor() {
+    super(
+      'Request is in the marketplace quote flow; staff quotes are not allowed',
+    );
+  }
+}
+
+export class ProviderUnavailableForApprovalError extends Error {
+  constructor() {
+    super('The selected provider is not available; choose another quote');
+  }
+}
 
 type ServicePaymentRow = {
   id: string;
@@ -266,6 +295,76 @@ export class ServiceRequestRepository
     await this.pool.query(
       'CREATE INDEX IF NOT EXISTS service_quotes_request_latest_idx ON service_quotes (service_request_id, id DESC)',
     );
+    // Provider-owned marketplace quotes (additive; staff quotes keep provider_id NULL)
+    await this.pool.query(
+      'ALTER TABLE service_quotes ADD COLUMN IF NOT EXISTS provider_id TEXT REFERENCES providers(id)',
+    );
+    await this.pool.query(
+      'CREATE INDEX IF NOT EXISTS service_quotes_provider_idx ON service_quotes (provider_id)',
+    );
+    // Final concurrency protection: one active provider quote per provider per request
+    await this.pool.query(
+      `CREATE UNIQUE INDEX IF NOT EXISTS service_quotes_one_active_per_provider
+       ON service_quotes (service_request_id, provider_id)
+       WHERE status IN ('proposed', 'approved') AND provider_id IS NOT NULL`,
+    );
+    await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS request_provider_opportunities (
+        id BIGSERIAL PRIMARY KEY,
+        service_request_id BIGINT NOT NULL REFERENCES service_requests(id),
+        provider_id TEXT NOT NULL REFERENCES providers(id),
+        status TEXT NOT NULL DEFAULT 'invited'
+          CHECK (status IN ('invited', 'quoted', 'withdrawn', 'closed')),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (service_request_id, provider_id)
+      )
+    `);
+    await this.pool.query(
+      'CREATE INDEX IF NOT EXISTS opportunities_provider_idx ON request_provider_opportunities (provider_id, status)',
+    );
+    // Extend the quote status CHECK with 'withdrawn' (controlled, idempotent, race-safe)
+    await this.pool.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conname = 'service_quotes_status_check'
+            AND pg_get_constraintdef(oid) LIKE '%withdrawn%'
+        ) THEN
+          BEGIN
+            ALTER TABLE service_quotes
+              DROP CONSTRAINT IF EXISTS service_quotes_status_check,
+              ADD CONSTRAINT service_quotes_status_check
+                CHECK (status IN ('proposed', 'approved', 'rejected', 'withdrawn'));
+          EXCEPTION WHEN duplicate_object THEN
+            NULL;
+          END;
+        END IF;
+      END $$;
+    `);
+    // Extend the event type CHECK with distinct marketplace event types
+    await this.pool.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conname = 'service_request_events_type_check'
+            AND pg_get_constraintdef(oid) LIKE '%opportunity_closed%'
+        ) THEN
+          BEGIN
+            ALTER TABLE service_request_events
+              DROP CONSTRAINT IF EXISTS service_request_events_type_check,
+              ADD CONSTRAINT service_request_events_type_check
+                CHECK (type IN ('request_created', 'provider_assigned', 'status_updated',
+                                'quote_proposed', 'quote_approved', 'quote_rejected',
+                                'opportunity_invited', 'opportunity_closed',
+                                'provider_quote_submitted', 'provider_quote_withdrawn'));
+          EXCEPTION WHEN duplicate_object THEN
+            NULL;
+          END;
+        END IF;
+      END $$;
+    `);
     await this.pool.query(`
       CREATE TABLE IF NOT EXISTS service_payments (
         id BIGSERIAL PRIMARY KEY,
@@ -826,10 +925,19 @@ export class ServiceRequestRepository
       if (activeQuote.rows[0]) {
         throw new Error('An active quote already exists');
       }
+      const marketplaceOpportunity = await client.query<{ id: string }>(
+        `SELECT id FROM request_provider_opportunities
+         WHERE service_request_id = $1
+         LIMIT 1`,
+        [databaseId],
+      );
+      if (marketplaceOpportunity.rows[0]) {
+        throw new StaffQuoteInMarketplaceFlowError();
+      }
       const result = await client.query<ServiceQuoteRow>(
         `INSERT INTO service_quotes (service_request_id, amount_halalas, scope)
          VALUES ($1, $2, $3)
-         RETURNING id, amount_halalas, scope, status, proposed_at, decided_at`,
+         RETURNING id, provider_id, amount_halalas, scope, status, proposed_at, decided_at`,
         [databaseId, amountHalalas, scope],
       );
       const quote = result.rows[0];
@@ -863,7 +971,7 @@ export class ServiceRequestRepository
       const quote = await client.query<
         ServiceQuoteRow & { request_status: ServiceRequest['status'] }
       >(
-        `SELECT q.id, q.amount_halalas, q.scope, q.status, q.proposed_at, q.decided_at,
+        `SELECT q.id, q.provider_id, q.amount_halalas, q.scope, q.status, q.proposed_at, q.decided_at,
                 r.status AS request_status
          FROM service_quotes q
          JOIN service_requests r ON r.id = q.service_request_id
@@ -875,11 +983,31 @@ export class ServiceRequestRepository
       if (!currentQuote || currentQuote.status !== 'proposed') {
         throw new Error('Pending customer quote not found');
       }
+      if (currentQuote.provider_id) {
+        const provider = await client.query<{
+          verification_status: string;
+          available: boolean;
+        }>(
+          `SELECT verification_status, available
+           FROM providers
+           WHERE id = $1
+           FOR UPDATE`,
+          [currentQuote.provider_id],
+        );
+        const currentProvider = provider.rows[0];
+        if (
+          !currentProvider ||
+          currentProvider.verification_status !== 'verified' ||
+          !currentProvider.available
+        ) {
+          throw new ProviderUnavailableForApprovalError();
+        }
+      }
       const result = await client.query<ServiceQuoteRow>(
         `UPDATE service_quotes
          SET status = $1, decided_at = NOW()
          WHERE id = $2
-         RETURNING id, amount_halalas, scope, status, proposed_at, decided_at`,
+         RETURNING id, provider_id, amount_halalas, scope, status, proposed_at, decided_at`,
         [decision, quoteDatabaseId],
       );
       const updatedQuote = result.rows[0];
@@ -893,6 +1021,60 @@ export class ServiceRequestRepository
            ON CONFLICT (quote_id) DO NOTHING`,
           [databaseId, quoteDatabaseId, updatedQuote.amount_halalas],
         );
+        if (updatedQuote.provider_id) {
+          const closedQuotes = await client.query<{ id: string }>(
+            `UPDATE service_quotes
+             SET status = 'rejected', decided_at = NOW()
+             WHERE service_request_id = $1 AND provider_id IS NOT NULL
+               AND status = 'proposed' AND id <> $2
+             RETURNING id`,
+            [databaseId, quoteDatabaseId],
+          );
+          for (let index = 0; index < closedQuotes.rows.length; index += 1) {
+            await client.query(
+              `INSERT INTO service_request_events (service_request_id, type, status)
+               VALUES ($1, 'quote_rejected', 'assigned')`,
+              [databaseId],
+            );
+          }
+          const openOpportunities = await client.query<{ id: string }>(
+            `SELECT id FROM request_provider_opportunities
+             WHERE service_request_id = $1 AND status IN ('invited', 'quoted')`,
+            [databaseId],
+          );
+          await client.query(
+            `UPDATE request_provider_opportunities
+             SET status = 'closed'
+             WHERE service_request_id = $1 AND status IN ('invited', 'quoted')`,
+            [databaseId],
+          );
+          for (
+            let index = 0;
+            index < openOpportunities.rows.length;
+            index += 1
+          ) {
+            await client.query(
+              `INSERT INTO service_request_events (service_request_id, type, status)
+               VALUES ($1, 'opportunity_closed', 'assigned')`,
+              [databaseId],
+            );
+          }
+          await client.query(
+            `UPDATE service_requests
+             SET assigned_provider_id = $2,
+                 status = CASE
+                   WHEN status = 'pending_dispatch' THEN 'assigned'
+                   ELSE status
+                 END
+             WHERE id = $1`,
+            [databaseId, updatedQuote.provider_id],
+          );
+          await client.query(
+            `INSERT INTO service_request_events (service_request_id, type, status)
+             VALUES ($1, 'provider_assigned', 'assigned')`,
+            [databaseId],
+          );
+        }
       }
       await client.query(
         `INSERT INTO service_request_events (service_request_id, type, status)
@@ -911,6 +1093,301 @@ export class ServiceRequestRepository
     } finally {
       client.release();
     }
+  }
+
+  async inviteProvidersToRequest(
+    requestId: string,
+    providerIds: string[],
+  ): Promise<ProviderOpportunity[]> {
+    const databaseId = this.toRequestDatabaseId(requestId);
+    const uniqueProviderIds = [...new Set(providerIds)];
+    if (uniqueProviderIds.length === 0) {
+      throw new Error('Provider invitation list is empty');
+    }
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const request = await client.query<{
+        status: ServiceRequest['status'];
+        service_id: string;
+        timing: ServiceRequest['timing'];
+      }>(
+        `SELECT status, service_id, timing
+         FROM service_requests
+         WHERE id = $1
+         FOR UPDATE`,
+        [databaseId],
+      );
+      const currentRequest = request.rows[0];
+      if (
+        !currentRequest ||
+        currentRequest.status === 'completed' ||
+        currentRequest.status === 'cancelled'
+      ) {
+        throw new Error('Request is not open for provider invitations');
+      }
+      const activeQuote = await client.query<{ id: string }>(
+        `SELECT id FROM service_quotes
+         WHERE service_request_id = $1 AND status IN ('proposed', 'approved')
+         LIMIT 1`,
+        [databaseId],
+      );
+      if (activeQuote.rows[0]) {
+        throw new Error(
+          'An active quote exists; provider invitations are not allowed',
+        );
+      }
+      const eligible = await client.query<{ provider_id: string }>(
+        `SELECT p.id AS provider_id
+         FROM providers p
+         WHERE p.id = ANY($1::text[])
+           AND p.verification_status = 'verified'
+           AND p.available = TRUE
+           AND $2 = ANY(p.specialties)`,
+        [uniqueProviderIds, currentRequest.service_id],
+      );
+      const created: ProviderOpportunity[] = [];
+      for (const providerId of eligible.rows.map((row) => row.provider_id)) {
+        const inserted = await client.query<{ id: string }>(
+          `INSERT INTO request_provider_opportunities (service_request_id, provider_id)
+           VALUES ($1, $2)
+           ON CONFLICT (service_request_id, provider_id) DO NOTHING
+           RETURNING id`,
+          [databaseId, providerId],
+        );
+        if (inserted.rows[0]) {
+          await client.query(
+            `INSERT INTO service_request_events (service_request_id, type, status)
+             VALUES ($1, 'opportunity_invited', $2)`,
+            [databaseId, currentRequest.status],
+          );
+          created.push({
+            requestId,
+            serviceId: currentRequest.service_id,
+            timing: currentRequest.timing,
+            opportunityStatus: 'invited',
+          });
+        }
+      }
+      await client.query('COMMIT');
+      return created;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async listProviderOpportunities(
+    providerId: string,
+  ): Promise<ProviderOpportunity[]> {
+    const result = await this.pool.query<{
+      request_id: string;
+      service_id: string;
+      timing: ServiceRequest['timing'];
+      opportunity_status: ProviderOpportunityStatus;
+      quote_id: string | null;
+      quote_provider_id: string | null;
+      quote_amount_halalas: number | null;
+      quote_scope: string | null;
+      quote_status: ServiceQuoteStatus | null;
+      quote_proposed_at: Date | null;
+      quote_decided_at: Date | null;
+    }>(
+      `SELECT r.id AS request_id, r.service_id, r.timing,
+              o.status AS opportunity_status,
+              q.id AS quote_id, q.provider_id AS quote_provider_id,
+              q.amount_halalas AS quote_amount_halalas, q.scope AS quote_scope,
+              q.status AS quote_status, q.proposed_at AS quote_proposed_at,
+              q.decided_at AS quote_decided_at
+       FROM request_provider_opportunities o
+       JOIN service_requests r ON r.id = o.service_request_id
+       LEFT JOIN LATERAL (
+         SELECT id, provider_id, amount_halalas, scope, status, proposed_at, decided_at
+         FROM service_quotes
+         WHERE service_request_id = r.id AND provider_id = $1
+         ORDER BY id DESC
+         LIMIT 1
+       ) q ON TRUE
+       WHERE o.provider_id = $1
+       ORDER BY r.id DESC`,
+      [providerId],
+    );
+    return result.rows.map((row) => ({
+      requestId: `MOE-${1000 + Number(row.request_id)}`,
+      serviceId: row.service_id,
+      timing: row.timing,
+      opportunityStatus: row.opportunity_status,
+      myQuote: row.quote_id
+        ? {
+            id: `QTE-${row.quote_id}`,
+            providerId: row.quote_provider_id ?? undefined,
+            amountHalalas: row.quote_amount_halalas ?? 0,
+            scope: row.quote_scope ?? '',
+            status: row.quote_status ?? 'proposed',
+            proposedAt: row.quote_proposed_at?.toISOString() ?? '',
+            decidedAt: row.quote_decided_at?.toISOString(),
+          }
+        : undefined,
+    }));
+  }
+
+  async submitProviderQuote(
+    requestId: string,
+    providerId: string,
+    amountHalalas: number,
+    scope: string,
+  ): Promise<ServiceQuote> {
+    const databaseId = this.toRequestDatabaseId(requestId);
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const request = await client.query<{ status: ServiceRequest['status'] }>(
+        'SELECT status FROM service_requests WHERE id = $1 FOR UPDATE',
+        [databaseId],
+      );
+      const currentStatus = request.rows[0]?.status;
+      if (!currentStatus) throw new Error('Service request not found');
+      if (currentStatus !== 'pending_dispatch') {
+        throw new Error(
+          'Provider quotes are only accepted while the request is pending dispatch',
+        );
+      }
+      const opportunity = await client.query<{
+        status: ProviderOpportunityStatus;
+      }>(
+        `SELECT status FROM request_provider_opportunities
+         WHERE service_request_id = $1 AND provider_id = $2
+         FOR UPDATE`,
+        [databaseId, providerId],
+      );
+      const opportunityStatus = opportunity.rows[0]?.status;
+      if (
+        !opportunityStatus ||
+        !['invited', 'quoted'].includes(opportunityStatus)
+      ) {
+        throw new ProviderOpportunityClosedError();
+      }
+      const staffQuote = await client.query<{ id: string }>(
+        `SELECT id FROM service_quotes
+         WHERE service_request_id = $1 AND provider_id IS NULL
+           AND status IN ('proposed', 'approved')
+         LIMIT 1`,
+        [databaseId],
+      );
+      if (staffQuote.rows[0]) {
+        throw new StaffQuoteInMarketplaceFlowError();
+      }
+      const ownActiveQuote = await client.query<{ id: string }>(
+        `SELECT id FROM service_quotes
+         WHERE service_request_id = $1 AND provider_id = $2
+           AND status IN ('proposed', 'approved')
+         LIMIT 1`,
+        [databaseId, providerId],
+      );
+      if (ownActiveQuote.rows[0]) {
+        throw new ProviderQuoteConflictError();
+      }
+      let insertedQuote: ServiceQuoteRow;
+      try {
+        const inserted = await client.query<ServiceQuoteRow>(
+          `INSERT INTO service_quotes (service_request_id, provider_id, amount_halalas, scope)
+           VALUES ($1, $2, $3, $4)
+           RETURNING id, provider_id, amount_halalas, scope, status, proposed_at, decided_at`,
+          [databaseId, providerId, amountHalalas, scope],
+        );
+        insertedQuote = inserted.rows[0];
+      } catch (error) {
+        if (this.isUniqueViolation(error)) {
+          throw new ProviderQuoteConflictError();
+        }
+        throw error;
+      }
+      if (!insertedQuote) {
+        throw new Error('Provider quote could not be submitted');
+      }
+      await client.query(
+        `UPDATE request_provider_opportunities
+         SET status = 'quoted'
+         WHERE service_request_id = $1 AND provider_id = $2`,
+        [databaseId, providerId],
+      );
+      await client.query(
+        `INSERT INTO service_request_events (service_request_id, type, status)
+         VALUES ($1, 'provider_quote_submitted', 'pending_dispatch')`,
+        [databaseId],
+      );
+      await client.query('COMMIT');
+      return this.toServiceQuote(insertedQuote);
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async withdrawProviderQuote(
+    quoteId: string,
+    providerId: string,
+  ): Promise<ServiceQuote> {
+    const databaseId = this.toQuoteDatabaseId(quoteId);
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const quote = await client.query<
+        ServiceQuoteRow & { request_id: string }
+      >(
+        `SELECT q.id, q.provider_id, q.amount_halalas, q.scope, q.status,
+                q.proposed_at, q.decided_at, q.service_request_id AS request_id
+         FROM service_quotes q
+         WHERE q.id = $1 AND q.provider_id = $2
+         FOR UPDATE`,
+        [databaseId, providerId],
+      );
+      const currentQuote = quote.rows[0];
+      if (!currentQuote || currentQuote.status !== 'proposed') {
+        throw new Error('Pending provider quote not found');
+      }
+      const updated = await client.query<ServiceQuoteRow>(
+        `UPDATE service_quotes
+         SET status = 'withdrawn', decided_at = NOW()
+         WHERE id = $1
+         RETURNING id, provider_id, amount_halalas, scope, status, proposed_at, decided_at`,
+        [databaseId],
+      );
+      if (!updated.rows[0]) {
+        throw new Error('Provider quote could not be withdrawn');
+      }
+      await client.query(
+        `UPDATE request_provider_opportunities
+         SET status = 'withdrawn'
+         WHERE service_request_id = $1 AND provider_id = $2`,
+        [currentQuote.request_id, providerId],
+      );
+      await client.query(
+        `INSERT INTO service_request_events (service_request_id, type, status)
+         VALUES ($1, 'provider_quote_withdrawn', 'pending_dispatch')`,
+        [currentQuote.request_id],
+      );
+      await client.query('COMMIT');
+      return this.toServiceQuote(updated.rows[0]);
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  private isUniqueViolation(error: unknown): boolean {
+    return (
+      typeof error === 'object' &&
+      error !== null &&
+      'code' in error &&
+      (error as { code?: unknown }).code === '23505'
+    );
   }
 
   async collectCashPayment(requestId: string): Promise<ServicePayment> {
@@ -1301,6 +1778,7 @@ export class ServiceRequestRepository
   private toServiceQuote(row: ServiceQuoteRow): ServiceQuote {
     return {
       id: `QTE-${row.id}`,
+      providerId: row.provider_id ?? undefined,
       amountHalalas: row.amount_halalas,
       scope: row.scope,
       status: row.status,

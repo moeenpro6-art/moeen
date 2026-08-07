@@ -335,4 +335,130 @@ describe('AppService', () => {
       'الخدمة غير مرضية',
     );
   });
+
+  it('rejects empty and non-array provider invitation lists and deduplicates ids', async () => {
+    const store = {
+      inviteProvidersToRequest: jest.fn().mockResolvedValue([]),
+    };
+    const service = new AppService(store as never);
+    const inviteService = service as unknown as {
+      inviteProvidersToRequest: (
+        requestId: string,
+        providerIds: unknown,
+      ) => Promise<unknown[]>;
+    };
+
+    await expect(
+      inviteService.inviteProvidersToRequest('MOE-1042', []),
+    ).rejects.toThrow('Provider invitation list is empty');
+    await expect(
+      inviteService.inviteProvidersToRequest('MOE-1042', 'not-an-array'),
+    ).rejects.toThrow('Provider invitation list must be an array');
+    await expect(
+      inviteService.inviteProvidersToRequest('MOE-1042', ['p1', 7]),
+    ).rejects.toThrow(
+      'Provider invitation list must contain only provider ids',
+    );
+
+    await expect(
+      inviteService.inviteProvidersToRequest('MOE-1042', [
+        '  p1  ',
+        'p1',
+        'p2',
+      ]),
+    ).resolves.toEqual([]);
+    expect(store.inviteProvidersToRequest).toHaveBeenCalledWith('MOE-1042', [
+      'p1',
+      'p2',
+    ]);
+  });
+
+  it('normalizes a provider quote before it is submitted', async () => {
+    const quote = {
+      id: 'QTE-9',
+      providerId: 'provider-1',
+      amountHalalas: 15_000,
+      scope: 'تنظيف شامل',
+      status: 'proposed' as const,
+      proposedAt: '2026-08-05T01:00:00.000Z',
+    };
+    const store = { submitProviderQuote: jest.fn().mockResolvedValue(quote) };
+    const service = new AppService(store as never);
+    const submitService = service as unknown as {
+      submitProviderQuote: (
+        providerId: string,
+        requestId: string,
+        amountHalalas: number,
+        scope: string,
+      ) => Promise<typeof quote>;
+    };
+
+    await expect(
+      submitService.submitProviderQuote(
+        'provider-1',
+        'MOE-1042',
+        15_000,
+        '  تنظيف شامل  ',
+      ),
+    ).resolves.toEqual(quote);
+    expect(store.submitProviderQuote).toHaveBeenCalledWith(
+      'MOE-1042',
+      'provider-1',
+      15_000,
+      'تنظيف شامل',
+    );
+
+    await expect(
+      submitService.submitProviderQuote('provider-1', 'MOE-1042', -5, 'x'),
+    ).rejects.toThrow('Invalid quote');
+  });
+
+  it('withdraws a provider quote through the store', async () => {
+    const quote = {
+      id: 'QTE-10',
+      providerId: 'provider-1',
+      amountHalalas: 10_000,
+      scope: 'عرض',
+      status: 'withdrawn' as const,
+      proposedAt: '2026-08-05T01:00:00.000Z',
+      decidedAt: '2026-08-05T02:00:00.000Z',
+    };
+    const store = { withdrawProviderQuote: jest.fn().mockResolvedValue(quote) };
+    const service = new AppService(store as never);
+    const withdrawService = service as unknown as {
+      withdrawProviderQuote: (
+        providerId: string,
+        quoteId: string,
+      ) => Promise<typeof quote>;
+    };
+
+    await expect(
+      withdrawService.withdrawProviderQuote('provider-1', 'QTE-10'),
+    ).resolves.toEqual(quote);
+    expect(store.withdrawProviderQuote).toHaveBeenCalledWith(
+      'QTE-10',
+      'provider-1',
+    );
+  });
+
+  it('lists provider opportunities through the store', async () => {
+    const opportunity = {
+      requestId: 'MOE-1042',
+      serviceId: 'ac-cleaning',
+      timing: 'as-soon-as-possible',
+      opportunityStatus: 'invited' as const,
+    };
+    const store = {
+      listProviderOpportunities: jest.fn().mockResolvedValue([opportunity]),
+    };
+    const service = new AppService(store as never);
+    const opportunityService = service as unknown as {
+      getProviderOpportunities: (providerId: string) => Promise<unknown[]>;
+    };
+
+    await expect(
+      opportunityService.getProviderOpportunities('provider-1'),
+    ).resolves.toEqual([opportunity]);
+    expect(store.listProviderOpportunities).toHaveBeenCalledWith('provider-1');
+  });
 });
