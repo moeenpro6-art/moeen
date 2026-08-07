@@ -19,6 +19,18 @@ const _statusLabels = {
   'completed': 'مكتمل',
 };
 
+const _timingLabels = {
+  'as-soon-as-possible': 'في أقرب وقت',
+  'scheduled': 'موعد محدد',
+};
+
+const _opportunityStatusLabels = {
+  'invited': 'مدعو',
+  'quoted': 'بانتظار قرار العميل',
+  'withdrawn': 'عرضك مسحوب',
+  'closed': 'مغلقة',
+};
+
 void main() {
   runApp(MoeenProviderApp());
 }
@@ -105,6 +117,35 @@ class ProviderJob {
       timing: json['timing'] as String,
       status: json['status'] as String,
       quote: quote is Map<String, dynamic>
+          ? ProviderQuote.fromJson(quote)
+          : null,
+    );
+  }
+}
+
+class ProviderOpportunity {
+  const ProviderOpportunity({
+    required this.requestId,
+    required this.serviceId,
+    required this.timing,
+    required this.opportunityStatus,
+    this.myQuote,
+  });
+
+  final String requestId;
+  final String serviceId;
+  final String timing;
+  final String opportunityStatus;
+  final ProviderQuote? myQuote;
+
+  factory ProviderOpportunity.fromJson(Map<String, dynamic> json) {
+    final quote = json['myQuote'];
+    return ProviderOpportunity(
+      requestId: json['requestId'] as String,
+      serviceId: json['serviceId'] as String,
+      timing: json['timing'] as String,
+      opportunityStatus: json['opportunityStatus'] as String,
+      myQuote: quote is Map<String, dynamic>
           ? ProviderQuote.fromJson(quote)
           : null,
     );
@@ -219,6 +260,40 @@ class ProviderApi {
         .toList();
   }
 
+  Future<List<ProviderOpportunity>> opportunities(String token) async {
+    final response = await _client.get(
+      _config.endpoint('/provider/opportunities'),
+      headers: _authorization(token),
+    );
+    if (response.statusCode == 401) {
+      throw const ProviderUnauthorizedException();
+    }
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw const ProviderApiException();
+    }
+    final body = jsonDecode(response.body);
+    if (body is! List<dynamic>) throw const ProviderApiException();
+    return body
+        .whereType<Map<dynamic, dynamic>>()
+        .map((item) =>
+            ProviderOpportunity.fromJson(Map<String, dynamic>.from(item)))
+        .toList();
+  }
+
+  Future<ProviderQuote> submitQuote(
+    String token,
+    String requestId,
+    int amountHalalas,
+    String scope,
+  ) async {
+    final response = await _client.post(
+      _config.endpoint('/provider/opportunities/$requestId/quotes'),
+      headers: _authorization(token, json: true),
+      body: jsonEncode({'amountHalalas': amountHalalas, 'scope': scope}),
+    );
+    return ProviderQuote.fromJson(_responseObject(response));
+  }
+
   Future<ProviderJob> updateJobStatus(
     String token,
     String requestId,
@@ -315,6 +390,9 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
   String? _token;
   ProviderProfile? _provider;
   List<ProviderJob> _jobs = const [];
+  List<ProviderOpportunity> _opportunities = const [];
+  bool _opportunitiesLoading = true;
+  String? _opportunitiesError;
   bool _loading = true;
   bool _submitting = false;
   String? _error;
@@ -339,6 +417,7 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
         return;
       }
       await _loadDashboard(token);
+      await _loadOpportunities();
     } catch (_) {
       await _expireSession();
     }
@@ -351,9 +430,63 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
         _token = null;
         _provider = null;
         _jobs = const [];
+        _opportunities = const [];
+        _opportunitiesLoading = true;
+        _opportunitiesError = null;
         _loading = false;
         _error = null;
       });
+    }
+  }
+
+  Future<void> _loadOpportunities() async {
+    final token = _token;
+    if (token == null) return;
+    setState(() {
+      _opportunitiesLoading = true;
+      _opportunitiesError = null;
+    });
+    try {
+      final opportunities = await widget._api.opportunities(token);
+      if (!mounted) return;
+      setState(() {
+        _opportunities = opportunities;
+        _opportunitiesLoading = false;
+      });
+    } on ProviderUnauthorizedException {
+      await _expireSession();
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _opportunitiesLoading = false;
+        _opportunitiesError = 'تعذر تحميل الفرص. حاول مرة أخرى.';
+      });
+    }
+  }
+
+  Future<void> _openQuoteSheet(
+    BuildContext sheetContext,
+    ProviderOpportunity opportunity,
+  ) async {
+    final token = _token;
+    if (token == null) return;
+    final result = await showModalBottomSheet<Object>(
+      context: sheetContext,
+      isScrollControlled: true,
+      builder: (_) => _QuoteSheet(
+        api: widget._api,
+        token: token,
+        requestId: opportunity.requestId,
+        serviceLabel:
+            _serviceNames[opportunity.serviceId] ?? opportunity.serviceId,
+      ),
+    );
+    if (result == 'unauthorized') {
+      await _expireSession();
+      return;
+    }
+    if (result == true) {
+      await _loadOpportunities();
     }
   }
 
@@ -386,6 +519,7 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
       final login = await widget._api.login(accessCode);
       await widget._sessionStore.writeToken(login.token);
       await _loadDashboard(login.token);
+      await _loadOpportunities();
     } on ProviderApiConfigurationException {
       if (mounted) {
         setState(() => _error = 'لم يتم ضبط رابط النظام لهذا الإصدار.');
@@ -414,7 +548,10 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
     if (token == null) return;
     setState(() => _submitting = true);
     try {
-      await _loadDashboard(token);
+      await Future.wait([
+        _loadDashboard(token),
+        _loadOpportunities(),
+      ]);
     } on ProviderUnauthorizedException {
       await _expireSession();
     } catch (_) {
@@ -630,6 +767,48 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
             ],
             const SizedBox(height: 20),
             const Text(
+              'فرص العمل المتاحة',
+              style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 8),
+            if (_opportunitiesLoading && _opportunities.isEmpty)
+              const Card(
+                child: Padding(
+                  padding: EdgeInsets.all(20),
+                  child: Center(child: CircularProgressIndicator()),
+                ),
+              )
+            else if (_opportunitiesError != null)
+              Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Text(
+                        _opportunitiesError!,
+                        style: const TextStyle(color: Color(0xFFB42318)),
+                      ),
+                      const SizedBox(height: 8),
+                      OutlinedButton(
+                        onPressed: _loadOpportunities,
+                        child: const Text('إعادة المحاولة'),
+                      ),
+                    ],
+                  ),
+                ),
+              )
+            else if (_opportunities.isEmpty)
+              const Card(
+                child: Padding(
+                  padding: EdgeInsets.all(20),
+                  child: Text('لا توجد فرص متاحة حاليًا.'),
+                ),
+              )
+            else
+              ..._opportunities.map(_buildOpportunityCard),
+            const SizedBox(height: 20),
+            const Text(
               'مهامي المسندة',
               style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
             ),
@@ -643,6 +822,55 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
               )
             else
               ..._jobs.map(_buildJobCard),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildOpportunityCard(ProviderOpportunity opportunity) {
+    final serviceLabel =
+        _serviceNames[opportunity.serviceId] ?? opportunity.serviceId;
+    final timingLabel =
+        _timingLabels[opportunity.timing] ?? opportunity.timing;
+    final statusLabel = _opportunityStatusLabels[opportunity.opportunityStatus] ??
+        opportunity.opportunityStatus;
+    final quote = opportunity.myQuote;
+    return Card(
+      margin: const EdgeInsets.only(bottom: 12),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              serviceLabel,
+              style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 4),
+            Text('$timingLabel · $statusLabel'),
+            if (quote != null && opportunity.opportunityStatus == 'quoted') ...[
+              const SizedBox(height: 8),
+              Text(
+                'عرضك: ${(quote.amountHalalas / 100).toStringAsFixed(2)} ر.س — بانتظار قرار العميل',
+                style: const TextStyle(fontWeight: FontWeight.w700),
+              ),
+              Text(quote.scope),
+            ],
+            if (opportunity.opportunityStatus == 'invited') ...[
+              const SizedBox(height: 12),
+              SizedBox(
+                width: double.infinity,
+                child: Builder(
+                  builder: (buttonContext) => FilledButton(
+                    onPressed: _submitting
+                        ? null
+                        : () => _openQuoteSheet(buttonContext, opportunity),
+                    child: const Text('تقديم عرض'),
+                  ),
+                ),
+              ),
+            ],
           ],
         ),
       ),
@@ -703,6 +931,127 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
                 providerActionLabel(job),
                 style: const TextStyle(color: Color(0xFF66807D)),
               ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _QuoteSheet extends StatefulWidget {
+  const _QuoteSheet({
+    required this.api,
+    required this.token,
+    required this.requestId,
+    required this.serviceLabel,
+  });
+
+  final ProviderApi api;
+  final String token;
+  final String requestId;
+  final String serviceLabel;
+
+  @override
+  State<_QuoteSheet> createState() => _QuoteSheetState();
+}
+
+class _QuoteSheetState extends State<_QuoteSheet> {
+  final _amountController = TextEditingController();
+  final _scopeController = TextEditingController();
+  bool _submitting = false;
+  String? _error;
+
+  @override
+  void dispose() {
+    _amountController.dispose();
+    _scopeController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _submit() async {
+    final amountText = _amountController.text.trim();
+    final scope = _scopeController.text.trim();
+    final amount = double.tryParse(amountText);
+    if (amount == null || amount <= 0) {
+      setState(() => _error = 'أدخل مبلغًا صحيحًا أكبر من صفر.');
+      return;
+    }
+    if (scope.length < 3) {
+      setState(() => _error = 'أدخل وصفًا للنطاق (3 أحرف على الأقل).');
+      return;
+    }
+    final amountHalalas = (amount * 100).round();
+    setState(() {
+      _submitting = true;
+      _error = null;
+    });
+    try {
+      await widget.api.submitQuote(
+        widget.token,
+        widget.requestId,
+        amountHalalas,
+        scope,
+      );
+      if (!mounted) return;
+      Navigator.of(context).pop(true);
+    } on ProviderUnauthorizedException {
+      if (!mounted) return;
+      Navigator.of(context).pop('unauthorized');
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _error = 'تعذر إرسال العرض. حاول مرة أخرى.');
+    } finally {
+      if (mounted) setState(() => _submitting = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Directionality(
+      textDirection: TextDirection.rtl,
+      child: Padding(
+        padding: EdgeInsets.only(
+          left: 16,
+          right: 16,
+          top: 16,
+          bottom: MediaQuery.of(context).viewInsets.bottom + 16,
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(
+              'تقديم عرض — ${widget.serviceLabel}',
+              style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _amountController,
+              keyboardType: const TextInputType.numberWithOptions(
+                decimal: true,
+              ),
+              decoration: const InputDecoration(
+                labelText: 'المبلغ (ر.س)',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _scopeController,
+              decoration: const InputDecoration(
+                labelText: 'وصف النطاق (3 أحرف على الأقل)',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            if (_error != null) ...[
+              const SizedBox(height: 12),
+              Text(_error!, style: const TextStyle(color: Color(0xFFB42318))),
+            ],
+            const SizedBox(height: 16),
+            FilledButton(
+              onPressed: _submitting ? null : _submit,
+              child: Text(_submitting ? 'جارٍ الإرسال…' : 'إرسال العرض'),
+            ),
           ],
         ),
       ),
