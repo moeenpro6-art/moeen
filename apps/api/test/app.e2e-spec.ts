@@ -1055,7 +1055,11 @@ describe('AppController (e2e)', () => {
       .post(`/my/service-requests/${requestId}/quotes/${quoteAId}/decision`)
       .set('Authorization', customerAuthorization)
       .send({ decision: 'approved' })
-      .expect(201);
+      .expect(201)
+      .expect(({ body }: { body: Record<string, unknown> }) => {
+        expect(body.status).toBe('approved');
+        expect(body).not.toHaveProperty('providerId');
+      });
 
     const after = await request(app.getHttpServer())
       .get('/my/service-requests')

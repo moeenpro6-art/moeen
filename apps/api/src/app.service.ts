@@ -635,12 +635,22 @@ export class AppService {
       throw new Error('Invalid quote decision');
     }
     const customer = await this.getCustomerForToken(token);
-    return this.serviceRequestStore.decideQuote(
+    const quote = await this.serviceRequestStore.decideQuote(
       requestId,
       customer.id,
       quoteId,
       decision,
     );
+    // Customer-facing responses never reveal which provider owns a quote;
+    // only the whitelisted quote fields are returned (approved and rejected).
+    return {
+      id: quote.id,
+      amountHalalas: quote.amountHalalas,
+      scope: quote.scope,
+      status: quote.status,
+      proposedAt: quote.proposedAt,
+      decidedAt: quote.decidedAt,
+    };
   }
 
   private async getCustomerForToken(token: string): Promise<Customer> {

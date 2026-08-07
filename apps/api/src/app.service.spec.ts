@@ -421,6 +421,87 @@ describe('AppService', () => {
     ).rejects.toThrow('Invalid quote');
   });
 
+  it('hides provider ids from an approved customer quote decision', async () => {
+    const store = {
+      findCustomerBySession: jest.fn().mockResolvedValue({
+        id: 'CUS-1',
+        phone: '+966512345678',
+      }),
+      decideQuote: jest.fn().mockResolvedValue({
+        id: 'QTE-3',
+        providerId: 'provider-9',
+        amountHalalas: 15_000,
+        scope: 'عرض اختبار',
+        status: 'approved',
+        proposedAt: '2026-08-05T01:00:00.000Z',
+        decidedAt: '2026-08-05T02:00:00.000Z',
+      }),
+    };
+    const service = new AppService(store as never);
+    const decisionService = service as unknown as {
+      decideMyQuote: (
+        token: string,
+        requestId: string,
+        quoteId: string,
+        decision: 'approved' | 'rejected',
+      ) => Promise<Record<string, unknown>>;
+    };
+
+    const result = await decisionService.decideMyQuote(
+      'customer-token',
+      'MOE-1002',
+      'QTE-3',
+      'approved',
+    );
+
+    expect(result).toEqual({
+      id: 'QTE-3',
+      amountHalalas: 15_000,
+      scope: 'عرض اختبار',
+      status: 'approved',
+      proposedAt: '2026-08-05T01:00:00.000Z',
+      decidedAt: '2026-08-05T02:00:00.000Z',
+    });
+    expect(result).not.toHaveProperty('providerId');
+  });
+
+  it('hides provider ids from a rejected customer quote decision', async () => {
+    const store = {
+      findCustomerBySession: jest.fn().mockResolvedValue({
+        id: 'CUS-1',
+        phone: '+966512345678',
+      }),
+      decideQuote: jest.fn().mockResolvedValue({
+        id: 'QTE-3',
+        providerId: 'provider-9',
+        amountHalalas: 15_000,
+        scope: 'عرض اختبار',
+        status: 'rejected',
+        proposedAt: '2026-08-05T01:00:00.000Z',
+        decidedAt: '2026-08-05T02:00:00.000Z',
+      }),
+    };
+    const service = new AppService(store as never);
+    const decisionService = service as unknown as {
+      decideMyQuote: (
+        token: string,
+        requestId: string,
+        quoteId: string,
+        decision: 'approved' | 'rejected',
+      ) => Promise<Record<string, unknown>>;
+    };
+
+    const result = await decisionService.decideMyQuote(
+      'customer-token',
+      'MOE-1002',
+      'QTE-3',
+      'rejected',
+    );
+
+    expect(result.status).toBe('rejected');
+    expect(result).not.toHaveProperty('providerId');
+  });
+
   it('withdraws a provider quote through the store', async () => {
     const quote = {
       id: 'QTE-10',
