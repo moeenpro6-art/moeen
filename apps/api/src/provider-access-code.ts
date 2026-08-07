@@ -11,6 +11,40 @@ const accessCodeKeyLength = 64;
 const accessCodeHashPrefix = 'scrypt';
 const legacyTokenHashPattern = /^[a-f0-9]{64}$/i;
 
+/**
+ * Generates a provider access code with at least 128 bits of entropy
+ * (16 cryptographically secure random bytes encoded as 32 hex characters).
+ */
+export function generateProviderAccessCode(): string {
+  return randomBytes(16).toString('hex');
+}
+
+/**
+ * Deterministic, indexed lookup identifier for an access code.
+ * SHA-256 of a high-entropy code is safe to store as a lookup key; it is
+ * never used for verification.
+ */
+export function providerAccessCodeLookupId(accessCode: string): string {
+  return createHash('sha256').update(accessCode).digest('hex');
+}
+
+// A structurally valid scrypt hash used to equalize verification timing when
+// an unknown lookup id is presented (no real credential is ever verified).
+const dummyProviderAccessCodeHash = `scrypt$${'0'.repeat(32)}$${'0'.repeat(
+  128,
+)}`;
+
+/**
+ * Runs one fixed scrypt verification against a dummy hash so that unknown
+ * access codes cost the same as a real verification attempt.
+ */
+export async function verifyDummyProviderAccessCode(): Promise<void> {
+  await verifyProviderAccessCode(
+    'dummy-provider-access-code-verification',
+    dummyProviderAccessCodeHash,
+  );
+}
+
 export async function hashProviderAccessCode(
   accessCode: string,
 ): Promise<string> {

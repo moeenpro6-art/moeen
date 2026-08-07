@@ -2,6 +2,10 @@ import 'dotenv/config';
 import { createHash, randomUUID } from 'node:crypto';
 import { Pool } from 'pg';
 import { resolveDatabaseConnectionString } from './database.config';
+import {
+  hashProviderAccessCode,
+  providerAccessCodeLookupId,
+} from './provider-access-code';
 import { ServiceRequestRepository } from './service-request.repository';
 import { StaffAuthRepository } from './staff-auth.repository';
 
@@ -361,6 +365,8 @@ describe('ServiceRequestRepository', () => {
          VALUES ($1, $2)`,
         [provider.id, legacyHash],
       );
+      // The idempotent schema backfill must run before lookup works.
+      await repository.initialize();
 
       await expect(
         repository.findProviderByAccessCode(accessCode),
@@ -374,6 +380,119 @@ describe('ServiceRequestRepository', () => {
     } finally {
       await pool.end();
     }
+  }, 15_000);
+
+  it('keeps provider lookups indexed: an unknown code is not verified against every provider', async () => {
+    const probe = new Pool({
+      connectionString: resolveDatabaseConnectionString(),
+    });
+    try {
+      for (let index = 0; index < 200; index += 1) {
+        const providerId = `PILOT-perf-${index}`;
+        const code = `perf-access-${index}-${randomUUID().slice(0, 8)}`;
+        await probe.query(
+          `INSERT INTO providers (id, name, specialties, available, service_zone, verification_status)
+           VALUES ($1, $2, ARRAY['ac-cleaning'], TRUE, 'بريدة', 'verified')`,
+          [providerId, `مقدم أداء ${index}`],
+        );
+        await probe.query(
+          `INSERT INTO provider_access_credentials (provider_id, access_code_hash, lookup_id)
+           VALUES ($1, $2, $3)`,
+          [
+            providerId,
+            await hashProviderAccessCode(code),
+            providerAccessCodeLookupId(code),
+          ],
+        );
+      }
+      const startedAt = Date.now();
+      await expect(
+        repository.findProviderByAccessCode(`unknown-code-${randomUUID()}`),
+      ).resolves.toBeUndefined();
+      const elapsedMs = Date.now() - startedAt;
+      // New path: one indexed lookup + one dummy verification (~0.1s).
+      // The old O(N) path would verify 200 scrypt hashes (~12s+).
+      expect(elapsedMs).toBeLessThan(5000);
+    } finally {
+      await probe.end();
+    }
+  }, 30_000);
+
+  it('backfills lookup ids for legacy SHA-256 credentials and keeps them authenticating', async () => {
+    const provider = await createVerifiedProvider(['ac-cleaning']);
+    const accessCode = `legacy-backfill-${randomUUID()}`;
+    const legacyHash = createHash('sha256').update(accessCode).digest('hex');
+    const probe = new Pool({
+      connectionString: resolveDatabaseConnectionString(),
+    });
+    try {
+      await probe.query(
+        `INSERT INTO provider_access_credentials (provider_id, access_code_hash)
+         VALUES ($1, $2)`,
+        [provider.id, legacyHash],
+      );
+      await repository.initialize();
+      const stored = await probe.query<{ lookup_id: string | null }>(
+        'SELECT lookup_id FROM provider_access_credentials WHERE provider_id = $1',
+        [provider.id],
+      );
+      expect(stored.rows[0]?.lookup_id).toBe(legacyHash);
+      await expect(
+        repository.findProviderByAccessCode(accessCode),
+      ).resolves.toMatchObject({ id: provider.id });
+    } finally {
+      await probe.end();
+    }
+  });
+
+  it('fails generically for a scrypt credential without lookup_id until the code is rotated', async () => {
+    const provider = await createVerifiedProvider(['ac-cleaning']);
+    const accessCode = `scrypt-no-lookup-${randomUUID()}`;
+    const probe = new Pool({
+      connectionString: resolveDatabaseConnectionString(),
+    });
+    try {
+      await probe.query(
+        `INSERT INTO provider_access_credentials (provider_id, access_code_hash)
+         VALUES ($1, $2)`,
+        [provider.id, await hashProviderAccessCode(accessCode)],
+      );
+      await expect(
+        repository.findProviderByAccessCode(accessCode),
+      ).resolves.toBeUndefined();
+      await repository.setProviderAccessCode(provider.id, accessCode);
+      await expect(
+        repository.findProviderByAccessCode(accessCode),
+      ).resolves.toMatchObject({ id: provider.id });
+    } finally {
+      await probe.end();
+    }
+  });
+
+  it('rejects a duplicate provider access code with a controlled error', async () => {
+    const providerA = await createVerifiedProvider(['ac-cleaning']);
+    const providerB = await createVerifiedProvider(['ac-cleaning']);
+    const accessCode = `shared-code-${randomUUID()}`;
+    await repository.setProviderAccessCode(providerA.id, accessCode);
+    await expect(
+      repository.setProviderAccessCode(providerB.id, accessCode),
+    ).rejects.toThrow('Provider access code is already in use');
+  });
+
+  it('keeps existing provider sessions valid after the lookup migration', async () => {
+    const provider = await createVerifiedProvider(['ac-cleaning']);
+    const accessCode = `session-migration-${randomUUID()}`;
+    await repository.setProviderAccessCode(provider.id, accessCode);
+    await repository.createProviderSession(
+      provider.id,
+      'session-token-after-migration',
+    );
+    await expect(
+      repository.findProviderBySession('session-token-after-migration'),
+    ).resolves.toMatchObject({ id: provider.id });
+    await expect(
+      repository.findProviderByAccessCode(accessCode),
+    ).resolves.toMatchObject({ id: provider.id });
   });
 
   it('records an immutable creation event for a new customer request', async () => {

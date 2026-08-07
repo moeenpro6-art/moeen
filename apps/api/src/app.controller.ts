@@ -83,7 +83,10 @@ export class AppController {
   }
 
   @Post('provider/auth/login')
-  loginProvider(@Body() body: unknown) {
+  async loginProvider(@Req() request: Request, @Body() body: unknown) {
+    await this.publicAuthRateLimiter.reserveProviderLogin(
+      this.clientIp(request),
+    );
     return this.providerAuthService.login(
       this.requiredString(body, 'accessCode', 16, 512),
     );

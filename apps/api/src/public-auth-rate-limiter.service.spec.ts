@@ -33,4 +33,33 @@ describe('PublicAuthRateLimiter', () => {
       limiter.reserveOtpVerification('2001:db8::1'),
     ).resolves.toBeUndefined();
   });
+
+  it('reserves provider login attempts with the provider_login scope', async () => {
+    const reservePublicAuthAttempt = jest.fn().mockResolvedValue(1);
+    const store: jest.Mocked<PublicAuthAttemptStore> = {
+      reservePublicAuthAttempt,
+    };
+    const limiter = new PublicAuthRateLimiter(store, () => 0);
+
+    await expect(
+      limiter.reserveProviderLogin('198.51.100.9'),
+    ).resolves.toBeUndefined();
+    expect(reservePublicAuthAttempt).toHaveBeenCalledWith(
+      'provider_login',
+      expect.stringMatching(/^[a-f0-9]{64}$/),
+      new Date(0),
+    );
+  });
+
+  it('rejects provider logins beyond the client-IP limit in one window', async () => {
+    const reservePublicAuthAttempt = jest.fn().mockResolvedValue(21);
+    const store: jest.Mocked<PublicAuthAttemptStore> = {
+      reservePublicAuthAttempt,
+    };
+    const limiter = new PublicAuthRateLimiter(store, () => 0);
+
+    await expect(
+      limiter.reserveProviderLogin('198.51.100.10'),
+    ).rejects.toMatchObject<HttpException>({ status: 429 });
+  });
 });

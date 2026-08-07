@@ -9,7 +9,7 @@ import {
 import { StaffAuthRepository } from './staff-auth.repository';
 
 export type PublicAuthAttemptScope =
-  'customer_otp_request' | 'customer_otp_verification';
+  'customer_otp_request' | 'customer_otp_verification' | 'provider_login';
 
 export interface PublicAuthAttemptStore {
   reservePublicAuthAttempt(
@@ -24,6 +24,7 @@ export class PublicAuthRateLimiter {
   private static readonly windowMs = 10 * 60_000;
   private static readonly maximumOtpRequests = 10;
   private static readonly maximumOtpVerifications = 20;
+  private static readonly maximumProviderLogins = 20;
 
   constructor(
     @Inject(StaffAuthRepository)
@@ -44,6 +45,14 @@ export class PublicAuthRateLimiter {
       'customer_otp_verification',
       clientIp,
       PublicAuthRateLimiter.maximumOtpVerifications,
+    );
+  }
+
+  reserveProviderLogin(clientIp: string): Promise<void> {
+    return this.reserve(
+      'provider_login',
+      clientIp,
+      PublicAuthRateLimiter.maximumProviderLogins,
     );
   }
 

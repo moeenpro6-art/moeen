@@ -5,6 +5,8 @@ import { resolveDatabaseConnectionString } from './database.config';
 import {
   hashProviderAccessCode,
   isLegacyProviderAccessCodeHash,
+  providerAccessCodeLookupId,
+  verifyDummyProviderAccessCode,
   verifyProviderAccessCode,
 } from './provider-access-code';
 import type {
@@ -224,6 +226,24 @@ export class ServiceRequestRepository
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
     `);
+    // Indexed access-code lookup (SHA-256 lookup id) with a uniqueness
+    // constraint as the final protection. Idempotent; no destructive DDL.
+    await this.pool.query(
+      'ALTER TABLE provider_access_credentials ADD COLUMN IF NOT EXISTS lookup_id TEXT',
+    );
+    await this.pool.query(
+      `CREATE UNIQUE INDEX IF NOT EXISTS provider_access_lookup_idx
+       ON provider_access_credentials (lookup_id)
+       WHERE lookup_id IS NOT NULL`,
+    );
+    // Backfill lookup ids only where safely derivable: legacy SHA-256 hashes
+    // are exactly sha256(accessCode). Salted scrypt hashes cannot be derived
+    // and must be rotated by operations (login fails generically until then).
+    await this.pool.query(
+      `UPDATE provider_access_credentials
+       SET lookup_id = access_code_hash
+       WHERE lookup_id IS NULL AND access_code_hash ~ '^[a-f0-9]{64}$'`,
+    );
     await this.pool.query(`
       CREATE TABLE IF NOT EXISTS provider_sessions (
         token_hash TEXT PRIMARY KEY,
@@ -574,6 +594,7 @@ export class ServiceRequestRepository
     accessCode: string,
   ): Promise<void> {
     const accessCodeHash = await hashProviderAccessCode(accessCode);
+    const lookupId = providerAccessCodeLookupId(accessCode);
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
@@ -582,13 +603,22 @@ export class ServiceRequestRepository
         [providerId],
       );
       if (!provider.rows[0]) throw new Error('Pilot provider not found');
-      await client.query(
-        `INSERT INTO provider_access_credentials (provider_id, access_code_hash)
-         VALUES ($1, $2)
-         ON CONFLICT (provider_id) DO UPDATE
-         SET access_code_hash = EXCLUDED.access_code_hash, updated_at = NOW()`,
-        [providerId, accessCodeHash],
-      );
+      try {
+        await client.query(
+          `INSERT INTO provider_access_credentials (provider_id, access_code_hash, lookup_id)
+           VALUES ($1, $2, $3)
+           ON CONFLICT (provider_id) DO UPDATE
+           SET access_code_hash = EXCLUDED.access_code_hash,
+               lookup_id = EXCLUDED.lookup_id,
+               updated_at = NOW()`,
+          [providerId, accessCodeHash, lookupId],
+        );
+      } catch (error) {
+        if (this.isUniqueViolation(error)) {
+          throw new Error('Provider access code is already in use');
+        }
+        throw error;
+      }
       await client.query(
         'DELETE FROM provider_sessions WHERE provider_id = $1',
         [providerId],
@@ -605,34 +635,41 @@ export class ServiceRequestRepository
   async findProviderByAccessCode(
     accessCode: string,
   ): Promise<ProviderAppPrincipal | undefined> {
+    // Single indexed lookup by SHA-256 lookup id, followed by at most one
+    // real scrypt verification. Unknown ids run one fixed dummy verification
+    // so timing does not reveal whether a credential exists.
+    const lookupId = providerAccessCodeLookupId(accessCode);
     const result = await this.pool.query<ProviderAccessRow>(
       `SELECT p.id, p.name, p.specialties, p.available, p.service_zone,
               p.verification_status, c.access_code_hash
        FROM provider_access_credentials c
        JOIN providers p ON p.id = c.provider_id
-       WHERE p.verification_status = 'verified'`,
+       WHERE c.lookup_id = $1 AND p.verification_status = 'verified'
+       LIMIT 1`,
+      [lookupId],
     );
-
-    for (const row of result.rows) {
-      if (!(await verifyProviderAccessCode(accessCode, row.access_code_hash))) {
-        continue;
-      }
-      if (isLegacyProviderAccessCodeHash(row.access_code_hash)) {
-        await this.pool.query(
-          `UPDATE provider_access_credentials
-           SET access_code_hash = $2, updated_at = NOW()
-           WHERE provider_id = $1 AND access_code_hash = $3`,
-          [
-            row.id,
-            await hashProviderAccessCode(accessCode),
-            row.access_code_hash,
-          ],
-        );
-      }
-      return this.toProviderAppPrincipal(row);
+    const row = result.rows[0];
+    if (!row) {
+      await verifyDummyProviderAccessCode();
+      return undefined;
     }
-
-    return undefined;
+    if (!(await verifyProviderAccessCode(accessCode, row.access_code_hash))) {
+      await verifyDummyProviderAccessCode();
+      return undefined;
+    }
+    if (isLegacyProviderAccessCodeHash(row.access_code_hash)) {
+      await this.pool.query(
+        `UPDATE provider_access_credentials
+         SET access_code_hash = $2, updated_at = NOW()
+         WHERE provider_id = $1 AND access_code_hash = $3`,
+        [
+          row.id,
+          await hashProviderAccessCode(accessCode),
+          row.access_code_hash,
+        ],
+      );
+    }
+    return this.toProviderAppPrincipal(row);
   }
 
   async createProviderSession(

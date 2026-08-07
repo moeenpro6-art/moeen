@@ -111,6 +111,26 @@ export class StaffAuthRepository
         PRIMARY KEY (scope, subject_hash)
       )
     `);
+    // Extend the public-auth scope CHECK with provider_login (controlled, idempotent, race-safe)
+    await this.pool.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conname = 'public_auth_rate_limits_scope_check'
+            AND pg_get_constraintdef(oid) LIKE '%provider_login%'
+        ) THEN
+          BEGIN
+            ALTER TABLE public_auth_rate_limits
+              DROP CONSTRAINT IF EXISTS public_auth_rate_limits_scope_check,
+              ADD CONSTRAINT public_auth_rate_limits_scope_check
+                CHECK (scope IN ('customer_otp_request', 'customer_otp_verification', 'provider_login'));
+          EXCEPTION WHEN duplicate_object THEN
+            NULL;
+          END;
+        END IF;
+      END $$;
+    `);
     await this.pool.query(`
       CREATE TABLE IF NOT EXISTS staff_audit_events (
         id BIGSERIAL PRIMARY KEY,
