@@ -247,10 +247,32 @@ export class AppController {
     @Body() body: { accessCode: string },
   ): Promise<void> {
     const actor = await this.requireStaff(authorization, ['admin']);
-    await this.appService.setPilotProviderAccessCode(
-      providerId,
-      body.accessCode ?? '',
-    );
+    try {
+      await this.appService.setPilotProviderAccessCode(
+        providerId,
+        body.accessCode ?? '',
+      );
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        error.message === 'Provider access code is already in use'
+      ) {
+        throw new ConflictException('Provider access code is already in use');
+      }
+      if (
+        error instanceof Error &&
+        error.message === 'Invalid provider access code'
+      ) {
+        throw new BadRequestException('Invalid provider access code');
+      }
+      if (
+        error instanceof Error &&
+        error.message === 'Pilot provider not found'
+      ) {
+        throw new NotFoundException('Pilot provider not found');
+      }
+      throw error;
+    }
     await this.staffAuditService.record(actor, {
       action: 'provider.access_code_rotated',
       subjectType: 'provider',

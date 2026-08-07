@@ -733,6 +733,88 @@ describe('AppController (e2e)', () => {
       .expect(200);
   });
 
+  it('rejects rotating with an access code already used by another provider', async () => {
+    const staffAuthorization = await createStaffAuthorization(app);
+    const sharedCode = `shared-access-${randomUUID()}`;
+    await request(app.getHttpServer())
+      .post('/providers/provider-1/access-code')
+      .set('Authorization', staffAuthorization)
+      .send({ accessCode: sharedCode })
+      .expect(201);
+    await request(app.getHttpServer())
+      .post('/providers/provider-2/access-code')
+      .set('Authorization', staffAuthorization)
+      .send({ accessCode: sharedCode })
+      .expect(409);
+    // The rejected rotation changed nothing: provider-2 can still rotate
+    // with a fresh code and authenticate with it.
+    const freshCode = `fresh-access-${randomUUID()}`;
+    await request(app.getHttpServer())
+      .post('/providers/provider-2/access-code')
+      .set('Authorization', staffAuthorization)
+      .send({ accessCode: freshCode })
+      .expect(201);
+    const providerLogin = await request(app.getHttpServer())
+      .post('/provider/auth/login')
+      .send({ accessCode: freshCode })
+      .expect(201);
+    const provider = responseObject(providerLogin.body).provider as {
+      id: string;
+    };
+    expect(provider.id).toBe('provider-2');
+  });
+
+  it('rejects a too-short provider access code with 400', async () => {
+    const staffAuthorization = await createStaffAuthorization(app);
+    await request(app.getHttpServer())
+      .post('/providers/provider-1/access-code')
+      .set('Authorization', staffAuthorization)
+      .send({ accessCode: 'short-code' })
+      .expect(400);
+  });
+
+  it('returns 404 when rotating the access code of an unknown provider', async () => {
+    const staffAuthorization = await createStaffAuthorization(app);
+    await request(app.getHttpServer())
+      .post('/providers/provider-does-not-exist/access-code')
+      .set('Authorization', staffAuthorization)
+      .send({ accessCode: `provider-access-${randomUUID()}` })
+      .expect(404);
+  });
+
+  it('rotating a provider access code invalidates the previous provider session', async () => {
+    const staffAuthorization = await createStaffAuthorization(app);
+    const oldCode = `provider-access-${randomUUID()}`;
+    const newCode = `provider-access-${randomUUID()}`;
+    await request(app.getHttpServer())
+      .post('/providers/provider-1/access-code')
+      .set('Authorization', staffAuthorization)
+      .send({ accessCode: oldCode })
+      .expect(201);
+    const oldLogin = await request(app.getHttpServer())
+      .post('/provider/auth/login')
+      .send({ accessCode: oldCode })
+      .expect(201);
+    const oldSessionToken = requiredString(oldLogin.body, 'token');
+
+    await request(app.getHttpServer())
+      .post('/providers/provider-1/access-code')
+      .set('Authorization', staffAuthorization)
+      .send({ accessCode: newCode })
+      .expect(201);
+
+    // The session issued under the old code is invalidated.
+    await request(app.getHttpServer())
+      .get('/provider/auth/me')
+      .set('Authorization', `Bearer ${oldSessionToken}`)
+      .expect(401);
+    // The new code authenticates.
+    await request(app.getHttpServer())
+      .post('/provider/auth/login')
+      .send({ accessCode: newCode })
+      .expect(201);
+  });
+
   it('returns a role-safe profile and revokes a logged-out staff session', async () => {
     const authorization = await createStaffAuthorization(app, 'dispatcher');
 

@@ -280,16 +280,31 @@ export default async function Home({ searchParams }: HomeProps) {
     const accessCode = String(formData.get('accessCode') ?? '').trim();
     if (providerId && accessCode.length >= 16) {
       const session = await requireStaffSession();
-      const response = await dashboardApiFetch(
-        `/providers/${providerId}/access-code`,
-        session.token,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ accessCode }),
-        },
-      );
-      requireSuccessfulStaffAction(response);
+      let response: Response;
+      try {
+        response = await dashboardApiFetch(
+          `/providers/${providerId}/access-code`,
+          session.token,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ accessCode }),
+          },
+        );
+      } catch {
+        redirect('/?error=rotation');
+      }
+      try {
+        requireSuccessfulStaffAction(response);
+      } catch (error) {
+        if (
+          error instanceof Error &&
+          error.message === 'Staff operation failed'
+        ) {
+          redirect('/?error=rotation');
+        }
+        throw error;
+      }
     }
     revalidatePath('/');
   }
@@ -388,6 +403,12 @@ export default async function Home({ searchParams }: HomeProps) {
         {error === 'forbidden' && (
           <p className={styles.accessError} role="alert">
             ليس لديك صلاحية لتنفيذ هذا الإجراء.
+          </p>
+        )}
+        {error === 'rotation' && (
+          <p className={styles.accessError} role="alert">
+            تعذر حفظ/تدوير رمز الوصول. جرّب رمزًا جديدًا غير مستخدم، ثم أعد
+            المحاولة.
           </p>
         )}
       </section>
