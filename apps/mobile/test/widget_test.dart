@@ -241,4 +241,152 @@ void main() {
     expect(request.quote, isNotNull);
     expect(request.quotes, hasLength(2));
   });
+
+  test('CustomerQuote.fromJson parses providerSummary defensively', () {
+    final quote = CustomerQuote.fromJson({
+      'id': 'QTE-30',
+      'amountHalalas': 15000,
+      'scope': 'تنظيف كامل',
+      'status': 'proposed',
+      'providerSummary': {
+        'name': 'فريق التبريد السريع',
+        'averageRating': 4.5,
+        'ratingCount': 12,
+      },
+    });
+
+    expect(quote.providerSummary?.name, 'فريق التبريد السريع');
+    expect(quote.providerSummary?.averageRating, 4.5);
+    expect(quote.providerSummary?.ratingCount, 12);
+  });
+
+  test('CustomerQuote.fromJson tolerates a missing providerSummary', () {
+    final quote = CustomerQuote.fromJson({
+      'id': 'QTE-31',
+      'amountHalalas': 12000,
+      'scope': 'تنظيف سريع',
+      'status': 'proposed',
+    });
+
+    expect(quote.providerSummary, isNull);
+    expect(quote.status, 'proposed');
+  });
+
+  testWidgets('renders provider name and rating summary per quote', (
+    tester,
+  ) async {
+    final request = CustomerRequest.fromJson({
+      'id': 'MOE-3001',
+      'serviceId': 'ac-cleaning',
+      'status': 'pending_dispatch',
+      'quotes': [
+        {
+          'id': 'QTE-32',
+          'amountHalalas': 15000,
+          'scope': 'تنظيف كامل',
+          'status': 'proposed',
+          'providerSummary': {
+            'name': 'فريق التبريد السريع',
+            'averageRating': 4.5,
+            'ratingCount': 12,
+          },
+        },
+      ],
+    });
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Directionality(
+          textDirection: TextDirection.rtl,
+          child: CustomerRequestCard(
+            request: request,
+            statusLabel: 'بانتظار القبول',
+            onReviewQuote: () {},
+            onRate: () {},
+            onSupport: () {},
+          ),
+        ),
+      ),
+    );
+
+    expect(find.text('فريق التبريد السريع'), findsOneWidget);
+    expect(find.text('4.5 ★ (12)'), findsOneWidget);
+    expect(find.textContaining('150.00 ر.س'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('unrated provider renders name without a fake rating', (
+    tester,
+  ) async {
+    final request = CustomerRequest.fromJson({
+      'id': 'MOE-3002',
+      'serviceId': 'ac-cleaning',
+      'status': 'pending_dispatch',
+      'quotes': [
+        {
+          'id': 'QTE-33',
+          'amountHalalas': 12000,
+          'scope': 'تنظيف سريع',
+          'status': 'proposed',
+          'providerSummary': {'name': 'مقدم جديد', 'ratingCount': 0},
+        },
+      ],
+    });
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Directionality(
+          textDirection: TextDirection.rtl,
+          child: CustomerRequestCard(
+            request: request,
+            statusLabel: 'بانتظار القبول',
+            onReviewQuote: () {},
+            onRate: () {},
+            onSupport: () {},
+          ),
+        ),
+      ),
+    );
+
+    expect(find.text('مقدم جديد'), findsOneWidget);
+    expect(find.textContaining('★'), findsNothing);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('legacy quote payload without providerSummary renders safely', (
+    tester,
+  ) async {
+    final request = CustomerRequest.fromJson({
+      'id': 'MOE-3003',
+      'serviceId': 'ac-cleaning',
+      'status': 'pending_dispatch',
+      'quotes': [
+        {
+          'id': 'QTE-34',
+          'amountHalalas': 10000,
+          'scope': 'تنظيف أساسي',
+          'status': 'proposed',
+        },
+      ],
+    });
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Directionality(
+          textDirection: TextDirection.rtl,
+          child: CustomerRequestCard(
+            request: request,
+            statusLabel: 'بانتظار القبول',
+            onReviewQuote: () {},
+            onRate: () {},
+            onSupport: () {},
+          ),
+        ),
+      ),
+    );
+
+    expect(find.textContaining('تنظيف أساسي'), findsOneWidget);
+    expect(find.textContaining('★'), findsNothing);
+    expect(tester.takeException(), isNull);
+  });
 }

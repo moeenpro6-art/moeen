@@ -636,24 +636,50 @@ String supportCategoryLabel(String category) =>
     }[category] ??
     'سبب آخر';
 
+class CustomerQuoteProviderSummary {
+  const CustomerQuoteProviderSummary({
+    required this.name,
+    this.averageRating,
+    required this.ratingCount,
+  });
+
+  final String name;
+  final double? averageRating;
+  final int ratingCount;
+
+  factory CustomerQuoteProviderSummary.fromJson(Map<String, dynamic> json) =>
+      CustomerQuoteProviderSummary(
+        name: json['name'] as String? ?? '',
+        averageRating: (json['averageRating'] as num?)?.toDouble(),
+        ratingCount: json['ratingCount'] as int? ?? 0,
+      );
+}
+
 class CustomerQuote {
   const CustomerQuote({
     required this.id,
     required this.amountHalalas,
     required this.scope,
     required this.status,
+    this.providerSummary,
   });
 
   final String id;
   final int amountHalalas;
   final String scope;
   final String status;
+  final CustomerQuoteProviderSummary? providerSummary;
 
   factory CustomerQuote.fromJson(Map<String, dynamic> json) => CustomerQuote(
     id: json['id'] as String,
     amountHalalas: json['amountHalalas'] as int,
     scope: json['scope'] as String,
     status: json['status'] as String,
+    providerSummary: (json['providerSummary'] as Map<String, dynamic>?) == null
+        ? null
+        : CustomerQuoteProviderSummary.fromJson(
+            json['providerSummary'] as Map<String, dynamic>,
+          ),
   );
 }
 
@@ -849,6 +875,26 @@ class CustomerRequestCard extends StatelessWidget {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
+                      if (quote.providerSummary != null &&
+                          quote.providerSummary!.name.isNotEmpty) ...[
+                        Text(
+                          quote.providerSummary!.name,
+                          style: const TextStyle(
+                            fontSize: 14,
+                            fontWeight: FontWeight.w700,
+                            color: Color(0xFF17312E),
+                          ),
+                        ),
+                        if (quote.providerSummary!.averageRating != null)
+                          Text(
+                            '${quote.providerSummary!.averageRating!.toStringAsFixed(1)} ★ (${quote.providerSummary!.ratingCount})',
+                            style: const TextStyle(
+                              fontSize: 12,
+                              color: Color(0xFF506764),
+                            ),
+                          ),
+                        const SizedBox(height: 2),
+                      ],
                       Text(
                         'عرض السعر: ${_formatSaudiRiyals(quote.amountHalalas)} — ${quote.scope}',
                         style: TextStyle(

@@ -383,16 +383,60 @@ class SecureProviderSessionStore implements ProviderSessionStore {
   Future<void> clearToken() => _storage.delete(key: _providerTokenStorageKey);
 }
 
+/// Stores requestIds the provider chose to hide from their own opportunity
+/// list on this device only. Keyed per provider account so a different
+/// provider on the same device never sees another account's hidden list.
+abstract class HiddenOpportunitiesStore {
+  Future<Set<String>> readHidden(String providerId);
+  Future<void> hideRequest(String providerId, String requestId);
+}
+
+class SecureHiddenOpportunitiesStore implements HiddenOpportunitiesStore {
+  SecureHiddenOpportunitiesStore({FlutterSecureStorage? storage})
+    : _storage = storage ?? const FlutterSecureStorage();
+
+  final FlutterSecureStorage _storage;
+
+  String _keyFor(String providerId) =>
+      'moeen_provider_hidden_opportunities_$providerId';
+
+  @override
+  Future<Set<String>> readHidden(String providerId) async {
+    final raw = await _storage.read(key: _keyFor(providerId));
+    if (raw == null || raw.isEmpty) return {};
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is! List) return {};
+      return decoded.whereType<String>().toSet();
+    } catch (_) {
+      return {};
+    }
+  }
+
+  @override
+  Future<void> hideRequest(String providerId, String requestId) async {
+    final hidden = await readHidden(providerId);
+    hidden.add(requestId);
+    await _storage.write(
+      key: _keyFor(providerId),
+      value: jsonEncode(hidden.toList()),
+    );
+  }
+}
+
 class MoeenProviderApp extends StatefulWidget {
   MoeenProviderApp({
     super.key,
     ProviderApi? api,
     ProviderSessionStore? sessionStore,
+    HiddenOpportunitiesStore? hiddenStore,
   }) : _api = api ?? ProviderApi(),
-       _sessionStore = sessionStore ?? SecureProviderSessionStore();
+       _sessionStore = sessionStore ?? SecureProviderSessionStore(),
+       _hiddenStore = hiddenStore ?? SecureHiddenOpportunitiesStore();
 
   final ProviderApi _api;
   final ProviderSessionStore _sessionStore;
+  final HiddenOpportunitiesStore _hiddenStore;
 
   @override
   State<MoeenProviderApp> createState() => _MoeenProviderAppState();
@@ -404,6 +448,7 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
   ProviderProfile? _provider;
   List<ProviderJob> _jobs = const [];
   List<ProviderOpportunity> _opportunities = const [];
+  Set<String> _hiddenRequestIds = {};
   bool _opportunitiesLoading = true;
   String? _opportunitiesError;
   bool _loading = true;
@@ -430,9 +475,22 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
         return;
       }
       await _loadDashboard(token);
+      await _loadHiddenOpportunities();
       await _loadOpportunities();
     } catch (_) {
       await _expireSession();
+    }
+  }
+
+  Future<void> _loadHiddenOpportunities() async {
+    final providerId = _provider?.id;
+    if (providerId == null) return;
+    try {
+      final hidden = await widget._hiddenStore.readHidden(providerId);
+      if (mounted) setState(() => _hiddenRequestIds = hidden);
+    } catch (_) {
+      // Best-effort local feature: a storage failure must not break the
+      // session; the list simply starts empty.
     }
   }
 
@@ -444,6 +502,7 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
         _provider = null;
         _jobs = const [];
         _opportunities = const [];
+        _hiddenRequestIds = {};
         _opportunitiesLoading = true;
         _opportunitiesError = null;
         _loading = false;
@@ -463,7 +522,12 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
       final opportunities = await widget._api.opportunities(token);
       if (!mounted) return;
       setState(() {
-        _opportunities = opportunities;
+        _opportunities = opportunities
+            .where(
+              (opportunity) =>
+                  !_hiddenRequestIds.contains(opportunity.requestId),
+            )
+            .toList();
         _opportunitiesLoading = false;
       });
     } on ProviderUnauthorizedException {
@@ -532,6 +596,7 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
       final login = await widget._api.login(accessCode);
       await widget._sessionStore.writeToken(login.token);
       await _loadDashboard(login.token);
+      await _loadHiddenOpportunities();
       await _loadOpportunities();
     } on ProviderApiConfigurationException {
       if (mounted) {
@@ -841,6 +906,31 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
     );
   }
 
+  bool _isOpportunityHideable(ProviderOpportunity opportunity) {
+    if (opportunity.opportunityStatus == 'rejected') return true;
+    if (opportunity.opportunityStatus == 'withdrawn') return true;
+    return opportunity.opportunityStatus == 'closed' &&
+        opportunity.myQuote?.status != 'approved';
+  }
+
+  Future<void> _hideOpportunity(ProviderOpportunity opportunity) async {
+    final providerId = _provider?.id;
+    if (providerId == null) return;
+    try {
+      await widget._hiddenStore.hideRequest(providerId, opportunity.requestId);
+    } catch (_) {
+      // Best-effort: the card still hides for this session even if the
+      // local persistence write fails.
+    }
+    if (!mounted) return;
+    setState(() {
+      _hiddenRequestIds.add(opportunity.requestId);
+      _opportunities = _opportunities
+          .where((item) => item.requestId != opportunity.requestId)
+          .toList();
+    });
+  }
+
   Widget _buildOpportunityCard(ProviderOpportunity opportunity) {
     final serviceLabel =
         _serviceNames[opportunity.serviceId] ?? opportunity.serviceId;
@@ -880,6 +970,16 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
                         : () => _openQuoteSheet(buttonContext, opportunity),
                     child: const Text('تقديم عرض'),
                   ),
+                ),
+              ),
+            ],
+            if (_isOpportunityHideable(opportunity)) ...[
+              const SizedBox(height: 12),
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton(
+                  onPressed: () => _hideOpportunity(opportunity),
+                  child: const Text('إخفاء من قائمتي'),
                 ),
               ),
             ],

@@ -112,6 +112,12 @@ export type ProviderOpportunity = {
   myQuote?: ServiceQuote;
 };
 
+export type CustomerQuoteProviderSummary = {
+  name: string;
+  averageRating: number | null;
+  ratingCount: number;
+};
+
 export type CustomerQuoteView = {
   id: string;
   amountHalalas?: number;
@@ -119,6 +125,7 @@ export type CustomerQuoteView = {
   status: ServiceQuoteStatus;
   proposedAt?: string;
   decidedAt?: string;
+  providerSummary?: CustomerQuoteProviderSummary;
 };
 
 export type ServicePaymentMethod = 'cash_on_completion' | 'paymob';

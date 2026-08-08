@@ -24,6 +24,7 @@ import type {
   ServicePaymentStatus,
   ServiceQuote,
   ServiceQuoteStatus,
+  CustomerQuoteProviderSummary,
   CustomerQuoteView,
   ProviderOpportunity,
   ProviderOpportunityStatus,
@@ -72,6 +73,7 @@ type ServiceRequestEventRow = {
 type ServiceQuoteRow = {
   id: string;
   provider_id: string | null;
+  provider_name?: string | null;
   amount_halalas: number;
   scope: string;
   status: ServiceQuoteStatus;
@@ -592,14 +594,64 @@ export class ServiceRequestRepository
     const providerQuotesByRequest = await this.fetchProviderQuotesByRequest(
       requests.map((request) => this.toRequestDatabaseId(request.id)),
     );
+    const providerIds = [
+      ...new Set(
+        [...providerQuotesByRequest.values()]
+          .flatMap((quotes) => quotes.map((quote) => quote.provider_id))
+          .filter((providerId): providerId is string => providerId !== null),
+      ),
+    ];
+    const ratingSummaries =
+      await this.fetchProviderRatingSummaries(providerIds);
     return requests.map((request) => {
       const providerQuotes = providerQuotesByRequest.get(request.id) ?? [];
       return {
         ...request,
         quote: this.toCustomerQuote(request.quote),
-        quotes: this.toCustomerQuoteViews(request.id, providerQuotes),
+        quotes: this.toCustomerQuoteViews(
+          request.id,
+          providerQuotes,
+          ratingSummaries,
+        ),
       };
     });
+  }
+
+  /**
+   * One set-based aggregate query for all quoting providers of a customer
+   * request list: AVG/COUNT of ratings from completed requests assigned to
+   * each provider. Avoids an N+1 rating query per quote.
+   */
+  private async fetchProviderRatingSummaries(
+    providerIds: string[],
+  ): Promise<Map<string, Omit<CustomerQuoteProviderSummary, 'name'>>> {
+    const summaries = new Map<
+      string,
+      Omit<CustomerQuoteProviderSummary, 'name'>
+    >();
+    if (providerIds.length === 0) return summaries;
+    const result = await this.pool.query<{
+      provider_id: string;
+      average_rating: number | null;
+      rating_count: number;
+    }>(
+      `SELECT assigned_provider_id AS provider_id,
+              ROUND(AVG(rating)::numeric, 1)::float8 AS average_rating,
+              COUNT(*)::int AS rating_count
+       FROM service_requests
+       WHERE assigned_provider_id = ANY($1::text[])
+         AND status = 'completed'
+         AND rating IS NOT NULL
+       GROUP BY assigned_provider_id`,
+      [providerIds],
+    );
+    for (const row of result.rows) {
+      summaries.set(row.provider_id, {
+        averageRating: row.average_rating,
+        ratingCount: row.rating_count,
+      });
+    }
+    return summaries;
   }
 
   private async fetchProviderQuotesByRequest(
@@ -610,11 +662,13 @@ export class ServiceRequestRepository
     const rows = await this.pool.query<
       ServiceQuoteRow & { service_request_id: string }
     >(
-      `SELECT id, provider_id, amount_halalas, scope, status, proposed_at, decided_at,
-               service_request_id
-        FROM service_quotes
-        WHERE service_request_id = ANY($1::bigint[]) AND provider_id IS NOT NULL
-        ORDER BY id DESC`,
+      `SELECT q.id, q.provider_id, p.name AS provider_name,
+              q.amount_halalas, q.scope, q.status,
+              q.proposed_at, q.decided_at, q.service_request_id
+        FROM service_quotes q
+        LEFT JOIN providers p ON p.id = q.provider_id
+        WHERE q.service_request_id = ANY($1::bigint[]) AND q.provider_id IS NOT NULL
+        ORDER BY q.id DESC`,
       [requestDatabaseIds],
     );
     for (const row of rows.rows) {
@@ -643,6 +697,7 @@ export class ServiceRequestRepository
   private toCustomerQuoteViews(
     requestId: string,
     providerQuotes: ServiceQuoteRow[],
+    providerSummaries: Map<string, Omit<CustomerQuoteProviderSummary, 'name'>>,
   ): CustomerQuoteView[] {
     return providerQuotes.map((quote) => ({
       id: `QTE-${quote.id}`,
@@ -651,6 +706,15 @@ export class ServiceRequestRepository
       status: quote.status,
       proposedAt: quote.proposed_at.toISOString(),
       decidedAt: quote.decided_at?.toISOString(),
+      providerSummary: quote.provider_id
+        ? {
+            name: quote.provider_name ?? '',
+            ...(providerSummaries.get(quote.provider_id) ?? {
+              averageRating: null,
+              ratingCount: 0,
+            }),
+          }
+        : undefined,
     }));
   }
 

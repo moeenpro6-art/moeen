@@ -106,7 +106,7 @@ void main() {
         }),
       );
 
-      await tester.pumpWidget(MoeenProviderApp(api: api, sessionStore: store));
+      await tester.pumpWidget(MoeenProviderApp(api: api, sessionStore: store, hiddenStore: _MemoryHiddenStore()));
       await tester.pumpAndSettle();
 
       // Restored session shows the authenticated dashboard.
@@ -152,7 +152,7 @@ void main() {
         }),
       );
 
-      await tester.pumpWidget(MoeenProviderApp(api: api, sessionStore: store));
+      await tester.pumpWidget(MoeenProviderApp(api: api, sessionStore: store, hiddenStore: _MemoryHiddenStore()));
       await tester.pumpAndSettle();
 
       // Authenticated dashboard with the availability switch.
@@ -182,7 +182,7 @@ void main() {
       ),
     );
 
-    await tester.pumpWidget(MoeenProviderApp(api: api, sessionStore: store));
+    await tester.pumpWidget(MoeenProviderApp(api: api, sessionStore: store, hiddenStore: _MemoryHiddenStore()));
     await tester.pumpAndSettle();
 
     expect(find.text('فرص العمل المتاحة'), findsOneWidget);
@@ -202,7 +202,7 @@ void main() {
       ),
     );
 
-    await tester.pumpWidget(MoeenProviderApp(api: api, sessionStore: store));
+    await tester.pumpWidget(MoeenProviderApp(api: api, sessionStore: store, hiddenStore: _MemoryHiddenStore()));
     await tester.pumpAndSettle();
 
     expect(find.text('لا توجد فرص متاحة حاليًا.'), findsOneWidget);
@@ -234,7 +234,7 @@ void main() {
         ),
       );
 
-      await tester.pumpWidget(MoeenProviderApp(api: api, sessionStore: store));
+      await tester.pumpWidget(MoeenProviderApp(api: api, sessionStore: store, hiddenStore: _MemoryHiddenStore()));
       await tester.pumpAndSettle();
 
       await tester.tap(find.text('تقديم عرض'));
@@ -273,7 +273,7 @@ void main() {
         ),
       );
 
-      await tester.pumpWidget(MoeenProviderApp(api: api, sessionStore: store));
+      await tester.pumpWidget(MoeenProviderApp(api: api, sessionStore: store, hiddenStore: _MemoryHiddenStore()));
       await tester.pumpAndSettle();
 
       await tester.tap(find.text('تقديم عرض'));
@@ -314,7 +314,7 @@ void main() {
         ),
       );
 
-      await tester.pumpWidget(MoeenProviderApp(api: api, sessionStore: store));
+      await tester.pumpWidget(MoeenProviderApp(api: api, sessionStore: store, hiddenStore: _MemoryHiddenStore()));
       await tester.pumpAndSettle();
 
       expect(
@@ -342,7 +342,7 @@ void main() {
         ),
       );
 
-      await tester.pumpWidget(MoeenProviderApp(api: api, sessionStore: store));
+      await tester.pumpWidget(MoeenProviderApp(api: api, sessionStore: store, hiddenStore: _MemoryHiddenStore()));
       await tester.pumpAndSettle();
 
       expect(store.token, isNull);
@@ -366,7 +366,7 @@ void main() {
         ),
       );
 
-      await tester.pumpWidget(MoeenProviderApp(api: api, sessionStore: store));
+      await tester.pumpWidget(MoeenProviderApp(api: api, sessionStore: store, hiddenStore: _MemoryHiddenStore()));
       await tester.pumpAndSettle();
 
       await tester.tap(find.text('تقديم عرض'));
@@ -453,6 +453,179 @@ void main() {
 
     expect(opportunityMessage(opp), 'مغلقة');
   });
+
+  testWidgets('hide action appears only for final rejected, withdrawn, and losing-closed opportunities', (tester) async {
+    final cases = <String, String>{
+      'rejected': 'تم رفض عرضك',
+      'withdrawn': 'عرضك مسحوب',
+      'closed-losing': 'تم إغلاق الفرصة بعد اختيار عرض آخر',
+    };
+    for (final entry in cases.entries) {
+      final json = switch (entry.key) {
+        'rejected' => _opportunitiesRejectedJson,
+        'withdrawn' => _opportunitiesWithdrawnJson,
+        _ => _opportunitiesClosedLosingJson,
+      };
+      final store = _MemorySessionStore()..token = 'stale-token';
+      final api = ProviderApi(
+        baseUrl: 'https://api.example.test',
+        client: _dashboardMockClient(
+          opportunitiesHandler: (_) async =>
+              http.Response(json, 200, headers: _jsonUtf8),
+        ),
+      );
+      // Tear down the previous app state so each iteration boots fresh.
+      await tester.pumpWidget(const SizedBox());
+      await tester.pumpWidget(
+        MoeenProviderApp(
+          api: api,
+          sessionStore: store,
+          hiddenStore: _MemoryHiddenStore(),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(find.textContaining(entry.value), findsOneWidget,
+          reason: 'outcome message for ${entry.key}');
+      expect(find.text('إخفاء من قائمتي'), findsOneWidget,
+          reason: 'hide button for ${entry.key}');
+    }
+  });
+
+  testWidgets('hide action never appears for invited, quoted, or winning-closed opportunities', (tester) async {
+    final cases = <String, String>{
+      'invited': _opportunitiesInvitedJson,
+      'quoted': _opportunitiesQuotedJson,
+      'winning-closed': _opportunitiesClosedWinnerJson,
+    };
+    for (final entry in cases.entries) {
+      final store = _MemorySessionStore()..token = 'stale-token';
+      final api = ProviderApi(
+        baseUrl: 'https://api.example.test',
+        client: _dashboardMockClient(
+          opportunitiesHandler: (_) async =>
+              http.Response(entry.value, 200, headers: _jsonUtf8),
+        ),
+      );
+      // Tear down the previous app state so each iteration boots fresh.
+      await tester.pumpWidget(const SizedBox());
+      await tester.pumpWidget(
+        MoeenProviderApp(
+          api: api,
+          sessionStore: store,
+          hiddenStore: _MemoryHiddenStore(),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('إخفاء من قائمتي'), findsNothing,
+          reason: 'no hide button for ${entry.key}');
+    }
+  });
+
+  testWidgets('tapping hide removes the card immediately with zero HTTP requests', (tester) async {
+    var totalRequests = 0;
+    final api = ProviderApi(
+      baseUrl: 'https://api.example.test',
+      client: MockClient((request) async {
+        totalRequests += 1;
+        final path = request.url.path;
+        if (path == '/provider/auth/me') {
+          return http.Response(_providerJson, 200, headers: _jsonUtf8);
+        }
+        if (path == '/provider/service-requests') {
+          return http.Response('[]', 200);
+        }
+        if (path == '/provider/opportunities') {
+          return http.Response(_opportunitiesRejectedJson, 200,
+              headers: _jsonUtf8);
+        }
+        return http.Response('{}', 404);
+      }),
+    );
+    final store = _MemorySessionStore()..token = 'stale-token';
+
+    await tester.pumpWidget(
+      MoeenProviderApp(
+        api: api,
+        sessionStore: store,
+        hiddenStore: _MemoryHiddenStore(),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('إخفاء من قائمتي'), findsOneWidget);
+
+    final requestsBefore = totalRequests;
+    await tester.tap(find.text('إخفاء من قائمتي'));
+    await tester.pumpAndSettle();
+
+    expect(totalRequests, requestsBefore);
+    expect(find.text('إخفاء من قائمتي'), findsNothing);
+    expect(find.text('لا توجد فرص متاحة حاليًا.'), findsOneWidget);
+  });
+
+  testWidgets('hidden requestId stays hidden after a rebuild for the same provider', (tester) async {
+    final hiddenStore = _MemoryHiddenStore();
+    final store = _MemorySessionStore()..token = 'stale-token';
+    final api = ProviderApi(
+      baseUrl: 'https://api.example.test',
+      client: _dashboardMockClient(
+        opportunitiesHandler: (_) async => http.Response(
+            _opportunitiesRejectedJson, 200,
+            headers: _jsonUtf8),
+      ),
+    );
+    Widget app() => MoeenProviderApp(
+          api: api,
+          sessionStore: store,
+          hiddenStore: hiddenStore,
+        );
+
+    await tester.pumpWidget(app());
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('إخفاء من قائمتي'));
+    await tester.pumpAndSettle();
+    expect(find.text('إخفاء من قائمتي'), findsNothing);
+
+    // Rebuild the whole widget tree with the same stores.
+    await tester.pumpWidget(Container());
+    await tester.pumpWidget(app());
+    await tester.pumpAndSettle();
+    expect(find.text('إخفاء من قائمتي'), findsNothing);
+    expect(find.text('لا توجد فرص متاحة حاليًا.'), findsOneWidget);
+  });
+
+  testWidgets('a different provider account does not inherit the hidden list', (tester) async {
+    final hiddenStore = _MemoryHiddenStore();
+    await hiddenStore.hideRequest('provider-1', 'MOE-9');
+    final store = _MemorySessionStore()..token = 'stale-token';
+    final api = ProviderApi(
+      baseUrl: 'https://api.example.test',
+      client: MockClient((request) async {
+        final path = request.url.path;
+        if (path == '/provider/auth/me') {
+          return http.Response(_providerJsonOther, 200, headers: _jsonUtf8);
+        }
+        if (path == '/provider/service-requests') {
+          return http.Response('[]', 200);
+        }
+        if (path == '/provider/opportunities') {
+          return http.Response(_opportunitiesRejectedJson, 200,
+              headers: _jsonUtf8);
+        }
+        return http.Response('{}', 404);
+      }),
+    );
+
+    await tester.pumpWidget(
+      MoeenProviderApp(
+        api: api,
+        sessionStore: store,
+        hiddenStore: hiddenStore,
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('إخفاء من قائمتي'), findsOneWidget);
+  });
 }
 
 class _MemorySessionStore implements ProviderSessionStore {
@@ -468,8 +641,25 @@ class _MemorySessionStore implements ProviderSessionStore {
   Future<void> clearToken() async => token = null;
 }
 
+class _MemoryHiddenStore implements HiddenOpportunitiesStore {
+  final Map<String, Set<String>> _hidden = {};
+
+  @override
+  Future<Set<String>> readHidden(String providerId) async =>
+      _hidden[providerId] ?? {};
+
+  @override
+  Future<void> hideRequest(String providerId, String requestId) async {
+    _hidden.putIfAbsent(providerId, () => <String>{}).add(requestId);
+  }
+}
+
 const _providerJson =
     '{"id":"provider-1","name":"مقدم اختبار","specialties":["ac-cleaning"],'
+    '"serviceZone":"بريدة","available":true}';
+
+const _providerJsonOther =
+    '{"id":"provider-2","name":"مقدم آخر","specialties":["ac-cleaning"],'
     '"serviceZone":"بريدة","available":true}';
 
 const _jsonUtf8 = {'content-type': 'application/json; charset=utf-8'};
@@ -484,6 +674,34 @@ const _opportunitiesQuotedJson =
     '"myQuote":{"id":"QTE-1","providerId":"provider-1",'
     '"amountHalalas":15000,"scope":"full clean","status":"proposed",'
     '"proposedAt":"2026-08-07T00:00:00.000Z"}}]';
+
+const _opportunitiesRejectedJson =
+    '[{"requestId":"MOE-9","serviceId":"ac-cleaning",'
+    '"timing":"as-soon-as-possible","opportunityStatus":"rejected",'
+    '"myQuote":{"id":"QTE-9","providerId":"provider-1",'
+    '"amountHalalas":15000,"scope":"عرض مرفوض","status":"rejected",'
+    '"proposedAt":"2026-08-07T00:00:00.000Z","decidedAt":"2026-08-07T01:00:00.000Z"}}]';
+
+const _opportunitiesWithdrawnJson =
+    '[{"requestId":"MOE-10","serviceId":"ac-cleaning",'
+    '"timing":"as-soon-as-possible","opportunityStatus":"withdrawn",'
+    '"myQuote":{"id":"QTE-10","providerId":"provider-1",'
+    '"amountHalalas":15000,"scope":"عرض مسحوب","status":"withdrawn",'
+    '"proposedAt":"2026-08-07T00:00:00.000Z","decidedAt":"2026-08-07T01:00:00.000Z"}}]';
+
+const _opportunitiesClosedLosingJson =
+    '[{"requestId":"MOE-11","serviceId":"ac-cleaning",'
+    '"timing":"as-soon-as-possible","opportunityStatus":"closed",'
+    '"myQuote":{"id":"QTE-11","providerId":"provider-1",'
+    '"amountHalalas":12000,"scope":"عرض خاسر","status":"rejected",'
+    '"proposedAt":"2026-08-07T00:00:00.000Z","decidedAt":"2026-08-07T01:00:00.000Z"}}]';
+
+const _opportunitiesClosedWinnerJson =
+    '[{"requestId":"MOE-12","serviceId":"ac-cleaning",'
+    '"timing":"as-soon-as-possible","opportunityStatus":"closed",'
+    '"myQuote":{"id":"QTE-12","providerId":"provider-1",'
+    '"amountHalalas":14000,"scope":"عرض فائز","status":"approved",'
+    '"proposedAt":"2026-08-07T00:00:00.000Z","decidedAt":"2026-08-07T01:00:00.000Z"}}]';
 
 const _quoteCreatedJson =
     '{"id":"QTE-1","providerId":"provider-1","amountHalalas":15000,'

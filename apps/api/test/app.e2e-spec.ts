@@ -68,7 +68,11 @@ async function createStaffAuthorization(
 async function createProviderAuthorization(
   app: INestApplication<App>,
   specialties: string[],
-): Promise<{ providerId: string; authorization: string }> {
+): Promise<{
+  providerId: string;
+  name: string;
+  authorization: string;
+}> {
   const adminAuthorization = await createStaffAuthorization(app, 'admin');
   const created = await request(app.getHttpServer())
     .post('/providers')
@@ -80,6 +84,7 @@ async function createProviderAuthorization(
     })
     .expect(201);
   const providerId = requiredString(created.body, 'id');
+  const name = requiredString(created.body, 'name');
   await request(app.getHttpServer())
     .patch(`/providers/${providerId}/verification`)
     .set('Authorization', adminAuthorization)
@@ -96,6 +101,7 @@ async function createProviderAuthorization(
     .expect(201);
   return {
     providerId,
+    name,
     authorization: `Bearer ${requiredString(login.body, 'token')}`,
   };
 }
@@ -1850,6 +1856,101 @@ describe('AppController (e2e)', () => {
     >;
     expect(bOpp.opportunityStatus).toBe('closed');
     expect((bOpp.myQuote as Record<string, unknown>).status).toBe('approved');
+  });
+
+  it('includes providerSummary with name, average rating and rating count in customer quote views', async () => {
+    // 1. Provider A earns one completed, rated request (rating 5/5).
+    const providerA = await createProviderAuthorization(app, ['ac-cleaning']);
+    const ratedCustomer = await createCustomerAuthorization(app);
+    const ratedRequestId = await createCustomerServiceRequest(
+      app,
+      ratedCustomer,
+    );
+    await request(app.getHttpServer())
+      .post(`/provider/opportunities/${ratedRequestId}/quotes`)
+      .set('Authorization', providerA.authorization)
+      .send({ amountHalalas: 10000, scope: 'تنظيف المكيف' })
+      .expect(201);
+    const ratedView = await request(app.getHttpServer())
+      .get('/my/service-requests')
+      .set('Authorization', ratedCustomer)
+      .expect(200);
+    const ratedRequest = (ratedView.body as Record<string, unknown>[]).find(
+      (item) => item.id === ratedRequestId,
+    ) as Record<string, unknown>;
+    const ratedQuotes = ratedRequest.quotes as Record<string, unknown>[];
+    const approvedQuote = ratedQuotes.find(
+      (quote) => quote.status === 'proposed',
+    ) as Record<string, unknown>;
+    await request(app.getHttpServer())
+      .post(
+        `/my/service-requests/${ratedRequestId}/quotes/${String(approvedQuote.id)}/decision`,
+      )
+      .set('Authorization', ratedCustomer)
+      .send({ decision: 'approved' })
+      .expect(201);
+    for (const status of ['on_the_way', 'in_progress', 'completed']) {
+      await request(app.getHttpServer())
+        .patch(`/provider/service-requests/${ratedRequestId}/status`)
+        .set('Authorization', providerA.authorization)
+        .send({ status })
+        .expect(200);
+    }
+    await request(app.getHttpServer())
+      .post(`/my/service-requests/${ratedRequestId}/rating`)
+      .set('Authorization', ratedCustomer)
+      .send({ rating: 5, comment: 'خدمة ممتازة' })
+      .expect(201);
+
+    // 2. A new request where A (rated) and B (unrated) both quote.
+    const providerB = await createProviderAuthorization(app, ['ac-cleaning']);
+    const customer = await createCustomerAuthorization(app);
+    const requestId = await createCustomerServiceRequest(app, customer);
+    await request(app.getHttpServer())
+      .post(`/provider/opportunities/${requestId}/quotes`)
+      .set('Authorization', providerA.authorization)
+      .send({ amountHalalas: 15000, scope: 'عرض أ' })
+      .expect(201);
+    await request(app.getHttpServer())
+      .post(`/provider/opportunities/${requestId}/quotes`)
+      .set('Authorization', providerB.authorization)
+      .send({ amountHalalas: 12000, scope: 'عرض ب' })
+      .expect(201);
+
+    // 3. The customer quote list carries a safe provider summary per quote.
+    const view = await request(app.getHttpServer())
+      .get('/my/service-requests')
+      .set('Authorization', customer)
+      .expect(200);
+    const record = (view.body as Record<string, unknown>[]).find(
+      (item) => item.id === requestId,
+    ) as Record<string, unknown>;
+    const quotes = record.quotes as Record<string, unknown>[];
+    const quoteA = quotes.find((quote) => quote.scope === 'عرض أ') as Record<
+      string,
+      unknown
+    >;
+    const quoteB = quotes.find((quote) => quote.scope === 'عرض ب') as Record<
+      string,
+      unknown
+    >;
+    expect(quoteA.providerSummary).toEqual({
+      name: providerA.name,
+      averageRating: 5,
+      ratingCount: 1,
+    });
+    expect(quoteB.providerSummary).toEqual({
+      name: providerB.name,
+      averageRating: null,
+      ratingCount: 0,
+    });
+    // Existing quote fields remain present.
+    expect(quoteA.amountHalalas).toBe(15000);
+    expect(quoteA.status).toBe('proposed');
+    // No provider identity or internal fields leak to the customer.
+    const serialized = JSON.stringify(record);
+    expect(serialized).not.toContain(providerA.providerId);
+    expect(serialized).not.toContain(providerB.providerId);
   });
 
   it('keeps the legacy staff quote flow unchanged when no opportunities exist', async () => {
