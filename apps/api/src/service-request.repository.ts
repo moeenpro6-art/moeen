@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
-import { Pool } from 'pg';
+import { Pool, type PoolClient } from 'pg';
 import { resolveDatabaseConnectionString } from './database.config';
 import {
   hashProviderAccessCode,
@@ -446,6 +446,12 @@ export class ServiceRequestRepository
          VALUES ($1, 'request_created', $2)`,
         [row.id, row.status],
       );
+      await this.insertEligibleOpportunities(
+        client,
+        Number.parseInt(row.id, 10),
+        row.service_id,
+        row.status,
+      );
       await client.query('COMMIT');
       return this.toServiceRequest(row);
     } catch (error) {
@@ -454,6 +460,42 @@ export class ServiceRequestRepository
     } finally {
       client.release();
     }
+  }
+
+  /**
+   * Set-based automatic invitation: creates one `invited` opportunity per
+   * eligible provider (verified, available, matching specialty) for a newly
+   * created request, inside the caller's transaction. Only rows actually
+   * inserted by this helper produce an `opportunity_invited` event; conflicts
+   * are skipped silently via the unique constraint.
+   */
+  private async insertEligibleOpportunities(
+    client: PoolClient,
+    serviceRequestDatabaseId: number,
+    serviceId: string,
+    requestStatus: string,
+  ): Promise<void> {
+    const inserted = await client.query<{ provider_id: string }>(
+      `INSERT INTO request_provider_opportunities (service_request_id, provider_id)
+       SELECT $1, p.id
+       FROM providers p
+       WHERE p.verification_status = 'verified'
+         AND p.available = TRUE
+         AND $2 = ANY(p.specialties)
+       ON CONFLICT (service_request_id, provider_id) DO NOTHING
+       RETURNING provider_id`,
+      [serviceRequestDatabaseId, serviceId],
+    );
+    if (inserted.rows.length === 0) return;
+    await client.query(
+      `INSERT INTO service_request_events (service_request_id, type, status)
+       SELECT service_request_id, 'opportunity_invited', status
+       FROM unnest($1::int[], $2::text[]) AS t(service_request_id, status)`,
+      [
+        Array(inserted.rows.length).fill(serviceRequestDatabaseId),
+        Array(inserted.rows.length).fill(requestStatus),
+      ],
+    );
   }
 
   async findAll(): Promise<ServiceRequest[]> {

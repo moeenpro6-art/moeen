@@ -561,12 +561,14 @@ describe('ServiceRequestRepository', () => {
       customer.id,
     );
 
-    await expect(historyReader.findRequestEvents(request.id)).resolves.toEqual([
-      expect.objectContaining({
-        type: 'request_created',
-        status: 'pending_dispatch',
-      }),
-    ]);
+    await expect(historyReader.findRequestEvents(request.id)).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: 'request_created',
+          status: 'pending_dispatch',
+        }),
+      ]),
+    );
   });
 
   it('requires customer approval before a quoted job can enter service', async () => {
@@ -587,15 +589,20 @@ describe('ServiceRequestRepository', () => {
     expect(typeof quoteStore.decideQuote).toBe('function');
 
     const customer = await repository.upsertCustomer('+966****3464');
+    // A unique serviceId guarantees no provider (seeded or accumulated from
+    // earlier runs) can match, so the request has no auto-created
+    // opportunities and the legacy staff quote path applies.
+    const uniqueServiceId = `staff-flow-${randomUUID()}`;
     const request = await repository.create(
       {
-        serviceId: 'plumbing',
+        serviceId: uniqueServiceId,
         address: 'حي الصفراء، بريدة',
         timing: 'as-soon-as-possible',
       },
       customer.id,
     );
-    await repository.assignProvider(request.id, 'provider-3');
+    const staffProvider = await createVerifiedProvider([uniqueServiceId]);
+    await repository.assignProvider(request.id, staffProvider.id);
     await repository.updateStatus(request.id, 'on_the_way');
 
     const quote = await quoteStore.proposeQuote(
@@ -634,22 +641,30 @@ describe('ServiceRequestRepository', () => {
     await repository.updateStatus(request.id, 'in_progress');
     await repository.updateStatus(request.id, 'completed');
 
-    await expect(repository.findRequestEvents(request.id)).resolves.toEqual([
-      expect.objectContaining({
-        type: 'request_created',
-        status: 'pending_dispatch',
-      }),
-      expect.objectContaining({
-        type: 'provider_assigned',
-        status: 'assigned',
-      }),
-      expect.objectContaining({ type: 'status_updated', status: 'on_the_way' }),
-      expect.objectContaining({
-        type: 'status_updated',
-        status: 'in_progress',
-      }),
-      expect.objectContaining({ type: 'status_updated', status: 'completed' }),
-    ]);
+    await expect(repository.findRequestEvents(request.id)).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: 'request_created',
+          status: 'pending_dispatch',
+        }),
+        expect.objectContaining({
+          type: 'provider_assigned',
+          status: 'assigned',
+        }),
+        expect.objectContaining({
+          type: 'status_updated',
+          status: 'on_the_way',
+        }),
+        expect.objectContaining({
+          type: 'status_updated',
+          status: 'in_progress',
+        }),
+        expect.objectContaining({
+          type: 'status_updated',
+          status: 'completed',
+        }),
+      ]),
+    );
   });
 
   it('does not allow a dispatched job to be assigned a second time', async () => {
@@ -697,15 +712,19 @@ describe('ServiceRequestRepository', () => {
     const customer = await repository.upsertCustomer(
       `cash-test-${randomUUID()}`,
     );
+    // A unique serviceId guarantees no provider can match, so the request
+    // has no auto-created opportunities and the staff quote path applies.
+    const uniqueServiceId = `staff-cash-${randomUUID()}`;
     const request = await repository.create(
       {
-        serviceId: 'plumbing',
+        serviceId: uniqueServiceId,
         address: 'حي الصفراء، بريدة',
         timing: 'as-soon-as-possible',
       },
       customer.id,
     );
-    await repository.assignProvider(request.id, 'provider-3');
+    const staffProvider = await createVerifiedProvider([uniqueServiceId]);
+    await repository.assignProvider(request.id, staffProvider.id);
     await repository.updateStatus(request.id, 'on_the_way');
     const quote = await repository.proposeQuote(
       request.id,
@@ -805,6 +824,10 @@ describe('ServiceRequestRepository', () => {
   }
 
   it('invites only eligible providers and records opportunity events', async () => {
+    // Request is created first so the providers below do not exist at
+    // auto-invite time; the manual invitation path then exercises its own
+    // eligibility filtering.
+    const { request } = await createPendingRequest('ac-cleaning');
     const eligible = await createVerifiedProvider(['ac-cleaning']);
     const pending = await repository.createPilotProvider({
       name: `مقدم معلق ${randomUUID().slice(0, 8)}`,
@@ -816,7 +839,6 @@ describe('ServiceRequestRepository', () => {
       'suspended',
     );
     const wrongSpecialty = await createVerifiedProvider(['plumbing']);
-    const { request } = await createPendingRequest('ac-cleaning');
 
     const created = await repository.inviteProvidersToRequest(request.id, [
       eligible.id,
@@ -843,9 +865,130 @@ describe('ServiceRequestRepository', () => {
     ).resolves.toEqual([]);
   });
 
+  it('automatically invites only eligible providers on request creation, emitting an event per inserted row only', async () => {
+    const eligible = await createVerifiedProvider(['ac-cleaning']);
+    const unavailable = await repository.updateProviderAvailability(
+      (await createVerifiedProvider(['ac-cleaning'])).id,
+      false,
+    );
+    const wrongSpecialty = await createVerifiedProvider(['plumbing']);
+    const customer = await repository.upsertCustomer(
+      `+9665${String(Math.floor(10_000_000 + Math.random() * 89_999_999))}`,
+    );
+
+    const created = await repository.create(
+      {
+        serviceId: 'ac-cleaning',
+        address: 'حي الصفراء، بريدة',
+        details: 'تفاصيل حساسة للخصوصية',
+        timing: 'as-soon-as-possible',
+      },
+      customer.id,
+    );
+
+    expect(created.status).toBe('pending_dispatch');
+    const eligibleOpportunities = await repository.listProviderOpportunities(
+      eligible.id,
+    );
+    expect(eligibleOpportunities).toHaveLength(1);
+    expect(eligibleOpportunities[0]).toMatchObject({
+      requestId: created.id,
+      serviceId: 'ac-cleaning',
+      opportunityStatus: 'invited',
+    });
+    // Ineligible providers (unavailable, wrong specialty) get no opportunity.
+    await expect(
+      repository.listProviderOpportunities(unavailable.id),
+    ).resolves.toEqual([]);
+    await expect(
+      repository.listProviderOpportunities(wrongSpecialty.id),
+    ).resolves.toEqual([]);
+
+    // Events: the request_created event plus one opportunity_invited per
+    // provider actually eligible at creation time. The test DB accumulates
+    // providers across runs, so assert relatively: the eligible provider's
+    // row produced an invitation event, and ineligible providers produced
+    // none attributable to them (their opportunity lists are empty).
+    const events = await repository.findRequestEvents(created.id);
+    expect(
+      events.some(
+        (event) =>
+          event.type === 'opportunity_invited' &&
+          event.status === 'pending_dispatch',
+      ),
+    ).toBe(true);
+    expect(events.some((event) => event.type === 'request_created')).toBe(true);
+  });
+
+  it('does not duplicate opportunities or invitation events when a row already exists', async () => {
+    const provider = await createVerifiedProvider(['ac-cleaning']);
+    const customer = await repository.upsertCustomer(
+      `+9665${String(Math.floor(10_000_000 + Math.random() * 89_999_999))}`,
+    );
+
+    // First creation auto-invites the eligible provider.
+    const first = await repository.create(
+      {
+        serviceId: 'ac-cleaning',
+        address: 'حي الصفراء، بريدة',
+        details: 'تفاصيل حساسة للخصوصية',
+        timing: 'as-soon-as-possible',
+      },
+      customer.id,
+    );
+    const before = await repository.listProviderOpportunities(provider.id);
+    expect(before).toHaveLength(1);
+    const beforeCount = (await repository.findRequestEvents(first.id)).filter(
+      (event) => event.type === 'opportunity_invited',
+    ).length;
+
+    // Manual invitation of the same provider is a no-op conflict: no second
+    // opportunity row and no second invitation event.
+    const manual = await repository.inviteProvidersToRequest(first.id, [
+      provider.id,
+    ]);
+    expect(manual).toEqual([]);
+    const after = await repository.listProviderOpportunities(provider.id);
+    expect(after).toHaveLength(1);
+    const afterCount = (await repository.findRequestEvents(first.id)).filter(
+      (event) => event.type === 'opportunity_invited',
+    ).length;
+    expect(afterCount).toBe(beforeCount);
+  });
+
+  it('creates the request without opportunities or invitation events when no provider is eligible', async () => {
+    // A unique serviceId guarantees no provider (seeded or accumulated from
+    // earlier runs) can match it, keeping this test deterministic.
+    const uniqueServiceId = `unmatched-${randomUUID()}`;
+    const customer = await repository.upsertCustomer(
+      `+9665${String(Math.floor(10_000_000 + Math.random() * 89_999_999))}`,
+    );
+    const created = await repository.create(
+      {
+        serviceId: uniqueServiceId,
+        address: 'حي الصفراء، بريدة',
+        details: 'تفاصيل حساسة للخصوصية',
+        timing: 'as-soon-as-possible',
+      },
+      customer.id,
+    );
+
+    expect(created.status).toBe('pending_dispatch');
+    const events = await repository.findRequestEvents(created.id);
+    expect(
+      events.filter((event) => event.type === 'opportunity_invited'),
+    ).toHaveLength(0);
+    expect(events.map((event) => event.type)).toContain('request_created');
+  });
+
   it('rejects invitations when an active quote exists, on completed requests, and for empty lists', async () => {
-    const staffProvider = await createVerifiedProvider(['ac-cleaning']);
-    const quoteRequest = await createPendingRequest('ac-cleaning');
+    // A unique serviceId guarantees no provider can match, so the request
+    // has no auto-created opportunities; the staff quote path then applies
+    // and the "active quote blocks invitations" rule is exercised. The
+    // provider is created after the request so auto-invite cannot reach it.
+    const activeQuoteServiceId = `staff-invite-${randomUUID()}`;
+    const quoteRequest = await createPendingRequest(activeQuoteServiceId);
+    const staffProvider = await createVerifiedProvider([activeQuoteServiceId]);
     await repository.assignProvider(quoteRequest.request.id, staffProvider.id);
     await repository.proposeQuote(
       quoteRequest.request.id,
@@ -860,8 +1003,9 @@ describe('ServiceRequestRepository', () => {
       'An active quote exists; provider invitations are not allowed',
     );
 
-    const completed = await createPendingRequest('ac-cleaning');
-    const mover = await createVerifiedProvider(['ac-cleaning']);
+    const completedServiceId = `staff-completed-${randomUUID()}`;
+    const completed = await createPendingRequest(completedServiceId);
+    const mover = await createVerifiedProvider([completedServiceId]);
     await repository.assignProvider(completed.request.id, mover.id);
     await repository.updateStatus(completed.request.id, 'on_the_way');
     await repository.updateStatus(completed.request.id, 'in_progress');
@@ -964,13 +1108,18 @@ describe('ServiceRequestRepository', () => {
       'Provider quotes are only accepted while the request is pending dispatch',
     );
 
-    const stranger = await createVerifiedProvider(['ac-cleaning']);
+    // The stranger is created after the request so auto-invite cannot reach
+    // it; without an opportunity row, quoting is rejected.
     const { request } = await createPendingRequest('ac-cleaning');
+    const stranger = await createVerifiedProvider(['ac-cleaning']);
     await expect(
       repository.submitProviderQuote(request.id, stranger.id, 10_000, 'عرض'),
     ).rejects.toThrow('Provider opportunity is not open for quoting');
 
+    // A fresh provider (created after the request) is not auto-invited, so
+    // the probe can insert its opportunity row without a unique conflict.
     const staffRequest = await createPendingRequest('ac-cleaning');
+    const staffSectionProvider = await createVerifiedProvider(['ac-cleaning']);
     const probe = new Pool({
       connectionString: resolveDatabaseConnectionString(),
     });
@@ -980,7 +1129,7 @@ describe('ServiceRequestRepository', () => {
       await probe.query(
         `INSERT INTO request_provider_opportunities (service_request_id, provider_id)
          VALUES ($1, $2)`,
-        [requestDatabaseId, provider.id],
+        [requestDatabaseId, staffSectionProvider.id],
       );
       await probe.query(
         `INSERT INTO service_quotes (service_request_id, amount_halalas, scope, status)
@@ -993,7 +1142,7 @@ describe('ServiceRequestRepository', () => {
     await expect(
       repository.submitProviderQuote(
         staffRequest.request.id,
-        provider.id,
+        staffSectionProvider.id,
         10_000,
         'عرض مقدم',
       ),
@@ -1181,8 +1330,13 @@ describe('ServiceRequestRepository', () => {
   });
 
   it('keeps existing staff quote records and old event rows valid after the constraint extensions', async () => {
-    const provider = await createVerifiedProvider(['ac-cleaning']);
-    const { request, customerId } = await createPendingRequest('ac-cleaning');
+    // A unique serviceId guarantees no provider can match, so the request
+    // has no auto-created opportunities and the staff quote path applies.
+    // The provider is created after the request so auto-invite cannot
+    // reach it.
+    const uniqueServiceId = `staff-legacy-${randomUUID()}`;
+    const { request, customerId } = await createPendingRequest(uniqueServiceId);
+    const provider = await createVerifiedProvider([uniqueServiceId]);
     await repository.assignProvider(request.id, provider.id);
     const staffQuote = await repository.proposeQuote(
       request.id,

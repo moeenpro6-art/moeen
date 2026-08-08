@@ -610,21 +610,32 @@ export class AppController {
       'admin',
       'dispatcher',
     ]);
-    const quote = await this.appService.proposeQuote(
-      requestId,
-      body.amountHalalas,
-      body.scope,
-    );
-    await this.staffAuditService.record(actor, {
-      action: 'request.quote_proposed',
-      subjectType: 'service_request',
-      subjectId: requestId,
-      newState: {
-        quoteStatus: quote.status,
-        amountHalalas: quote.amountHalalas,
-      },
-    });
-    return quote;
+    try {
+      const quote = await this.appService.proposeQuote(
+        requestId,
+        body.amountHalalas,
+        body.scope,
+      );
+      await this.staffAuditService.record(actor, {
+        action: 'request.quote_proposed',
+        subjectType: 'service_request',
+        subjectId: requestId,
+        newState: {
+          quoteStatus: quote.status,
+          amountHalalas: quote.amountHalalas,
+        },
+      });
+      return quote;
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        error.message ===
+          'Request is in the marketplace quote flow; staff quotes are not allowed'
+      ) {
+        throw new ConflictException(error.message);
+      }
+      throw error;
+    }
   }
 
   @Post('service-requests/:id/opportunities')

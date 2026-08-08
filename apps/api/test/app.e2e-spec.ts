@@ -135,6 +135,93 @@ async function createCustomerServiceRequest(
   return requiredString(created.body, 'id');
 }
 
+/**
+ * Makes a seeded provider (provider-1/2/3) unavailable so automatic
+ * invitations skip it. Returns a provider authorization for later use.
+ */
+async function makeSeededProviderUnavailable(
+  app: INestApplication<App>,
+  providerId: string,
+): Promise<string> {
+  const staffAuthorization = await createStaffAuthorization(app, 'admin');
+  const accessCode = `provider-access-${randomUUID()}`;
+  await request(app.getHttpServer())
+    .post(`/providers/${providerId}/access-code`)
+    .set('Authorization', staffAuthorization)
+    .send({ accessCode })
+    .expect(201);
+  const login = await request(app.getHttpServer())
+    .post('/provider/auth/login')
+    .send({ accessCode })
+    .expect(201);
+  const authorization = `Bearer ${requiredString(login.body, 'token')}`;
+  await request(app.getHttpServer())
+    .patch('/provider/availability')
+    .set('Authorization', authorization)
+    .send({ available: false })
+    .expect(200);
+  return authorization;
+}
+
+/**
+ * Removes E2E-created PILOT providers (and their dependent rows) whose
+ * specialties include the given serviceId, so a later request for that
+ * service deterministically has zero eligible matching providers. This is
+ * test-only database cleanup; it never touches seeded or production rows.
+ */
+async function removePilotProvidersForService(
+  serviceId: string,
+): Promise<void> {
+  const pool = new Pool({ connectionString: process.env.TEST_DATABASE_URL });
+  try {
+    await pool.query(
+      `DELETE FROM service_payments
+       WHERE quote_id IN (
+         SELECT id FROM service_quotes WHERE provider_id LIKE 'PILOT-%'
+       )
+          OR service_request_id IN (
+         SELECT id FROM service_requests WHERE assigned_provider_id LIKE 'PILOT-%'
+       )`,
+    );
+    await pool.query(
+      `DELETE FROM service_request_events
+       WHERE service_request_id IN (
+         SELECT id FROM service_requests WHERE assigned_provider_id LIKE 'PILOT-%'
+       )`,
+    );
+    await pool.query(
+      `DELETE FROM request_provider_opportunities
+       WHERE provider_id LIKE 'PILOT-%'
+          OR service_request_id IN (
+         SELECT id FROM service_requests WHERE assigned_provider_id LIKE 'PILOT-%'
+       )`,
+    );
+    await pool.query(
+      `DELETE FROM service_quotes
+       WHERE provider_id LIKE 'PILOT-%'
+          OR service_request_id IN (
+         SELECT id FROM service_requests WHERE assigned_provider_id LIKE 'PILOT-%'
+       )`,
+    );
+    await pool.query(
+      `DELETE FROM service_requests WHERE assigned_provider_id LIKE 'PILOT-%'`,
+    );
+    await pool.query(
+      `DELETE FROM provider_sessions WHERE provider_id LIKE 'PILOT-%'`,
+    );
+    await pool.query(
+      `DELETE FROM provider_access_credentials WHERE provider_id LIKE 'PILOT-%'`,
+    );
+    await pool.query(
+      `DELETE FROM providers
+       WHERE id LIKE 'PILOT-%' AND $1 = ANY(specialties)`,
+      [serviceId],
+    );
+  } finally {
+    await pool.end();
+  }
+}
+
 let nextTestPhoneSuffix = 0;
 const testPhoneRunSeed =
   Number.parseInt(randomUUID().replaceAll('-', '').slice(0, 8), 16) %
@@ -420,6 +507,11 @@ describe('AppController (e2e)', () => {
       })
       .expect(201);
     const customerAuthorization = `Bearer ${requiredString(verified.body, 'token')}`;
+    // The legacy staff flow needs a request with no marketplace opportunity:
+    // make the seeded ac-cleaning provider unavailable and remove PILOT
+    // providers accumulated by earlier tests, so auto-invite finds nobody.
+    await makeSeededProviderUnavailable(app, 'provider-1');
+    await removePilotProvidersForService('ac-cleaning');
     const created = await request(app.getHttpServer())
       .post('/service-requests')
       .set('Authorization', customerAuthorization)
@@ -434,11 +526,16 @@ describe('AppController (e2e)', () => {
       app,
       'dispatcher',
     );
+    // A provider created AFTER the request did not exist at auto-invite time,
+    // so the request has no opportunity rows and the staff quote path applies.
+    const legacyProvider = await createProviderAuthorization(app, [
+      'ac-cleaning',
+    ]);
 
     await request(app.getHttpServer())
       .patch(`/service-requests/${requestId}/assignment`)
       .set('Authorization', staffAuthorization)
-      .send({ providerId: 'provider-1' })
+      .send({ providerId: legacyProvider.providerId })
       .expect(200);
     await request(app.getHttpServer())
       .patch(`/service-requests/${requestId}/status`)
@@ -503,6 +600,11 @@ describe('AppController (e2e)', () => {
       })
       .expect(201);
     const customerAuthorization = `Bearer ${requiredString(verified.body, 'token')}`;
+    // Legacy staff flow: the request must have no marketplace opportunity.
+    // Make the seeded plumbing provider unavailable and remove PILOT
+    // providers accumulated by earlier tests before creating the request.
+    await makeSeededProviderUnavailable(app, 'provider-3');
+    await removePilotProvidersForService('plumbing');
     const created = await request(app.getHttpServer())
       .post('/service-requests')
       .set('Authorization', customerAuthorization)
@@ -517,11 +619,14 @@ describe('AppController (e2e)', () => {
       app,
       'dispatcher',
     );
+    // Provider created after the request: no auto-created opportunity, so the
+    // legacy staff quote flow applies.
+    const legacyProvider = await createProviderAuthorization(app, ['plumbing']);
 
     await request(app.getHttpServer())
       .patch(`/service-requests/${requestId}/assignment`)
       .set('Authorization', dispatcherAuthorization)
-      .send({ providerId: 'provider-3' })
+      .send({ providerId: legacyProvider.providerId })
       .expect(200);
     await request(app.getHttpServer())
       .patch(`/service-requests/${requestId}/status`)
@@ -627,6 +732,13 @@ describe('AppController (e2e)', () => {
       })
       .expect(201);
     const customerAuthorization = `Bearer ${requiredString(verified.body, 'token')}`;
+    // Legacy staff flow: both requests must have no marketplace
+    // opportunities. Disable the seeded providers for ac-cleaning and
+    // plumbing and remove PILOT providers accumulated by earlier tests.
+    await makeSeededProviderUnavailable(app, 'provider-1');
+    await makeSeededProviderUnavailable(app, 'provider-3');
+    await removePilotProvidersForService('ac-cleaning');
+    await removePilotProvidersForService('plumbing');
     const ownRequest = await request(app.getHttpServer())
       .post('/service-requests')
       .set('Authorization', customerAuthorization)
@@ -648,29 +760,25 @@ describe('AppController (e2e)', () => {
     const ownRequestId = requiredString(ownRequest.body, 'id');
     const otherRequestId = requiredString(otherRequest.body, 'id');
     const staffAuthorization = await createStaffAuthorization(app);
+    // Fresh providers created after the requests: no auto-created
+    // opportunities, so the legacy staff assignment/quote flow applies.
+    const ownProvider = await createProviderAuthorization(app, ['ac-cleaning']);
+    const otherProvider = await createProviderAuthorization(app, ['plumbing']);
 
     await request(app.getHttpServer())
       .patch(`/service-requests/${ownRequestId}/assignment`)
       .set('Authorization', staffAuthorization)
-      .send({ providerId: 'provider-1' })
+      .send({ providerId: ownProvider.providerId })
       .expect(200);
     await request(app.getHttpServer())
       .patch(`/service-requests/${otherRequestId}/assignment`)
       .set('Authorization', staffAuthorization)
-      .send({ providerId: 'provider-3' })
+      .send({ providerId: otherProvider.providerId })
       .expect(200);
 
-    const accessCode = `provider-access-${randomUUID()}`;
-    await request(app.getHttpServer())
-      .post('/providers/provider-1/access-code')
-      .set('Authorization', staffAuthorization)
-      .send({ accessCode })
-      .expect(201);
-    const providerLogin = await request(app.getHttpServer())
-      .post('/provider/auth/login')
-      .send({ accessCode })
-      .expect(201);
-    const providerAuthorization = `Bearer ${requiredString(providerLogin.body, 'token')}`;
+    // ownProvider was created (and logged in) via createProviderAuthorization
+    // after the requests, so its session token is already available.
+    const providerAuthorization = ownProvider.authorization;
 
     await request(app.getHttpServer())
       .get('/provider/service-requests')
@@ -938,6 +1046,281 @@ describe('AppController (e2e)', () => {
     const serialized = JSON.stringify(body);
     expect(serialized).not.toContain('حي الصفراء');
     expect(serialized).not.toContain('معلومات حساسة');
+  });
+
+  it('auto-invites eligible verified/available providers when a customer creates a request', async () => {
+    // Eligible provider exists BEFORE the request is created.
+    const eligible = await createProviderAuthorization(app, ['ac-cleaning']);
+    const customerAuthorization = await createCustomerAuthorization(app);
+    const requestId = await createCustomerServiceRequest(
+      app,
+      customerAuthorization,
+    );
+
+    const opportunities = await request(app.getHttpServer())
+      .get('/provider/opportunities')
+      .set('Authorization', eligible.authorization)
+      .expect(200);
+    const body = opportunities.body as Record<string, unknown>[];
+    expect(body).toHaveLength(1);
+    expect(body[0]).toMatchObject({
+      requestId,
+      serviceId: 'ac-cleaning',
+      opportunityStatus: 'invited',
+    });
+    // Privacy: no address, customer identity, phone, or details leaked.
+    const serialized = JSON.stringify(body);
+    expect(serialized).not.toContain('حي الصفراء');
+    expect(serialized).not.toContain('معلومات حساسة');
+  });
+
+  it('excludes unverified, unavailable, and non-matching providers from automatic invitations', async () => {
+    const adminAuthorization = await createStaffAuthorization(app, 'admin');
+    // Unverified provider (no verification patch applied).
+    const unverified = await request(app.getHttpServer())
+      .post('/providers')
+      .set('Authorization', adminAuthorization)
+      .send({
+        name: `مقدم غير موثق ${randomUUID().slice(0, 8)}`,
+        specialties: ['ac-cleaning'],
+        serviceZone: 'بريدة',
+      })
+      .expect(201);
+    const unverifiedId = requiredString(unverified.body, 'id');
+    // Unavailable provider (created verified, then set unavailable).
+    const unavailableProvider = await createProviderAuthorization(app, [
+      'ac-cleaning',
+    ]);
+    // Set unavailable through the provider's own session (the admin-side
+    // /providers/:id/availability route does not exist).
+    await request(app.getHttpServer())
+      .patch('/provider/availability')
+      .set('Authorization', unavailableProvider.authorization)
+      .send({ available: false })
+      .expect(200);
+    // Non-matching provider (different specialty).
+    await createProviderAuthorization(app, ['plumbing']);
+    // Eligible provider must exist BEFORE the request is created.
+    const eligible = await createProviderAuthorization(app, ['ac-cleaning']);
+
+    const customerAuthorization = await createCustomerAuthorization(app);
+    const requestId = await createCustomerServiceRequest(
+      app,
+      customerAuthorization,
+    );
+
+    // The eligible (verified + available + matching) provider sees the
+    // auto-created opportunity.
+    const eligibleView = await request(app.getHttpServer())
+      .get('/provider/opportunities')
+      .set('Authorization', eligible.authorization)
+      .expect(200);
+    const eligibleItems = eligibleView.body as Record<string, unknown>[];
+    expect(eligibleItems).toHaveLength(1);
+    expect(eligibleItems[0]).toMatchObject({
+      requestId,
+      serviceId: 'ac-cleaning',
+      opportunityStatus: 'invited',
+    });
+    // The unavailable provider still has a session; its listing must not
+    // contain the new request (auto-invite skipped it).
+    const unavailableView = await request(app.getHttpServer())
+      .get('/provider/opportunities')
+      .set('Authorization', unavailableProvider.authorization)
+      .expect(200);
+    const unavailableBody = unavailableView.body as Record<string, unknown>[];
+    expect(unavailableBody.some((item) => item.requestId === requestId)).toBe(
+      false,
+    );
+    // The unverified provider cannot log in (no session), so it can never
+    // see the request; confirm its id is not referenced anywhere customer-
+    // visible by checking the customer's request history has no provider id.
+    const history = await request(app.getHttpServer())
+      .get(`/my/service-requests/${requestId}/history`)
+      .set('Authorization', customerAuthorization)
+      .expect(200);
+    expect(JSON.stringify(history.body)).not.toContain(unverifiedId);
+  });
+
+  it('request creation succeeds with zero eligible providers and stays pending_dispatch', async () => {
+    // Make the seeded ac-cleaning provider unavailable so no eligible
+    // provider remains for this service; the request must still succeed.
+    await makeSeededProviderUnavailable(app, 'provider-1');
+    const customerAuthorization = await createCustomerAuthorization(app);
+    const created = await request(app.getHttpServer())
+      .post('/service-requests')
+      .set('Authorization', customerAuthorization)
+      .send({
+        serviceId: 'ac-cleaning',
+        address: 'حي الصفراء، بريدة',
+        details: 'معلومات حساسة للخصوصية',
+        timing: 'as-soon-as-possible',
+      })
+      .expect(201);
+    const requestId = requiredString(created.body, 'id');
+    expect(created.body).toMatchObject({ status: 'pending_dispatch' });
+    // The provider-1 session sees no opportunity for this request.
+    const providerAuthorization = await makeSeededProviderUnavailable(
+      app,
+      'provider-1',
+    );
+    const view = await request(app.getHttpServer())
+      .get('/provider/opportunities')
+      .set('Authorization', providerAuthorization)
+      .expect(200);
+    const body = view.body as Record<string, unknown>[];
+    expect(body.some((item) => item.requestId === requestId)).toBe(false);
+  });
+
+  it('automatic plus manual invitation does not duplicate opportunities or events', async () => {
+    // Earlier tests may leave PILOT ac-cleaning providers in the shared test
+    // DB.  Remove them so the baseline auto-invite count is deterministic
+    // (seeded provider-1 + the single eligible provider created below).
+    await removePilotProvidersForService('ac-cleaning');
+    const eligible = await createProviderAuthorization(app, ['ac-cleaning']);
+    const customerAuthorization = await createCustomerAuthorization(app);
+    const requestId = await createCustomerServiceRequest(
+      app,
+      customerAuthorization,
+    );
+
+    // Baseline events after automatic invitation.
+    const baselineEvents = await request(app.getHttpServer())
+      .get(`/my/service-requests/${requestId}/history`)
+      .set('Authorization', customerAuthorization)
+      .expect(200);
+    const baselineTypes = (baselineEvents.body as Record<string, string>[]).map(
+      (e) => e.type,
+    );
+    const baselineInviteCount = baselineTypes.filter(
+      (t) => t === 'opportunity_invited',
+    ).length;
+    expect(baselineInviteCount).toBeGreaterThanOrEqual(1);
+
+    // Manual re-invite of the already auto-invited provider: no duplicate.
+    const dispatcherAuthorization = await createStaffAuthorization(
+      app,
+      'dispatcher',
+    );
+    const manual = await request(app.getHttpServer())
+      .post(`/service-requests/${requestId}/opportunities`)
+      .set('Authorization', dispatcherAuthorization)
+      .send({ providerIds: [eligible.providerId] })
+      .expect(201);
+    expect(manual.body).toHaveLength(0);
+
+    // Events unchanged after the no-op manual invitation.
+    const afterEvents = await request(app.getHttpServer())
+      .get(`/my/service-requests/${requestId}/history`)
+      .set('Authorization', customerAuthorization)
+      .expect(200);
+    const afterInviteCount = (afterEvents.body as Record<string, string>[])
+      .map((e) => e.type)
+      .filter((t) => t === 'opportunity_invited').length;
+    expect(afterInviteCount).toBe(baselineInviteCount);
+
+    // Exactly one opportunity for the eligible provider on this request.
+    const providerView = await request(app.getHttpServer())
+      .get('/provider/opportunities')
+      .set('Authorization', eligible.authorization)
+      .expect(200);
+    const matches = (providerView.body as Record<string, unknown>[]).filter(
+      (item) => item.requestId === requestId,
+    );
+    expect(matches).toHaveLength(1);
+    expect(matches[0]).toMatchObject({
+      serviceId: 'ac-cleaning',
+      opportunityStatus: 'invited',
+    });
+
+    // Privacy: events expose no provider identity or address.
+    const serialized = JSON.stringify(afterEvents.body);
+    expect(serialized).not.toContain('حي الصفراء');
+    expect(serialized).not.toContain(eligible.providerId);
+  });
+
+  it('rejects staff quote creation with 409 when marketplace opportunities exist', async () => {
+    // An eligible provider exists before the request → auto-invited →
+    // marketplace opportunity exists. Assign a provider to advance the
+    // request to a state where quotes are allowed, then confirm staff quote
+    // is blocked with 409 because opportunities exist.
+    await removePilotProvidersForService('ac-cleaning');
+    const eligible = await createProviderAuthorization(app, ['ac-cleaning']);
+    const customerAuthorization = await createCustomerAuthorization(app);
+    const requestId = await createCustomerServiceRequest(
+      app,
+      customerAuthorization,
+    );
+    const staffAuthorization = await createStaffAuthorization(
+      app,
+      'dispatcher',
+    );
+    await request(app.getHttpServer())
+      .patch(`/service-requests/${requestId}/assignment`)
+      .set('Authorization', staffAuthorization)
+      .send({ providerId: eligible.providerId })
+      .expect(200);
+    await request(app.getHttpServer())
+      .patch(`/service-requests/${requestId}/status`)
+      .set('Authorization', staffAuthorization)
+      .send({ status: 'on_the_way' })
+      .expect(200);
+
+    const res = await request(app.getHttpServer())
+      .post(`/service-requests/${requestId}/quotes`)
+      .set('Authorization', staffAuthorization)
+      .send({ amountHalalas: 10000, scope: 'عرض موظف مرفوض' });
+
+    expect(res.status).toBe(409);
+    const resBody = res.body as { message?: string };
+    expect(resBody.message).toContain('marketplace');
+    // The request state is unchanged: still on_the_way, no staff quote.
+    const view = await request(app.getHttpServer())
+      .get('/my/service-requests')
+      .set('Authorization', customerAuthorization)
+      .expect(200);
+    const myRequest = (view.body as Record<string, unknown>[]).find(
+      (item) => item.id === requestId,
+    ) as Record<string, unknown>;
+    expect(myRequest.status).toBe('on_the_way');
+    expect(myRequest.quote).toBeUndefined();
+  });
+
+  it('quote flow works from automatic invitation through provider opportunity listing', async () => {
+    const eligible = await createProviderAuthorization(app, ['ac-cleaning']);
+    const customerAuthorization = await createCustomerAuthorization(app);
+    const requestId = await createCustomerServiceRequest(
+      app,
+      customerAuthorization,
+    );
+
+    const quote = await request(app.getHttpServer())
+      .post(`/provider/opportunities/${requestId}/quotes`)
+      .set('Authorization', eligible.authorization)
+      .send({ amountHalalas: 15000, scope: 'تنظيف شامل للمكيفات' })
+      .expect(201);
+    expect(quote.body).toMatchObject({
+      status: 'proposed',
+      amountHalalas: 15000,
+    });
+
+    const opportunities = await request(app.getHttpServer())
+      .get('/provider/opportunities')
+      .set('Authorization', eligible.authorization)
+      .expect(200);
+    const body = opportunities.body as Record<string, unknown>[];
+    expect(body).toHaveLength(1);
+    expect(body[0]).toMatchObject({
+      requestId,
+      serviceId: 'ac-cleaning',
+      opportunityStatus: 'quoted',
+    });
+    expect((body[0] as { myQuote?: { status: string } }).myQuote).toMatchObject(
+      {
+        status: 'proposed',
+        amountHalalas: 15000,
+      },
+    );
   });
 
   it('rejects invalid provider invitation inputs and deduplicates ids', async () => {
@@ -1291,15 +1674,26 @@ describe('AppController (e2e)', () => {
 
   it('keeps the legacy staff quote flow unchanged when no opportunities exist', async () => {
     const customerAuthorization = await createCustomerAuthorization(app);
+    // The legacy staff flow only applies when no marketplace opportunity
+    // exists. Make the seeded ac-cleaning provider unavailable and remove
+    // any PILOT providers accumulated by earlier tests, so the request is
+    // deterministically created with zero eligible matching providers; then
+    // create a fresh matching provider afterwards and use that (available)
+    // provider for assignment and the staff-quote flow.
+    await makeSeededProviderUnavailable(app, 'provider-1');
+    await removePilotProvidersForService('ac-cleaning');
     const requestId = await createCustomerServiceRequest(
       app,
       customerAuthorization,
     );
     const staffAuthorization = await createStaffAuthorization(app);
+    const legacyProvider = await createProviderAuthorization(app, [
+      'ac-cleaning',
+    ]);
     await request(app.getHttpServer())
       .patch(`/service-requests/${requestId}/assignment`)
       .set('Authorization', staffAuthorization)
-      .send({ providerId: 'provider-1' })
+      .send({ providerId: legacyProvider.providerId })
       .expect(200);
     const proposed = await request(app.getHttpServer())
       .post(`/service-requests/${requestId}/quotes`)
