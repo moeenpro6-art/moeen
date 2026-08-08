@@ -1564,6 +1564,107 @@ describe('AppController (e2e)', () => {
     );
   });
 
+  it('returns only the winning provider marketplace quote in the assigned provider job', async () => {
+    const customerAuthorization = await createCustomerAuthorization(app);
+    const requestId = await createCustomerServiceRequest(
+      app,
+      customerAuthorization,
+    );
+    const dispatcherAuthorization = await createStaffAuthorization(
+      app,
+      'dispatcher',
+    );
+    const providerA = await createProviderAuthorization(app, ['ac-cleaning']);
+    const providerB = await createProviderAuthorization(app, ['ac-cleaning']);
+    const winnerScope = 'نطاق الفائز P0: تنظيف عميق للمكيف';
+    const competitorScope = 'نطاق المنافس P0: تنظيف سريع للمكيف';
+
+    await request(app.getHttpServer())
+      .post(`/service-requests/${requestId}/opportunities`)
+      .set('Authorization', dispatcherAuthorization)
+      .send({ providerIds: [providerA.providerId, providerB.providerId] })
+      .expect(201);
+
+    const quoteA = await request(app.getHttpServer())
+      .post(`/provider/opportunities/${requestId}/quotes`)
+      .set('Authorization', providerA.authorization)
+      .send({ amountHalalas: 15000, scope: winnerScope })
+      .expect(201);
+    const quoteAId = requiredString(quoteA.body, 'id');
+
+    const quoteB = await request(app.getHttpServer())
+      .post(`/provider/opportunities/${requestId}/quotes`)
+      .set('Authorization', providerB.authorization)
+      .send({ amountHalalas: 12000, scope: competitorScope })
+      .expect(201);
+    const quoteBId = requiredString(quoteB.body, 'id');
+
+    await request(app.getHttpServer())
+      .post(`/my/service-requests/${requestId}/quotes/${quoteAId}/decision`)
+      .set('Authorization', customerAuthorization)
+      .send({ decision: 'approved' })
+      .expect(201);
+
+    const customerView = await request(app.getHttpServer())
+      .get('/my/service-requests')
+      .set('Authorization', customerAuthorization)
+      .expect(200);
+    const customerRequest = (
+      customerView.body as Record<string, unknown>[]
+    ).find((item) => item.id === requestId) as Record<string, unknown>;
+    const customerQuotes = customerRequest.quotes as Record<string, unknown>[];
+    const approvedQuote = customerQuotes.find(
+      (quote) => quote.id === quoteAId,
+    ) as Record<string, unknown>;
+    const rejectedQuote = customerQuotes.find(
+      (quote) => quote.id === quoteBId,
+    ) as Record<string, unknown>;
+    expect(approvedQuote).toEqual(
+      expect.objectContaining({
+        id: quoteAId,
+        amountHalalas: 15000,
+        scope: winnerScope,
+        status: 'approved',
+      }),
+    );
+    expect(rejectedQuote).toEqual(
+      expect.objectContaining({
+        id: quoteBId,
+        amountHalalas: 12000,
+        scope: competitorScope,
+        status: 'rejected',
+      }),
+    );
+    expect(customerRequest.status).toBe('assigned');
+    expect(
+      (customerRequest.assignedProvider as Record<string, unknown>).id,
+    ).toBe(providerA.providerId);
+    expect(customerRequest.payment).toEqual(
+      expect.objectContaining({
+        method: 'cash_on_completion',
+        status: 'cash_due',
+        amountHalalas: 15000,
+      }),
+    );
+
+    const providerJobsView = await request(app.getHttpServer())
+      .get('/provider/service-requests')
+      .set('Authorization', providerA.authorization)
+      .expect(200);
+    const providerJob = (
+      providerJobsView.body as Record<string, unknown>[]
+    ).find((item) => item.id === requestId) as Record<string, unknown>;
+    expect(providerJob).toBeDefined();
+    const providerQuote = responseObject(providerJob.quote);
+    expect(providerQuote.id).toBe(quoteAId);
+    expect(providerQuote.amountHalalas).toBe(15000);
+    expect(providerQuote.scope).toBe(winnerScope);
+    expect(providerQuote.status).toBe('approved');
+    expect(typeof providerQuote.proposedAt).toBe('string');
+    expect(typeof providerQuote.decidedAt).toBe('string');
+    expect(JSON.stringify(providerJob)).not.toContain(competitorScope);
+  });
+
   it('fails safely when the winning provider becomes unavailable before approval', async () => {
     const customerAuthorization = await createCustomerAuthorization(app);
     const requestId = await createCustomerServiceRequest(
@@ -2001,6 +2102,22 @@ describe('AppController (e2e)', () => {
     expect(myRequest.quotes).toEqual([]);
     expect(myRequest.payment).toEqual(
       expect.objectContaining({ status: 'cash_due' }),
+    );
+
+    const providerJobs = await request(app.getHttpServer())
+      .get('/provider/service-requests')
+      .set('Authorization', legacyProvider.authorization)
+      .expect(200);
+    const providerJob = (providerJobs.body as Record<string, unknown>[]).find(
+      (item) => item.id === requestId,
+    ) as Record<string, unknown>;
+    expect(providerJob.quote).toEqual(
+      expect.objectContaining({
+        id: quoteId,
+        amountHalalas: 10000,
+        scope: 'عرض الموظف التقليدي',
+        status: 'approved',
+      }),
     );
   });
 

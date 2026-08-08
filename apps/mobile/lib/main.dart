@@ -792,16 +792,22 @@ Future<bool> quoteDecisionWasPersistedAfterAmbiguousFailure({
   required Future<List<CustomerRequest>> Function() loadRequests,
 }) async {
   try {
-    return (await loadRequests()).any(
-      (request) =>
-          request.id == requestId &&
-          request.quote?.id == quoteId &&
-          request.quote?.status == decision,
-    );
+    return (await loadRequests()).any((request) {
+      if (request.id != requestId) return false;
+      if (request.quotes.isNotEmpty) {
+        return request.quotes.any(
+          (quote) => quote.id == quoteId && quote.status == decision,
+        );
+      }
+      return request.quote?.id == quoteId && request.quote?.status == decision;
+    });
   } catch (_) {
     return false;
   }
 }
+
+bool isSuccessfulHttpStatus(int statusCode) =>
+    statusCode >= 200 && statusCode < 300;
 
 class CustomerRequestCard extends StatelessWidget {
   const CustomerRequestCard({
@@ -1170,7 +1176,9 @@ class _CustomerRequestsPageState extends State<CustomerRequestsPage> {
         },
         body: jsonEncode({'decision': decision}),
       );
-      if (response.statusCode != 201) throw Exception('Quote decision failed');
+      if (!isSuccessfulHttpStatus(response.statusCode)) {
+        throw Exception('Quote decision failed');
+      }
       if (!mounted) return;
       setState(() => _requests = _load());
       ScaffoldMessenger.of(context).showSnackBar(

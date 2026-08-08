@@ -736,9 +736,20 @@ export class ServiceRequestRepository
        JOIN providers p ON p.id = r.assigned_provider_id
        LEFT JOIN LATERAL (
          SELECT id, amount_halalas, scope, status, proposed_at, decided_at
-         FROM service_quotes
-         WHERE service_request_id = r.id
-         ORDER BY id DESC
+         FROM (
+           SELECT id, amount_halalas, scope, status, proposed_at, decided_at,
+                  0 AS quote_source_priority
+           FROM service_quotes
+           WHERE service_request_id = r.id
+             AND provider_id = r.assigned_provider_id
+           UNION ALL
+           SELECT id, amount_halalas, scope, status, proposed_at, decided_at,
+                  1 AS quote_source_priority
+           FROM service_quotes
+           WHERE service_request_id = r.id
+             AND provider_id IS NULL
+         ) eligible_quotes
+         ORDER BY quote_source_priority, id DESC
          LIMIT 1
        ) q ON TRUE
        LEFT JOIN LATERAL (

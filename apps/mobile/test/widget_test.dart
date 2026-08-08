@@ -100,6 +100,82 @@ void main() {
     },
   );
 
+  test(
+    'reconciles the selected quote from quotes when the legacy quote is a competitor',
+    () async {
+      final recovered = await quoteDecisionWasPersistedAfterAmbiguousFailure(
+        requestId: 'MOE-101',
+        quoteId: 'QTE-101',
+        decision: 'approved',
+        loadRequests: () async => const [
+          CustomerRequest(
+            id: 'MOE-101',
+            serviceId: 'ac-cleaning',
+            status: 'assigned',
+            quote: CustomerQuote(
+              id: 'QTE-102',
+              amountHalalas: 12000,
+              scope: 'عرض المنافس الأحدث',
+              status: 'rejected',
+            ),
+            quotes: [
+              CustomerQuote(
+                id: 'QTE-101',
+                amountHalalas: 15000,
+                scope: 'العرض المختار',
+                status: 'approved',
+              ),
+              CustomerQuote(
+                id: 'QTE-102',
+                amountHalalas: 12000,
+                scope: 'عرض المنافس الأحدث',
+                status: 'rejected',
+              ),
+            ],
+          ),
+        ],
+      );
+
+      expect(recovered, isTrue);
+    },
+  );
+
+  test(
+    'reconciles a quote decision from the legacy singular quote when quotes are absent',
+    () async {
+      final recovered = await quoteDecisionWasPersistedAfterAmbiguousFailure(
+        requestId: 'MOE-102',
+        quoteId: 'QTE-103',
+        decision: 'rejected',
+        loadRequests: () async => const [
+          CustomerRequest(
+            id: 'MOE-102',
+            serviceId: 'plumbing',
+            status: 'pending_dispatch',
+            quote: CustomerQuote(
+              id: 'QTE-103',
+              amountHalalas: 10000,
+              scope: 'عرض قديم منفرد',
+              status: 'rejected',
+            ),
+          ),
+        ],
+      );
+
+      expect(recovered, isTrue);
+    },
+  );
+
+  test('treats every 2xx quote decision response as successful', () {
+    expect(isSuccessfulHttpStatus(200), isTrue);
+    expect(isSuccessfulHttpStatus(201), isTrue);
+    expect(isSuccessfulHttpStatus(299), isTrue);
+    expect(isSuccessfulHttpStatus(199), isFalse);
+    expect(isSuccessfulHttpStatus(300), isFalse);
+    expect(isSuccessfulHttpStatus(409), isFalse);
+    expect(isSuccessfulHttpStatus(500), isFalse);
+  });
+
   testWidgets('shows every Moeen launch service in Arabic', (tester) async {
     await tester.pumpWidget(
       const MaterialApp(
