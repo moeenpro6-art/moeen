@@ -386,6 +386,26 @@ export class ServiceRequestRepository
         END IF;
       END $$;
     `);
+    // Extend the opportunity status CHECK with 'rejected' (controlled, idempotent, race-safe)
+    await this.pool.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conname = 'request_provider_opportunities_status_check'
+            AND pg_get_constraintdef(oid) LIKE '%rejected%'
+        ) THEN
+          BEGIN
+            ALTER TABLE request_provider_opportunities
+              DROP CONSTRAINT IF EXISTS request_provider_opportunities_status_check,
+              ADD CONSTRAINT request_provider_opportunities_status_check
+                CHECK (status IN ('invited', 'quoted', 'withdrawn', 'closed', 'rejected'));
+          EXCEPTION WHEN duplicate_object THEN
+            NULL;
+          END;
+        END IF;
+      END $$;
+    `);
     await this.pool.query(`
       CREATE TABLE IF NOT EXISTS service_payments (
         id BIGSERIAL PRIMARY KEY,
@@ -624,33 +644,14 @@ export class ServiceRequestRepository
     requestId: string,
     providerQuotes: ServiceQuoteRow[],
   ): CustomerQuoteView[] {
-    const approvedQuote = providerQuotes.find(
-      (quote) => quote.status === 'approved',
-    );
-    if (approvedQuote) {
-      return providerQuotes.map((quote) =>
-        quote.id === approvedQuote.id
-          ? {
-              id: `QTE-${quote.id}`,
-              amountHalalas: quote.amount_halalas,
-              scope: quote.scope,
-              status: quote.status,
-              proposedAt: quote.proposed_at.toISOString(),
-              decidedAt: quote.decided_at?.toISOString(),
-            }
-          : { id: `QTE-${quote.id}`, status: quote.status },
-      );
-    }
-    return providerQuotes
-      .filter((quote) => quote.status === 'proposed')
-      .map((quote) => ({
-        id: `QTE-${quote.id}`,
-        amountHalalas: quote.amount_halalas,
-        scope: quote.scope,
-        status: quote.status,
-        proposedAt: quote.proposed_at.toISOString(),
-        decidedAt: quote.decided_at?.toISOString(),
-      }));
+    return providerQuotes.map((quote) => ({
+      id: `QTE-${quote.id}`,
+      amountHalalas: quote.amount_halalas,
+      scope: quote.scope,
+      status: quote.status,
+      proposedAt: quote.proposed_at.toISOString(),
+      decidedAt: quote.decided_at?.toISOString(),
+    }));
   }
 
   async findByProviderId(providerId: string): Promise<ServiceRequest[]> {
@@ -1174,6 +1175,15 @@ export class ServiceRequestRepository
       );
       const updatedQuote = result.rows[0];
       if (!updatedQuote) throw new Error('Quote decision could not be saved');
+      if (decision === 'rejected' && updatedQuote.provider_id) {
+        await client.query(
+          `UPDATE request_provider_opportunities
+           SET status = 'rejected'
+           WHERE service_request_id = $1 AND provider_id = $2
+             AND status = 'quoted'`,
+          [databaseId, updatedQuote.provider_id],
+        );
+      }
       if (decision === 'approved') {
         await client.query(
           `INSERT INTO service_payments (

@@ -380,6 +380,79 @@ void main() {
       expect(find.text('تطبيق مقدم الخدمة'), findsOneWidget);
     },
   );
+
+  test('ProviderOpportunity parses rejected status and quote', () {
+    final opp = ProviderOpportunity.fromJson({
+      'requestId': 'MOE-1001',
+      'serviceId': 'ac-cleaning',
+      'timing': 'as-soon-as-possible',
+      'opportunityStatus': 'rejected',
+      'myQuote': {
+        'id': 'QTE-1',
+        'amountHalalas': 15000,
+        'scope': 'تنظيف كامل',
+        'status': 'rejected',
+      },
+    });
+
+    expect(opp.opportunityStatus, 'rejected');
+    expect(opp.myQuote?.status, 'rejected');
+  });
+
+  test('opportunityMessage returns direct-rejection text', () {
+    final opp = ProviderOpportunity.fromJson({
+      'requestId': 'MOE-1002',
+      'serviceId': 'ac-cleaning',
+      'timing': 'as-soon-as-possible',
+      'opportunityStatus': 'rejected',
+      'myQuote': {
+        'id': 'QTE-2',
+        'amountHalalas': 10000,
+        'scope': 'test',
+        'status': 'rejected',
+      },
+    } as Map<String, dynamic>);
+
+    expect(opportunityMessage(opp), 'تم رفض عرضك');
+  });
+
+  test(
+      'opportunityMessage returns closed-after-other text for non-approved'
+      ' closed opportunity', () {
+    final opp = ProviderOpportunity.fromJson({
+      'requestId': 'MOE-1003',
+      'serviceId': 'ac-cleaning',
+      'timing': 'as-soon-as-possible',
+      'opportunityStatus': 'closed',
+      'myQuote': {
+        'id': 'QTE-3',
+        'amountHalalas': 12000,
+        'scope': 'test',
+        'status': 'rejected',
+      },
+    } as Map<String, dynamic>);
+
+    expect(opportunityMessage(opp), 'تم إغلاق الفرصة بعد اختيار عرض آخر');
+  });
+
+  test(
+      'opportunityMessage returns base label for approved closed opportunity',
+      () {
+    final opp = ProviderOpportunity.fromJson({
+      'requestId': 'MOE-1004',
+      'serviceId': 'ac-cleaning',
+      'timing': 'as-soon-as-possible',
+      'opportunityStatus': 'closed',
+      'myQuote': {
+        'id': 'QTE-4',
+        'amountHalalas': 14000,
+        'scope': 'test',
+        'status': 'approved',
+      },
+    } as Map<String, dynamic>);
+
+    expect(opportunityMessage(opp), 'مغلقة');
+  });
 }
 
 class _MemorySessionStore implements ProviderSessionStore {
@@ -441,4 +514,5 @@ MockClient _dashboardMockClient({
     }
     return http.Response('{}', 404);
   });
+
 }

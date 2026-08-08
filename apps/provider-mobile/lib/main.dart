@@ -29,7 +29,20 @@ const _opportunityStatusLabels = {
   'quoted': 'بانتظار قرار العميل',
   'withdrawn': 'عرضك مسحوب',
   'closed': 'مغلقة',
+  'rejected': 'تم رفض عرضك',
 };
+
+String opportunityMessage(ProviderOpportunity opp) {
+  if (opp.opportunityStatus == 'rejected') {
+    return 'تم رفض عرضك';
+  }
+  if (opp.opportunityStatus == 'closed' &&
+      opp.myQuote != null &&
+      opp.myQuote!.status != 'approved') {
+    return 'تم إغلاق الفرصة بعد اختيار عرض آخر';
+  }
+  return _opportunityStatusLabels[opp.opportunityStatus] ?? opp.opportunityStatus;
+}
 
 void main() {
   runApp(MoeenProviderApp());
@@ -833,8 +846,7 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
         _serviceNames[opportunity.serviceId] ?? opportunity.serviceId;
     final timingLabel =
         _timingLabels[opportunity.timing] ?? opportunity.timing;
-    final statusLabel = _opportunityStatusLabels[opportunity.opportunityStatus] ??
-        opportunity.opportunityStatus;
+    final statusLabel = opportunityMessage(opportunity);
     final quote = opportunity.myQuote;
     return Card(
       margin: const EdgeInsets.only(bottom: 12),

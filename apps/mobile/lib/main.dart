@@ -692,6 +692,7 @@ class CustomerRequest {
     required this.status,
     this.providerName,
     this.quote,
+    this.quotes = const [],
     this.payment,
     this.rating,
     this.ratingComment,
@@ -702,6 +703,7 @@ class CustomerRequest {
   final String status;
   final String? providerName;
   final CustomerQuote? quote;
+  final List<CustomerQuote> quotes;
   final CustomerPayment? payment;
   final int? rating;
   final String? ratingComment;
@@ -717,6 +719,11 @@ class CustomerRequest {
         quote: (json['quote'] as Map<String, dynamic>?) == null
             ? null
             : CustomerQuote.fromJson(json['quote'] as Map<String, dynamic>),
+        quotes: (json['quotes'] as List<dynamic>?)
+                ?.map((q) =>
+                    CustomerQuote.fromJson(q as Map<String, dynamic>))
+                .toList() ??
+            const [],
         payment: (json['payment'] as Map<String, dynamic>?) == null
             ? null
             : CustomerPayment.fromJson(json['payment'] as Map<String, dynamic>),
@@ -776,6 +783,7 @@ class CustomerRequestCard extends StatelessWidget {
     required this.request,
     required this.statusLabel,
     required this.onReviewQuote,
+    this.onReviewSpecificQuote,
     required this.onRate,
     required this.onSupport,
   });
@@ -783,6 +791,7 @@ class CustomerRequestCard extends StatelessWidget {
   final CustomerRequest request;
   final String statusLabel;
   final VoidCallback onReviewQuote;
+  final void Function(CustomerQuote)? onReviewSpecificQuote;
   final VoidCallback onRate;
   final VoidCallback onSupport;
 
@@ -833,7 +842,66 @@ class CustomerRequestCard extends StatelessWidget {
                   ? (request.providerName ?? 'سنعيّن الفني المناسب قريباً')
                   : 'تقييمك: ${request.rating}/5${request.ratingComment == null ? '' : ' — ${request.ratingComment}'}',
             ),
-            if (request.quote != null)
+            if (request.quotes.isNotEmpty)
+              ...request.quotes.map(
+                (quote) => Padding(
+                  padding: const EdgeInsets.only(top: 8),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'عرض السعر: ${_formatSaudiRiyals(quote.amountHalalas)} — ${quote.scope}',
+                        style: TextStyle(
+                          color: quote.status == 'proposed'
+                              ? const Color(0xFF0B6E69)
+                              : quote.status == 'rejected'
+                                  ? const Color(0xFFB33A3A)
+                                  : const Color(0xFF506764),
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      if (quote.status == 'proposed')
+                        Text(
+                          'الحالة: بإمكانك قبول العرض',
+                          style: const TextStyle(fontSize: 12),
+                        )
+                      else if (quote.status == 'rejected')
+                        Text(
+                          'الحالة: تم رفض العرض',
+                          style: const TextStyle(
+                            fontSize: 12,
+                            color: Color(0xFFB33A3A),
+                          ),
+                        )
+                      else if (quote.status == 'approved')
+                        Text(
+                          'الحالة: تم قبول العرض',
+                          style: const TextStyle(
+                            fontSize: 12,
+                            color: Color(0xFF0B6E69),
+                          ),
+                        ),
+                      if (quote.status == 'proposed')
+                        Padding(
+                          padding: const EdgeInsets.only(top: 4),
+                          child: Wrap(
+                            spacing: 4,
+                            children: [
+                              TextButton(
+                                onPressed: onReviewSpecificQuote != null
+                                    ? () =>
+                                        onReviewSpecificQuote!(quote)
+                                    : null,
+                                child: const Text('مراجعة العرض'),
+                              ),
+                            ],
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              )
+            else if (request.quote != null)
               Padding(
                 padding: const EdgeInsets.only(top: 8),
                 child: Text(
@@ -866,7 +934,8 @@ class CustomerRequestCard extends StatelessWidget {
               spacing: 4,
               runSpacing: 4,
               children: [
-                if (request.quote?.status == 'proposed')
+                if (request.quotes.isEmpty &&
+                    request.quote?.status == 'proposed')
                   TextButton(
                     onPressed: onReviewQuote,
                     child: const Text('مراجعة العرض'),
@@ -943,6 +1012,8 @@ class _CustomerRequestsPageState extends State<CustomerRequestsPage> {
                     request: item,
                     statusLabel: _status(item.status),
                     onReviewQuote: () => _showQuoteDecisionDialog(item),
+                    onReviewSpecificQuote: (quote) =>
+                        _showQuoteDecisionDialogForQuote(item, quote),
                     onRate: () => _showRatingDialog(item),
                     onSupport: () => _showSupportDialog(item),
                   ),
@@ -953,6 +1024,47 @@ class _CustomerRequestsPageState extends State<CustomerRequestsPage> {
       },
     ),
   );
+
+  Future<void> _showQuoteDecisionDialogForQuote(
+    CustomerRequest request,
+    CustomerQuote quote,
+  ) async {
+    final decision = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('مراجعة عرض السعر'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(quote.scope),
+            const SizedBox(height: 12),
+            Text(
+              _formatSaudiRiyals(quote.amountHalalas),
+              style: const TextStyle(
+                color: Color(0xFF0B6E69),
+                fontSize: 22,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+            const SizedBox(height: 8),
+            const Text('لن يبدأ الفني العمل قبل موافقتك على العرض.'),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, 'rejected'),
+            child: const Text('رفض العرض'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, 'approved'),
+            child: const Text('موافقة'),
+          ),
+        ],
+      ),
+    );
+    if (decision != null) await _submitQuoteDecision(request, quote, decision);
+  }
 
   Future<void> _showQuoteDecisionDialog(CustomerRequest request) async {
     final quote = request.quote;

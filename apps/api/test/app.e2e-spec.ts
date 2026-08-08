@@ -1547,7 +1547,8 @@ describe('AppController (e2e)', () => {
     const rejectedView = afterQuotes.find(
       (quote) => quote.id === quoteBId,
     ) as Record<string, unknown>;
-    expect(rejectedView).toEqual({ id: quoteBId, status: 'rejected' });
+    expect(rejectedView.status).toBe('rejected');
+    expect(rejectedView.amountHalalas).toBe(12000);
     expect(afterRequest.payment).toEqual(
       expect.objectContaining({
         method: 'cash_on_completion',
@@ -1670,6 +1671,185 @@ describe('AppController (e2e)', () => {
     expect(
       afterQuotes.find((quote) => quote.status === 'rejected'),
     ).toBeDefined();
+  });
+
+  it('rejects one provider quote while leaving the other active, updating the rejected opportunity', async () => {
+    const customerAuthorization = await createCustomerAuthorization(app);
+    const requestId = await createCustomerServiceRequest(
+      app,
+      customerAuthorization,
+    );
+    const dispatcherAuthorization = await createStaffAuthorization(
+      app,
+      'dispatcher',
+    );
+    const providerA = await createProviderAuthorization(app, ['ac-cleaning']);
+    const providerB = await createProviderAuthorization(app, ['ac-cleaning']);
+    await request(app.getHttpServer())
+      .post(`/service-requests/${requestId}/opportunities`)
+      .set('Authorization', dispatcherAuthorization)
+      .send({ providerIds: [providerA.providerId, providerB.providerId] })
+      .expect(201);
+    const quoteA = await request(app.getHttpServer())
+      .post(`/provider/opportunities/${requestId}/quotes`)
+      .set('Authorization', providerA.authorization)
+      .send({ amountHalalas: 15000, scope: 'عرض أ' })
+      .expect(201);
+    const quoteAId = requiredString(quoteA.body, 'id');
+    const quoteB = await request(app.getHttpServer())
+      .post(`/provider/opportunities/${requestId}/quotes`)
+      .set('Authorization', providerB.authorization)
+      .send({ amountHalalas: 12000, scope: 'عرض ب' })
+      .expect(201);
+    const quoteBId = requiredString(quoteB.body, 'id');
+
+    // Reject A only.
+    await request(app.getHttpServer())
+      .post(`/my/service-requests/${requestId}/quotes/${quoteAId}/decision`)
+      .set('Authorization', customerAuthorization)
+      .send({ decision: 'rejected' })
+      .expect(201);
+
+    // Customer view: both quotes present, A rejected, B still proposed.
+    const customerView = await request(app.getHttpServer())
+      .get('/my/service-requests')
+      .set('Authorization', customerAuthorization)
+      .expect(200);
+    const customerRequest = (
+      customerView.body as Record<string, unknown>[]
+    ).find((item) => item.id === requestId) as Record<string, unknown>;
+    const quotes = customerRequest.quotes as Record<string, unknown>[];
+    expect(quotes).toHaveLength(2);
+    const rejectedQuote = quotes.find((q) => q.id === quoteAId) as Record<
+      string,
+      unknown
+    >;
+    expect(rejectedQuote.status).toBe('rejected');
+    const activeQuote = quotes.find((q) => q.id === quoteBId) as Record<
+      string,
+      unknown
+    >;
+    expect(activeQuote.status).toBe('proposed');
+    // Request still unassigned.
+    expect(customerRequest.status).toBe('pending_dispatch');
+    // No providerId exposed.
+    expect(JSON.stringify(customerRequest)).not.toContain(providerA.providerId);
+
+    // Provider A sees rejected opportunity.
+    const providerAView = await request(app.getHttpServer())
+      .get('/provider/opportunities')
+      .set('Authorization', providerA.authorization)
+      .expect(200);
+    const aOpps = providerAView.body as Record<string, unknown>[];
+    const aOpp = aOpps.find((o) => o.requestId === requestId) as Record<
+      string,
+      unknown
+    >;
+    expect(aOpp.opportunityStatus).toBe('rejected');
+    expect((aOpp.myQuote as Record<string, unknown>).status).toBe('rejected');
+
+    // Provider B still sees quoted opportunity.
+    const providerBView = await request(app.getHttpServer())
+      .get('/provider/opportunities')
+      .set('Authorization', providerB.authorization)
+      .expect(200);
+    const bOpps = providerBView.body as Record<string, unknown>[];
+    const bOpp = bOpps.find((o) => o.requestId === requestId) as Record<
+      string,
+      unknown
+    >;
+    expect(bOpp.opportunityStatus).toBe('quoted');
+    expect((bOpp.myQuote as Record<string, unknown>).status).toBe('proposed');
+  });
+
+  it('subsequently approving a quote closes all opportunities and assigns the winner, without leaking competitor data', async () => {
+    const customerAuthorization = await createCustomerAuthorization(app);
+    const requestId = await createCustomerServiceRequest(
+      app,
+      customerAuthorization,
+    );
+    const dispatcherAuthorization = await createStaffAuthorization(
+      app,
+      'dispatcher',
+    );
+    const providerA = await createProviderAuthorization(app, ['ac-cleaning']);
+    const providerB = await createProviderAuthorization(app, ['ac-cleaning']);
+    await request(app.getHttpServer())
+      .post(`/service-requests/${requestId}/opportunities`)
+      .set('Authorization', dispatcherAuthorization)
+      .send({ providerIds: [providerA.providerId, providerB.providerId] })
+      .expect(201);
+    // A is first quoted then rejected by the customer.
+    const quoteA = await request(app.getHttpServer())
+      .post(`/provider/opportunities/${requestId}/quotes`)
+      .set('Authorization', providerA.authorization)
+      .send({ amountHalalas: 15000, scope: 'عرض أ' })
+      .expect(201);
+    const quoteAId = requiredString(quoteA.body, 'id');
+    await request(app.getHttpServer())
+      .post(`/my/service-requests/${requestId}/quotes/${quoteAId}/decision`)
+      .set('Authorization', customerAuthorization)
+      .send({ decision: 'rejected' })
+      .expect(201);
+    // B quotes and is then approved.
+    const quoteB = await request(app.getHttpServer())
+      .post(`/provider/opportunities/${requestId}/quotes`)
+      .set('Authorization', providerB.authorization)
+      .send({ amountHalalas: 12000, scope: 'عرض ب' })
+      .expect(201);
+    const quoteBId = requiredString(quoteB.body, 'id');
+    await request(app.getHttpServer())
+      .post(`/my/service-requests/${requestId}/quotes/${quoteBId}/decision`)
+      .set('Authorization', customerAuthorization)
+      .send({ decision: 'approved' })
+      .expect(201);
+
+    // Winner assigned, competitor closed.
+    const customerView = await request(app.getHttpServer())
+      .get('/my/service-requests')
+      .set('Authorization', customerAuthorization)
+      .expect(200);
+    const customerRequest = (
+      customerView.body as Record<string, unknown>[]
+    ).find((item) => item.id === requestId) as Record<string, unknown>;
+    expect(customerRequest.status).toBe('assigned');
+    expect(
+      (customerRequest.assignedProvider as Record<string, unknown>).id,
+    ).toBe(providerB.providerId);
+
+    // Losing provider A sees closed opportunity with safe message.
+    const providerAView = await request(app.getHttpServer())
+      .get('/provider/opportunities')
+      .set('Authorization', providerA.authorization)
+      .expect(200);
+    const aOpps = providerAView.body as Record<string, unknown>[];
+    const aOpp = aOpps.find((o) => o.requestId === requestId) as Record<
+      string,
+      unknown
+    >;
+    // A was directly rejected earlier; its opportunity stays 'rejected',
+    // not overwritten to 'closed' (the approval-closure targets only
+    // 'invited'/'quoted' statuses).
+    expect(aOpp.opportunityStatus).toBe('rejected');
+    // No competitor data leaked.
+    const serializedAOpp = JSON.stringify(aOpp);
+    expect(serializedAOpp).not.toContain(providerB.providerId);
+    expect(serializedAOpp).not.toContain('12000'); // B's price
+    // No customer-private data leaked.
+    expect(serializedAOpp).not.toContain('حي الصفراء');
+
+    // Winner B sees closed opportunity with approved quote.
+    const providerBView = await request(app.getHttpServer())
+      .get('/provider/opportunities')
+      .set('Authorization', providerB.authorization)
+      .expect(200);
+    const bOpps = providerBView.body as Record<string, unknown>[];
+    const bOpp = bOpps.find((o) => o.requestId === requestId) as Record<
+      string,
+      unknown
+    >;
+    expect(bOpp.opportunityStatus).toBe('closed');
+    expect((bOpp.myQuote as Record<string, unknown>).status).toBe('approved');
   });
 
   it('keeps the legacy staff quote flow unchanged when no opportunities exist', async () => {
