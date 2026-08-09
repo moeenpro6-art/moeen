@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { Pool } from 'pg';
 import { Test, TestingModule } from '@nestjs/testing';
 import { INestApplication } from '@nestjs/common';
@@ -84,6 +85,9 @@ async function createProviderAuthorization(
     })
     .expect(201);
   const providerId = requiredString(created.body, 'id');
+  // Register the ACTUAL id returned by the server (never inferred from any
+  // prefix) — only after the 201 confirmed creation succeeded.
+  createdProviderIds.add(providerId);
   const name = requiredString(created.body, 'name');
   await request(app.getHttpServer())
     .patch(`/providers/${providerId}/verification`)
@@ -104,6 +108,85 @@ async function createProviderAuthorization(
     name,
     authorization: `Bearer ${requiredString(login.body, 'token')}`,
   };
+}
+
+/**
+ * Removes ONLY the providers this suite registered (exact ids) plus their
+ * dependent rows, in FK-safe order (bottom-up per the actual constraints:
+ * service_payments → service_request_events → request_provider_opportunities
+ * → service_quotes → service_requests → provider_sessions →
+ * provider_access_credentials → providers). Runs inside one transaction;
+ * on any error it ROLLBACKs and rethrows. The registered ids are dropped
+ * from the set ONLY after COMMIT, so repeated calls are idempotent no-ops.
+ * No wildcard or prefix scans, no broad subqueries, no unregistered
+ * providers are ever touched.
+ */
+async function removeCreatedProvidersForLegacyFlow(): Promise<void> {
+  if (createdProviderIds.size === 0) return;
+  const ids = [...createdProviderIds];
+  const pool = new Pool({ connectionString: process.env.TEST_DATABASE_URL });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      `DELETE FROM service_payments
+       WHERE quote_id IN (
+         SELECT id FROM service_quotes WHERE provider_id = ANY($1::text[])
+       )
+          OR service_request_id IN (
+         SELECT id FROM service_requests WHERE assigned_provider_id = ANY($1::text[])
+       )`,
+      [ids],
+    );
+    await client.query(
+      `DELETE FROM service_request_events
+       WHERE service_request_id IN (
+         SELECT id FROM service_requests WHERE assigned_provider_id = ANY($1::text[])
+       )`,
+      [ids],
+    );
+    await client.query(
+      `DELETE FROM request_provider_opportunities
+       WHERE provider_id = ANY($1::text[])
+          OR service_request_id IN (
+         SELECT id FROM service_requests WHERE assigned_provider_id = ANY($1::text[])
+       )`,
+      [ids],
+    );
+    await client.query(
+      `DELETE FROM service_quotes
+       WHERE provider_id = ANY($1::text[])
+          OR service_request_id IN (
+         SELECT id FROM service_requests WHERE assigned_provider_id = ANY($1::text[])
+       )`,
+      [ids],
+    );
+    await client.query(
+      `DELETE FROM service_requests WHERE assigned_provider_id = ANY($1::text[])`,
+      [ids],
+    );
+    await client.query(
+      `DELETE FROM provider_sessions WHERE provider_id = ANY($1::text[])`,
+      [ids],
+    );
+    await client.query(
+      `DELETE FROM provider_access_credentials
+       WHERE provider_id = ANY($1::text[])`,
+      [ids],
+    );
+    await client.query(`DELETE FROM providers WHERE id = ANY($1::text[])`, [
+      ids,
+    ]);
+    await client.query('COMMIT');
+    for (const id of ids) {
+      createdProviderIds.delete(id);
+    }
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 async function createCustomerAuthorization(
@@ -170,63 +253,21 @@ async function makeSeededProviderUnavailable(
 }
 
 /**
- * Removes E2E-created PILOT providers (and their dependent rows) whose
- * specialties include the given serviceId, so a later request for that
- * service deterministically has zero eligible matching providers. This is
- * test-only database cleanup; it never touches seeded or production rows.
+ * Q0-SEC isolation note for this suite:
+ * scripts/with-test-env.js rewrites TEST_DATABASE_URL to the run-unique
+ * schema (moeen_test_<runId>) BEFORE jest spawns, and test/setup/
+ * setup-test-env.ts only VALIDATES what every worker inherits — it never
+ * rewrites anything. Each run starts in a fresh schema and global-teardown.ts
+ * drops this run's whole schema with CASCADE.
+ *
+ * Determinism for the legacy staff-flow tests: providers created through the
+ * admin endpoint are assigned PILOT-prefixed ids by the SERVER, and they stay
+ * eligible for auto-invite for the rest of the suite. Legacy-flow tests
+ * therefore remove exactly the ids THIS suite registered (createdProviderIds)
+ * before issuing their request — exact-match parameterized deletes only,
+ * never prefix scans and never touching unregistered providers.
  */
-async function removePilotProvidersForService(
-  serviceId: string,
-): Promise<void> {
-  const pool = new Pool({ connectionString: process.env.TEST_DATABASE_URL });
-  try {
-    await pool.query(
-      `DELETE FROM service_payments
-       WHERE quote_id IN (
-         SELECT id FROM service_quotes WHERE provider_id LIKE 'PILOT-%'
-       )
-          OR service_request_id IN (
-         SELECT id FROM service_requests WHERE assigned_provider_id LIKE 'PILOT-%'
-       )`,
-    );
-    await pool.query(
-      `DELETE FROM service_request_events
-       WHERE service_request_id IN (
-         SELECT id FROM service_requests WHERE assigned_provider_id LIKE 'PILOT-%'
-       )`,
-    );
-    await pool.query(
-      `DELETE FROM request_provider_opportunities
-       WHERE provider_id LIKE 'PILOT-%'
-          OR service_request_id IN (
-         SELECT id FROM service_requests WHERE assigned_provider_id LIKE 'PILOT-%'
-       )`,
-    );
-    await pool.query(
-      `DELETE FROM service_quotes
-       WHERE provider_id LIKE 'PILOT-%'
-          OR service_request_id IN (
-         SELECT id FROM service_requests WHERE assigned_provider_id LIKE 'PILOT-%'
-       )`,
-    );
-    await pool.query(
-      `DELETE FROM service_requests WHERE assigned_provider_id LIKE 'PILOT-%'`,
-    );
-    await pool.query(
-      `DELETE FROM provider_sessions WHERE provider_id LIKE 'PILOT-%'`,
-    );
-    await pool.query(
-      `DELETE FROM provider_access_credentials WHERE provider_id LIKE 'PILOT-%'`,
-    );
-    await pool.query(
-      `DELETE FROM providers
-       WHERE id LIKE 'PILOT-%' AND $1 = ANY(specialties)`,
-      [serviceId],
-    );
-  } finally {
-    await pool.end();
-  }
-}
+const createdProviderIds = new Set<string>();
 
 let nextTestPhoneSuffix = 0;
 const testPhoneRunSeed =
@@ -514,10 +555,12 @@ describe('AppController (e2e)', () => {
       .expect(201);
     const customerAuthorization = `Bearer ${requiredString(verified.body, 'token')}`;
     // The legacy staff flow needs a request with no marketplace opportunity:
-    // make the seeded ac-cleaning provider unavailable and remove PILOT
-    // providers accumulated by earlier tests, so auto-invite finds nobody.
+    // make the seeded ac-cleaning provider unavailable — this run's schema is
+    // fresh, so no PILOT providers exist and auto-invite finds nobody.
     await makeSeededProviderUnavailable(app, 'provider-1');
-    await removePilotProvidersForService('ac-cleaning');
+    // Q0-SEC determinism: remove exactly the providers this suite created
+    // (exact registered ids) so auto-invite finds nobody for this request.
+    await removeCreatedProvidersForLegacyFlow();
     const created = await request(app.getHttpServer())
       .post('/service-requests')
       .set('Authorization', customerAuthorization)
@@ -607,10 +650,12 @@ describe('AppController (e2e)', () => {
       .expect(201);
     const customerAuthorization = `Bearer ${requiredString(verified.body, 'token')}`;
     // Legacy staff flow: the request must have no marketplace opportunity.
-    // Make the seeded plumbing provider unavailable and remove PILOT
-    // providers accumulated by earlier tests before creating the request.
+    // Make the seeded plumbing provider unavailable — this run's schema is
+    // fresh, so no PILOT providers exist before creating the request.
     await makeSeededProviderUnavailable(app, 'provider-3');
-    await removePilotProvidersForService('plumbing');
+    // Q0-SEC determinism: remove exactly the providers this suite created
+    // (exact registered ids) so auto-invite finds nobody for this request.
+    await removeCreatedProvidersForLegacyFlow();
     const created = await request(app.getHttpServer())
       .post('/service-requests')
       .set('Authorization', customerAuthorization)
@@ -740,11 +785,12 @@ describe('AppController (e2e)', () => {
     const customerAuthorization = `Bearer ${requiredString(verified.body, 'token')}`;
     // Legacy staff flow: both requests must have no marketplace
     // opportunities. Disable the seeded providers for ac-cleaning and
-    // plumbing and remove PILOT providers accumulated by earlier tests.
+    // plumbing — this run's schema is fresh, so no PILOT providers exist.
     await makeSeededProviderUnavailable(app, 'provider-1');
     await makeSeededProviderUnavailable(app, 'provider-3');
-    await removePilotProvidersForService('ac-cleaning');
-    await removePilotProvidersForService('plumbing');
+    // Q0-SEC determinism: remove exactly the providers this suite created
+    // (exact registered ids) so auto-invite finds nobody for these requests.
+    await removeCreatedProvidersForLegacyFlow();
     const ownRequest = await request(app.getHttpServer())
       .post('/service-requests')
       .set('Authorization', customerAuthorization)
@@ -1152,6 +1198,9 @@ describe('AppController (e2e)', () => {
     // Make the seeded ac-cleaning provider unavailable so no eligible
     // provider remains for this service; the request must still succeed.
     await makeSeededProviderUnavailable(app, 'provider-1');
+    // Q0-SEC determinism: remove exactly the providers this suite created
+    // (exact registered ids) so zero eligible providers remain.
+    await removeCreatedProvidersForLegacyFlow();
     const customerAuthorization = await createCustomerAuthorization(app);
     const created = await request(app.getHttpServer())
       .post('/service-requests')
@@ -1179,10 +1228,9 @@ describe('AppController (e2e)', () => {
   });
 
   it('automatic plus manual invitation does not duplicate opportunities or events', async () => {
-    // Earlier tests may leave PILOT ac-cleaning providers in the shared test
-    // DB.  Remove them so the baseline auto-invite count is deterministic
-    // (seeded provider-1 + the single eligible provider created below).
-    await removePilotProvidersForService('ac-cleaning');
+    // This run's schema is fresh, so the baseline auto-invite count is
+    // deterministic (seeded provider-1 + the single eligible provider created
+    // below) — no PILOT leftovers exist.
     const eligible = await createProviderAuthorization(app, ['ac-cleaning']);
     const customerAuthorization = await createCustomerAuthorization(app);
     const requestId = await createCustomerServiceRequest(
@@ -1249,8 +1297,8 @@ describe('AppController (e2e)', () => {
     // An eligible provider exists before the request → auto-invited →
     // marketplace opportunity exists. Assign a provider to advance the
     // request to a state where quotes are allowed, then confirm staff quote
-    // is blocked with 409 because opportunities exist.
-    await removePilotProvidersForService('ac-cleaning');
+    // is blocked with 409 because opportunities exist. (This run's schema is
+    // fresh — no PILOT providers exist.)
     const eligible = await createProviderAuthorization(app, ['ac-cleaning']);
     const customerAuthorization = await createCustomerAuthorization(app);
     const requestId = await createCustomerServiceRequest(
@@ -2071,13 +2119,16 @@ describe('AppController (e2e)', () => {
   it('keeps the legacy staff quote flow unchanged when no opportunities exist', async () => {
     const customerAuthorization = await createCustomerAuthorization(app);
     // The legacy staff flow only applies when no marketplace opportunity
-    // exists. Make the seeded ac-cleaning provider unavailable and remove
-    // any PILOT providers accumulated by earlier tests, so the request is
-    // deterministically created with zero eligible matching providers; then
-    // create a fresh matching provider afterwards and use that (available)
-    // provider for assignment and the staff-quote flow.
+    // exists. Make the seeded ac-cleaning provider unavailable — this run's
+    // schema is fresh, so the request is deterministically created with zero
+    // eligible matching providers; then create a fresh matching provider
+    // afterwards and use that (available) provider for assignment and the
+    // staff-quote flow.
     await makeSeededProviderUnavailable(app, 'provider-1');
-    await removePilotProvidersForService('ac-cleaning');
+    // Q0-SEC determinism: remove exactly the providers this suite created
+    // (exact registered ids) so the request is deterministically created with
+    // zero eligible matching providers.
+    await removeCreatedProvidersForLegacyFlow();
     const requestId = await createCustomerServiceRequest(
       app,
       customerAuthorization,
@@ -2135,56 +2186,72 @@ describe('AppController (e2e)', () => {
     );
   });
 
+  describe('Q0-SEC legacy-flow determinism regression', () => {
+    it('removes exactly the registered provider ids and nothing else', async () => {
+      const registered = await createProviderAuthorization(app, [
+        'ac-cleaning',
+      ]);
+      // A provider NOT registered by the suite must survive the cleanup.
+      const adminAuthorization = await createStaffAuthorization(app, 'admin');
+      const unregisteredRes = await request(app.getHttpServer())
+        .post('/providers')
+        .set('Authorization', adminAuthorization)
+        .send({
+          name: `مقدم E2E ${randomUUID().slice(0, 8)}`,
+          specialties: ['ac-cleaning'],
+          serviceZone: 'بريدة',
+        })
+        .expect(201);
+      const unregisteredId = requiredString(unregisteredRes.body, 'id');
+      await request(app.getHttpServer())
+        .patch(`/providers/${unregisteredId}/verification`)
+        .set('Authorization', adminAuthorization)
+        .expect(200);
+
+      await removeCreatedProvidersForLegacyFlow();
+
+      const pool = new Pool({
+        connectionString: process.env.TEST_DATABASE_URL,
+      });
+      try {
+        const gone = await pool.query<{ n: number }>(
+          `SELECT count(*)::int AS n FROM providers WHERE id = $1`,
+          [registered.providerId],
+        );
+        expect(gone.rows[0].n).toBe(0);
+        const stays = await pool.query<{ n: number }>(
+          `SELECT count(*)::int AS n FROM providers WHERE id = $1`,
+          [unregisteredId],
+        );
+        expect(stays.rows[0].n).toBe(1);
+      } finally {
+        await pool.end();
+      }
+    });
+
+    it('is an idempotent no-op when no ids are registered', async () => {
+      await removeCreatedProvidersForLegacyFlow();
+      expect(createdProviderIds.size).toBe(0);
+    });
+
+    it('never scans with prefix patterns or broad wipes', () => {
+      const source = readFileSync(__filename, 'utf8');
+      // The literals are assembled so this assertion cannot match itself.
+      const likePattern = new RegExp("LIKE\\s+'PILOT-%'");
+      const ilikePattern = new RegExp('ILI' + 'KE');
+      expect(source).not.toMatch(likePattern);
+      expect(source).not.toMatch(ilikePattern);
+    });
+  });
+
   afterEach(async () => {
     await app.close();
   });
 
   afterAll(async () => {
-    // Remove E2E-created pilot providers (and their dependent rows) so the
-    // provider-login scrypt loop stays bounded across runs.
-    const pool = new Pool({ connectionString: process.env.TEST_DATABASE_URL });
-    try {
-      await pool.query(
-        `DELETE FROM service_payments
-         WHERE service_request_id IN (
-           SELECT id FROM service_requests WHERE assigned_provider_id LIKE 'PILOT-%'
-         )
-            OR quote_id IN (
-           SELECT id FROM service_quotes WHERE provider_id LIKE 'PILOT-%'
-         )`,
-      );
-      await pool.query(
-        `DELETE FROM service_request_events
-         WHERE service_request_id IN (
-           SELECT id FROM service_requests WHERE assigned_provider_id LIKE 'PILOT-%'
-         )`,
-      );
-      await pool.query(
-        `DELETE FROM request_provider_opportunities
-         WHERE provider_id LIKE 'PILOT-%'
-            OR service_request_id IN (
-           SELECT id FROM service_requests WHERE assigned_provider_id LIKE 'PILOT-%'
-         )`,
-      );
-      await pool.query(
-        `DELETE FROM service_quotes
-         WHERE provider_id LIKE 'PILOT-%'
-            OR service_request_id IN (
-           SELECT id FROM service_requests WHERE assigned_provider_id LIKE 'PILOT-%'
-         )`,
-      );
-      await pool.query(
-        `DELETE FROM service_requests WHERE assigned_provider_id LIKE 'PILOT-%'`,
-      );
-      await pool.query(
-        `DELETE FROM provider_sessions WHERE provider_id LIKE 'PILOT-%'`,
-      );
-      await pool.query(
-        `DELETE FROM provider_access_credentials WHERE provider_id LIKE 'PILOT-%'`,
-      );
-      await pool.query(`DELETE FROM providers WHERE id LIKE 'PILOT-%'`);
-    } finally {
-      await pool.end();
-    }
+    // Q0-SEC: no shared-schema cleanup here. Each test run owns its unique
+    // schema (moeen_test_<runId>) and global-teardown.ts drops it with
+    // CASCADE, so nothing created by this run can leak into or collide with
+    // another run.
   });
 });

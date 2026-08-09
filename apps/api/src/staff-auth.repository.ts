@@ -104,7 +104,7 @@ export class StaffAuthRepository
     `);
     await this.pool.query(`
       CREATE TABLE IF NOT EXISTS public_auth_rate_limits (
-        scope TEXT NOT NULL CHECK (scope IN ('customer_otp_request', 'customer_otp_verification')),
+        scope TEXT NOT NULL CHECK (scope IN ('customer_otp_request', 'customer_otp_verification', 'provider_login')),
         subject_hash CHAR(64) NOT NULL,
         window_started_at TIMESTAMPTZ NOT NULL,
         attempt_count INTEGER NOT NULL CHECK (attempt_count > 0),
@@ -112,13 +112,20 @@ export class StaffAuthRepository
       )
     `);
     // Extend the public-auth scope CHECK with provider_login (controlled, idempotent, race-safe)
+    // Scoped to the current schema's own table: an unqualified pg_constraint scan can
+    // match (and pg_get_constraintdef open) a same-named constraint from ANOTHER schema
+    // while that schema is being dropped concurrently (parallel test runs), which fails
+    // with "could not open relation with OID ...".
     await this.pool.query(`
       DO $$
       BEGIN
         IF NOT EXISTS (
-          SELECT 1 FROM pg_constraint
-          WHERE conname = 'public_auth_rate_limits_scope_check'
-            AND pg_get_constraintdef(oid) LIKE '%provider_login%'
+          SELECT 1 FROM pg_constraint c
+          WHERE c.conrelid = to_regclass(format('%I.%I', current_schema(), 'public_auth_rate_limits'))
+            AND c.conname = 'public_auth_rate_limits_scope_check'
+            AND pg_get_constraintdef(c.oid) LIKE '%customer_otp_request%'
+            AND pg_get_constraintdef(c.oid) LIKE '%customer_otp_verification%'
+            AND pg_get_constraintdef(c.oid) LIKE '%provider_login%'
         ) THEN
           BEGIN
             ALTER TABLE public_auth_rate_limits

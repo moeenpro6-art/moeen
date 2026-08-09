@@ -296,7 +296,7 @@ export class ServiceRequestRepository
       CREATE TABLE IF NOT EXISTS service_request_events (
         id BIGSERIAL PRIMARY KEY,
         service_request_id BIGINT NOT NULL REFERENCES service_requests(id),
-        type TEXT NOT NULL CHECK (type IN ('request_created', 'provider_assigned', 'status_updated', 'quote_proposed', 'quote_approved', 'quote_rejected')),
+        type TEXT NOT NULL CHECK (type IN ('request_created', 'provider_assigned', 'status_updated', 'quote_proposed', 'quote_approved', 'quote_rejected', 'opportunity_invited', 'opportunity_closed', 'provider_quote_submitted', 'provider_quote_withdrawn')),
         status TEXT NOT NULL,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
@@ -310,7 +310,7 @@ export class ServiceRequestRepository
         service_request_id BIGINT NOT NULL REFERENCES service_requests(id),
         amount_halalas INTEGER NOT NULL CHECK (amount_halalas > 0),
         scope TEXT NOT NULL,
-        status TEXT NOT NULL CHECK (status IN ('proposed', 'approved', 'rejected')) DEFAULT 'proposed',
+        status TEXT NOT NULL CHECK (status IN ('proposed', 'approved', 'rejected', 'withdrawn')) DEFAULT 'proposed',
         proposed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         decided_at TIMESTAMPTZ
       )
@@ -337,7 +337,7 @@ export class ServiceRequestRepository
         service_request_id BIGINT NOT NULL REFERENCES service_requests(id),
         provider_id TEXT NOT NULL REFERENCES providers(id),
         status TEXT NOT NULL DEFAULT 'invited'
-          CHECK (status IN ('invited', 'quoted', 'withdrawn', 'closed')),
+          CHECK (status IN ('invited', 'quoted', 'withdrawn', 'closed', 'rejected')),
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         UNIQUE (service_request_id, provider_id)
       )
@@ -346,13 +346,21 @@ export class ServiceRequestRepository
       'CREATE INDEX IF NOT EXISTS opportunities_provider_idx ON request_provider_opportunities (provider_id, status)',
     );
     // Extend the quote status CHECK with 'withdrawn' (controlled, idempotent, race-safe)
+    // Scoped to the current schema's own table: an unqualified pg_constraint scan can
+    // match (and pg_get_constraintdef open) a same-named constraint from ANOTHER schema
+    // while that schema is being dropped concurrently (parallel test runs), which fails
+    // with "could not open relation with OID ...".
     await this.pool.query(`
       DO $$
       BEGIN
         IF NOT EXISTS (
-          SELECT 1 FROM pg_constraint
-          WHERE conname = 'service_quotes_status_check'
-            AND pg_get_constraintdef(oid) LIKE '%withdrawn%'
+          SELECT 1 FROM pg_constraint c
+          WHERE c.conrelid = to_regclass(format('%I.%I', current_schema(), 'service_quotes'))
+            AND c.conname = 'service_quotes_status_check'
+            AND pg_get_constraintdef(c.oid) LIKE '%proposed%'
+            AND pg_get_constraintdef(c.oid) LIKE '%approved%'
+            AND pg_get_constraintdef(c.oid) LIKE '%rejected%'
+            AND pg_get_constraintdef(c.oid) LIKE '%withdrawn%'
         ) THEN
           BEGIN
             ALTER TABLE service_quotes
@@ -366,13 +374,24 @@ export class ServiceRequestRepository
       END $$;
     `);
     // Extend the event type CHECK with distinct marketplace event types
+    // (same current_schema() scoping as the quote CHECK migration above)
     await this.pool.query(`
       DO $$
       BEGIN
         IF NOT EXISTS (
-          SELECT 1 FROM pg_constraint
-          WHERE conname = 'service_request_events_type_check'
-            AND pg_get_constraintdef(oid) LIKE '%opportunity_closed%'
+          SELECT 1 FROM pg_constraint c
+          WHERE c.conrelid = to_regclass(format('%I.%I', current_schema(), 'service_request_events'))
+            AND c.conname = 'service_request_events_type_check'
+            AND pg_get_constraintdef(c.oid) LIKE '%request_created%'
+            AND pg_get_constraintdef(c.oid) LIKE '%provider_assigned%'
+            AND pg_get_constraintdef(c.oid) LIKE '%status_updated%'
+            AND pg_get_constraintdef(c.oid) LIKE '%quote_proposed%'
+            AND pg_get_constraintdef(c.oid) LIKE '%quote_approved%'
+            AND pg_get_constraintdef(c.oid) LIKE '%quote_rejected%'
+            AND pg_get_constraintdef(c.oid) LIKE '%opportunity_invited%'
+            AND pg_get_constraintdef(c.oid) LIKE '%opportunity_closed%'
+            AND pg_get_constraintdef(c.oid) LIKE '%provider_quote_submitted%'
+            AND pg_get_constraintdef(c.oid) LIKE '%provider_quote_withdrawn%'
         ) THEN
           BEGIN
             ALTER TABLE service_request_events
@@ -389,13 +408,19 @@ export class ServiceRequestRepository
       END $$;
     `);
     // Extend the opportunity status CHECK with 'rejected' (controlled, idempotent, race-safe)
+    // (same current_schema() scoping as the quote CHECK migration above)
     await this.pool.query(`
       DO $$
       BEGIN
         IF NOT EXISTS (
-          SELECT 1 FROM pg_constraint
-          WHERE conname = 'request_provider_opportunities_status_check'
-            AND pg_get_constraintdef(oid) LIKE '%rejected%'
+          SELECT 1 FROM pg_constraint c
+          WHERE c.conrelid = to_regclass(format('%I.%I', current_schema(), 'request_provider_opportunities'))
+            AND c.conname = 'request_provider_opportunities_status_check'
+            AND pg_get_constraintdef(c.oid) LIKE '%invited%'
+            AND pg_get_constraintdef(c.oid) LIKE '%quoted%'
+            AND pg_get_constraintdef(c.oid) LIKE '%withdrawn%'
+            AND pg_get_constraintdef(c.oid) LIKE '%closed%'
+            AND pg_get_constraintdef(c.oid) LIKE '%rejected%'
         ) THEN
           BEGIN
             ALTER TABLE request_provider_opportunities
