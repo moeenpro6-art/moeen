@@ -1663,6 +1663,20 @@ describe('AppController (e2e)', () => {
     expect(typeof providerQuote.proposedAt).toBe('string');
     expect(typeof providerQuote.decidedAt).toBe('string');
     expect(JSON.stringify(providerJob)).not.toContain(competitorScope);
+
+    const onTheWay = await request(app.getHttpServer())
+      .patch(`/provider/service-requests/${requestId}/status`)
+      .set('Authorization', providerA.authorization)
+      .send({ status: 'on_the_way' })
+      .expect(200);
+    expect(responseObject(onTheWay.body).status).toBe('on_the_way');
+
+    const inProgress = await request(app.getHttpServer())
+      .patch(`/provider/service-requests/${requestId}/status`)
+      .set('Authorization', providerA.authorization)
+      .send({ status: 'in_progress' })
+      .expect(200);
+    expect(responseObject(inProgress.body).status).toBe('in_progress');
   });
 
   it('fails safely when the winning provider becomes unavailable before approval', async () => {

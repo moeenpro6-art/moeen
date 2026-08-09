@@ -1101,14 +1101,27 @@ export class ServiceRequestRepository
         throw new Error('Invalid status transition');
       }
       if (status === 'in_progress') {
-        const latestQuote = await client.query<{ status: ServiceQuoteStatus }>(
-          `SELECT status FROM service_quotes
-           WHERE service_request_id = $1
-           ORDER BY id DESC
+        const effectiveQuote = await client.query<{
+          status: ServiceQuoteStatus;
+        }>(
+          `SELECT status
+           FROM (
+             SELECT id, status, 0 AS quote_source_priority
+             FROM service_quotes
+             WHERE service_request_id = $1 AND provider_id = $2
+             UNION ALL
+             SELECT id, status, 1 AS quote_source_priority
+             FROM service_quotes
+             WHERE service_request_id = $1 AND provider_id IS NULL
+           ) eligible_quotes
+           ORDER BY quote_source_priority, id DESC
            LIMIT 1`,
-          [databaseId],
+          [databaseId, providerId],
         );
-        if (latestQuote.rows[0] && latestQuote.rows[0].status !== 'approved') {
+        if (
+          effectiveQuote.rows[0] &&
+          effectiveQuote.rows[0].status !== 'approved'
+        ) {
           throw new Error('Quote approval required');
         }
       }
