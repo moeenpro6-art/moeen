@@ -48,11 +48,19 @@ type ServiceRequestRow = {
   rating: number | null;
   rating_comment: string | null;
   quote_id: string | null;
+  quote_provider_id: string | null;
+  quote_provider_name: string | null;
   quote_amount_halalas: number | null;
   quote_scope: string | null;
   quote_status: ServiceQuoteStatus | null;
   quote_proposed_at: Date | null;
   quote_decided_at: Date | null;
+  opportunity_invited: number | null;
+  opportunity_quoted: number | null;
+  opportunity_withdrawn: number | null;
+  opportunity_closed: number | null;
+  opportunity_rejected: number | null;
+  opportunity_total: number | null;
   payment_id: string | null;
   payment_amount_halalas: number | null;
   payment_currency: 'SAR' | null;
@@ -679,9 +687,14 @@ export class ServiceRequestRepository
               p.id AS assigned_provider_id, p.name AS assigned_provider_name,
               p.specialties AS assigned_provider_specialties, p.available AS assigned_provider_available,
               r.rating, r.rating_comment,
-              q.id AS quote_id, q.amount_halalas AS quote_amount_halalas,
+              q.id AS quote_id, q.provider_id AS quote_provider_id,
+              qp.name AS quote_provider_name,
+              q.amount_halalas AS quote_amount_halalas,
               q.scope AS quote_scope, q.status AS quote_status,
               q.proposed_at AS quote_proposed_at, q.decided_at AS quote_decided_at,
+              opp.invited AS opportunity_invited, opp.quoted AS opportunity_quoted,
+              opp.withdrawn AS opportunity_withdrawn, opp.closed AS opportunity_closed,
+              opp.rejected AS opportunity_rejected, opp.total AS opportunity_total,
               sp.id AS payment_id, sp.amount_halalas AS payment_amount_halalas,
               sp.currency AS payment_currency, sp.method AS payment_method,
               sp.status AS payment_status, sp.created_at AS payment_created_at,
@@ -690,12 +703,23 @@ export class ServiceRequestRepository
        FROM service_requests r
        LEFT JOIN providers p ON p.id = r.assigned_provider_id
        LEFT JOIN LATERAL (
-         SELECT id, amount_halalas, scope, status, proposed_at, decided_at
+         SELECT id, provider_id, amount_halalas, scope, status, proposed_at, decided_at
          FROM service_quotes
          WHERE service_request_id = r.id
          ORDER BY id DESC
          LIMIT 1
        ) q ON TRUE
+       LEFT JOIN providers qp ON qp.id = q.provider_id
+       LEFT JOIN LATERAL (
+         SELECT count(*) FILTER (WHERE status = 'invited') AS invited,
+                count(*) FILTER (WHERE status = 'quoted') AS quoted,
+                count(*) FILTER (WHERE status = 'withdrawn') AS withdrawn,
+                count(*) FILTER (WHERE status = 'closed') AS closed,
+                count(*) FILTER (WHERE status = 'rejected') AS rejected,
+                count(*) AS total
+         FROM request_provider_opportunities
+         WHERE service_request_id = r.id
+       ) opp ON TRUE
        LEFT JOIN LATERAL (
          SELECT id, amount_halalas, currency, method, status, created_at, collected_at, refunded_at
          FROM service_payments
@@ -2327,6 +2351,8 @@ export class ServiceRequestRepository
       quote: row.quote_id
         ? {
             id: `QTE-${row.quote_id}`,
+            providerId: row.quote_provider_id ?? undefined,
+            providerName: row.quote_provider_name ?? undefined,
             amountHalalas: row.quote_amount_halalas ?? 0,
             scope: row.quote_scope ?? '',
             status: row.quote_status ?? 'proposed',
@@ -2334,6 +2360,17 @@ export class ServiceRequestRepository
             decidedAt: row.quote_decided_at?.toISOString(),
           }
         : undefined,
+      opportunities:
+        Number(row.opportunity_total) > 0
+          ? {
+              invited: Number(row.opportunity_invited),
+              quoted: Number(row.opportunity_quoted),
+              withdrawn: Number(row.opportunity_withdrawn),
+              closed: Number(row.opportunity_closed),
+              rejected: Number(row.opportunity_rejected),
+              total: Number(row.opportunity_total),
+            }
+          : undefined,
       payment: row.payment_id
         ? this.toServicePayment({
             id: row.payment_id,

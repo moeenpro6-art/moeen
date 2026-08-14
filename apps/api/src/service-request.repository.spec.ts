@@ -936,6 +936,85 @@ describe('ServiceRequestRepository', () => {
     expect(requests).toContainEqual({ ...created, quotes: [] });
   });
 
+  it('findAll exposes the marketplace opportunity summary and quote provider for staff', async () => {
+    // F5: the operations dashboard must see the marketplace state created by
+    // the API so its picture never contradicts the provider quote flow.
+    const uniqueServiceId = `staff-view-${randomUUID()}`;
+    const { request, customerId } = await createPendingRequest(uniqueServiceId);
+    const providerA = await createVerifiedProvider([uniqueServiceId]);
+    const providerB = await createVerifiedProvider([uniqueServiceId]);
+    await repository.inviteProvidersToRequest(request.id, [
+      providerA.id,
+      providerB.id,
+    ]);
+    await repository.submitProviderQuote(
+      request.id,
+      providerA.id,
+      15_000,
+      'عرض أ',
+    );
+    await repository.submitProviderQuote(
+      request.id,
+      providerB.id,
+      12_000,
+      'عرض ب',
+    );
+
+    const staffView = await repository.findAll();
+    const requestView = staffView.find((item) => item.id === request.id);
+
+    expect(requestView?.opportunities).toEqual({
+      invited: 0,
+      quoted: 2,
+      withdrawn: 0,
+      closed: 0,
+      rejected: 0,
+      total: 2,
+    });
+    // The latest quote (highest id) is provider B's and carries its origin so
+    // staff can tell a marketplace provider quote from a staff quote.
+    expect(requestView?.quote).toMatchObject({
+      amountHalalas: 12_000,
+      scope: 'عرض ب',
+      providerId: providerB.id,
+      providerName: providerB.name,
+    });
+
+    // The customer view must not gain the staff-only marketplace summary or
+    // provider origin: the F5 contract extension stays out of the customer API.
+    const customerView = await repository.findByCustomerId(customerId);
+    const customerRequest = customerView.find((item) => item.id === request.id);
+    expect(customerRequest?.opportunities).toBeUndefined();
+    expect(customerRequest?.quote?.providerName).toBeUndefined();
+  });
+
+  it('findAll omits marketplace fields for a plain staff-quote request', async () => {
+    // No eligible provider exists at creation time (unique service id), so no
+    // opportunities are auto-created and the staff quote path applies.
+    const uniqueServiceId = `staff-view-clean-${randomUUID()}`;
+    const { request } = await createPendingRequest(uniqueServiceId);
+    const staffProvider = await createVerifiedProvider([uniqueServiceId]);
+    await repository.assignProvider(request.id, staffProvider.id);
+    await repository.updateStatus(request.id, 'on_the_way');
+    const quote = await repository.proposeQuote(
+      request.id,
+      15_000,
+      'إصلاح تسرب تحت المغسلة',
+    );
+
+    const staffView = await repository.findAll();
+    const requestView = staffView.find((item) => item.id === request.id);
+
+    expect(requestView?.opportunities).toBeUndefined();
+    expect(requestView?.quote).toMatchObject({
+      id: quote.id,
+      amountHalalas: 15_000,
+    });
+    // A staff quote has no provider origin and must not be presented as one.
+    expect(requestView?.quote?.providerId).toBeUndefined();
+    expect(requestView?.quote?.providerName).toBeUndefined();
+  });
+
   async function createVerifiedProvider(specialties: string[]) {
     const provider = await repository.createPilotProvider({
       name: `مقدم اختبار ${randomUUID().slice(0, 8)}`,

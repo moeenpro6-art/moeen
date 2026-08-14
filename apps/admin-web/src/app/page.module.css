@@ -38,6 +38,13 @@
 .quotePending { color: #9a6700 !important; font-weight: 700; }
 .quoteApproved { color: #0b6e69 !important; font-weight: 700; }
 .quoteRejected { color: #b42318 !important; font-weight: 700; }
+.quoteWithdrawn { color: #4b5563 !important; font-weight: 700; }
+.marketplace { min-width: 220px; padding: 12px; border: 1px solid #d8d2f0; border-radius: 12px; background: #f7f5fd; }
+.marketplace strong { color: #17312e; }
+.marketplace span { color: #506764; font-size: 13px; }
+.marketplaceNote { margin: 0; padding: 8px 10px; border-radius: 9px; background: #fdf3e3; color: #7a4d0d; font-size: 13px; line-height: 1.6; }
+.assignmentBlock { display: grid; gap: 8px; justify-items: start; }
+.loadError { margin: 0; padding: 14px 16px; background: #fdecea; color: #b42318; font-weight: 700; text-align: center; }
 .payment { min-width: 220px; padding: 12px; border: 1px solid #e6d5a8; border-radius: 12px; background: #fffaf0; }
 .payment strong { color: #17312e; }
 .payment span { display: block; margin-top: 4px; font-size: 13px; }
@@ -49,4 +56,4 @@
 .quoteForm { display: grid; grid-template-columns: minmax(125px, 0.55fr) minmax(180px, 1fr) auto; gap: 8px; align-items: center; min-width: 360px; }
 .quoteForm input { min-width: 0; border: 1px solid #cddbd8; border-radius: 9px; background: #fff; color: #17312e; padding: 9px; font: inherit; }
 .quoteForm button { padding: 9px 12px; white-space: nowrap; }
-@media (max-width: 700px) { .page { padding: 20px 16px 40px; } .hero, .header, .sectionTitle, .job { align-items: flex-start; flex-direction: column; } .metrics { grid-template-columns: repeat(2, 1fr); } .hero { padding: 26px; } .quoteForm { width: 100%; min-width: 0; grid-template-columns: 1fr; } .quote { width: 100%; } }
+@media (max-width: 700px) { .page { padding: 20px 16px 40px; } .hero, .header, .sectionTitle, .job { align-items: flex-start; flex-direction: column; } .metrics { grid-template-columns: repeat(2, 1fr); } .hero { padding: 26px; } .quoteForm { width: 100%; min-width: 0; grid-template-columns: 1fr; } .quote { width: 100%; } .marketplace { width: 100%; } .assignmentBlock { width: 100%; } .assignmentBlock .assignment { width: 100%; flex-wrap: wrap; } .assignmentBlock select { flex: 1 1 160px; min-width: 0; } }
