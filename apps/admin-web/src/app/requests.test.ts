@@ -130,3 +130,131 @@ test('accepts a complete API lifecycle event for the dashboard', () => {
     true,
   );
 });
+
+test('maps a marketplace provider quote and opportunity summary into the dashboard request', () => {
+  const request = toDashboardRequest({
+    id: 'MOE-1010',
+    serviceId: 'ac-cleaning',
+    address: 'حي الصفراء، بريدة',
+    timing: 'as-soon-as-possible',
+    status: 'pending_dispatch',
+    quote: {
+      id: 'QTE-9',
+      providerId: 'provider-9',
+      providerName: 'فريق التبريد السريع',
+      amountHalalas: 12000,
+      scope: 'تنظيف مكيفين',
+      status: 'proposed',
+    },
+    opportunities: {
+      invited: 2,
+      quoted: 1,
+      withdrawn: 0,
+      closed: 0,
+      rejected: 0,
+      total: 3,
+    },
+    createdAt: '2026-08-06T01:00:00.000Z',
+  });
+
+  assert.deepEqual(request.quote, {
+    id: 'QTE-9',
+    providerId: 'provider-9',
+    providerName: 'فريق التبريد السريع',
+    amountHalalas: 12000,
+    scope: 'تنظيف مكيفين',
+    status: 'proposed',
+  });
+  assert.deepEqual(request.opportunities, {
+    invited: 2,
+    quoted: 1,
+    withdrawn: 0,
+    closed: 0,
+    rejected: 0,
+    total: 3,
+  });
+});
+
+test('accepts a withdrawn provider quote alongside its opportunity summary', () => {
+  assert.equal(
+    requests.isApiServiceRequest({
+      id: 'MOE-1011',
+      serviceId: 'plumbing',
+      address: 'حي الريان، بريدة',
+      timing: 'as-soon-as-possible',
+      status: 'pending_dispatch',
+      quote: {
+        id: 'QTE-10',
+        providerId: 'provider-9',
+        providerName: 'فريق التبريد السريع',
+        amountHalalas: 9000,
+        scope: 'إصلاح تسرب',
+        status: 'withdrawn',
+      },
+      opportunities: {
+        invited: 0,
+        quoted: 0,
+        withdrawn: 1,
+        closed: 1,
+        rejected: 0,
+        total: 2,
+      },
+      createdAt: '2026-08-06T02:00:00.000Z',
+    }),
+    true,
+  );
+});
+
+test('rejects a request whose opportunity summary is malformed', () => {
+  assert.equal(
+    requests.isApiServiceRequest({
+      id: 'MOE-1012',
+      serviceId: 'plumbing',
+      address: 'حي الريان، بريدة',
+      timing: 'as-soon-as-possible',
+      status: 'pending_dispatch',
+      opportunities: {
+        invited: 'many',
+        quoted: 1,
+        withdrawn: 0,
+        closed: 0,
+        rejected: 0,
+        total: 2,
+      },
+      createdAt: '2026-08-06T03:00:00.000Z',
+    }),
+    false,
+  );
+});
+
+test('labels marketplace opportunity events in Arabic', () => {
+  const eventLabel = (
+    requests as typeof requests & {
+      requestEventLabel?: (event: { type: string; status: string }) => string;
+    }
+  ).requestEventLabel;
+
+  assert.equal(typeof eventLabel, 'function');
+  assert.equal(
+    eventLabel?.({ type: 'opportunity_invited', status: 'pending_dispatch' }),
+    'تمت دعوة مقدم خدمة من السوق',
+  );
+  assert.equal(
+    eventLabel?.({ type: 'opportunity_closed', status: 'assigned' }),
+    'أُغلقت فرصة السوق',
+  );
+  assert.equal(
+    eventLabel?.({
+      type: 'provider_quote_submitted',
+      status: 'pending_dispatch',
+    }),
+    'قدّم مقدم الخدمة عرضًا من السوق',
+  );
+  assert.equal(
+    eventLabel?.({
+      type: 'provider_quote_withdrawn',
+      status: 'pending_dispatch',
+    }),
+    'سحب مقدم الخدمة عرضه',
+  );
+});

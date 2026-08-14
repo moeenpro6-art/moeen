@@ -98,11 +98,21 @@ export type ServiceQuoteStatus =
 export type ServiceQuote = {
   id: string;
   providerId?: string;
+  providerName?: string;
   amountHalalas: number;
   scope: string;
   status: ServiceQuoteStatus;
   proposedAt: string;
   decidedAt?: string;
+};
+
+export type ServiceOpportunitySummary = {
+  invited: number;
+  quoted: number;
+  withdrawn: number;
+  closed: number;
+  rejected: number;
+  total: number;
 };
 
 export type ProviderOpportunityStatus =
@@ -159,6 +169,7 @@ export type ServiceRequest = CreateServiceRequest & {
   assignedProvider?: Provider;
   quote?: ServiceQuote;
   quotes?: CustomerQuoteView[];
+  opportunities?: ServiceOpportunitySummary;
   payment?: ServicePayment;
   rating?: number;
   ratingComment?: string;

@@ -6,9 +6,20 @@ export type ApiServiceRequestEvent = {
 
 export type ApiServiceQuote = {
   id: string;
+  providerId?: string;
+  providerName?: string;
   amountHalalas: number;
   scope: string;
-  status: 'proposed' | 'approved' | 'rejected';
+  status: 'proposed' | 'approved' | 'rejected' | 'withdrawn';
+};
+
+export type ApiServiceOpportunitySummary = {
+  invited: number;
+  quoted: number;
+  withdrawn: number;
+  closed: number;
+  rejected: number;
+  total: number;
 };
 
 export type ApiServicePayment = {
@@ -38,6 +49,7 @@ export type ApiServiceRequest = {
   status: string;
   assignedProvider?: { name: string };
   quote?: ApiServiceQuote;
+  opportunities?: ApiServiceOpportunitySummary;
   payment?: ApiServicePayment;
   rating?: number;
   ratingComment?: string;
@@ -54,6 +66,7 @@ export type DashboardRequest = {
   status: string;
   provider: string;
   quote?: DashboardQuote;
+  opportunities?: ApiServiceOpportunitySummary;
   payment?: ApiServicePayment;
   rating?: number;
   ratingComment?: string;
@@ -94,6 +107,10 @@ export function requestEventLabel(event: ApiServiceRequestEvent): string {
   if (event.type === 'quote_proposed') return 'تم إرسال عرض السعر';
   if (event.type === 'quote_approved') return 'وافق العميل على عرض السعر';
   if (event.type === 'quote_rejected') return 'رفض العميل عرض السعر';
+  if (event.type === 'opportunity_invited') return 'تمت دعوة مقدم خدمة من السوق';
+  if (event.type === 'opportunity_closed') return 'أُغلقت فرصة السوق';
+  if (event.type === 'provider_quote_submitted') return 'قدّم مقدم الخدمة عرضًا من السوق';
+  if (event.type === 'provider_quote_withdrawn') return 'سحب مقدم الخدمة عرضه';
   if (event.type === 'status_updated') {
     return `تحديث الحالة: ${statuses[event.status] ?? event.status}`;
   }
@@ -109,6 +126,9 @@ export function toDashboardRequest(request: ApiServiceRequest): DashboardRequest
     status: statuses[request.status] ?? request.status,
     provider: request.assignedProvider?.name ?? 'لم يُعيّن بعد',
     ...(request.quote ? { quote: request.quote } : {}),
+    ...(request.opportunities
+      ? { opportunities: request.opportunities }
+      : {}),
     ...(request.payment ? { payment: request.payment } : {}),
     rating: request.rating,
     ratingComment: request.ratingComment,
@@ -123,7 +143,24 @@ function isApiServiceQuote(value: unknown): value is ApiServiceQuote {
     Number.isInteger(quote.amountHalalas) &&
     Number(quote.amountHalalas) > 0 &&
     typeof quote.scope === 'string' &&
-    ['proposed', 'approved', 'rejected'].includes(String(quote.status))
+    ['proposed', 'approved', 'rejected', 'withdrawn'].includes(
+      String(quote.status),
+    ) &&
+    (quote.providerId === undefined || typeof quote.providerId === 'string') &&
+    (quote.providerName === undefined ||
+      typeof quote.providerName === 'string')
+  );
+}
+
+function isApiServiceOpportunitySummary(
+  value: unknown,
+): value is ApiServiceOpportunitySummary {
+  if (typeof value !== 'object' || value === null) return false;
+  const summary = value as Record<string, unknown>;
+  return (
+    ['invited', 'quoted', 'withdrawn', 'closed', 'rejected', 'total'].every(
+      (key) => Number.isInteger(summary[key]) && Number(summary[key]) >= 0,
+    )
   );
 }
 
@@ -165,6 +202,8 @@ export function isApiServiceRequest(value: unknown): value is ApiServiceRequest 
       'createdAt',
     ].every((key) => typeof request[key] === 'string') &&
     (request.quote === undefined || isApiServiceQuote(request.quote)) &&
+    (request.opportunities === undefined ||
+      isApiServiceOpportunitySummary(request.opportunities)) &&
     (request.payment === undefined || isApiServicePayment(request.payment))
   );
 }

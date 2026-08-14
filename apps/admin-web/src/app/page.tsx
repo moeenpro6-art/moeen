@@ -29,33 +29,44 @@ import {
 
 export const dynamic = 'force-dynamic';
 
-async function getServiceRequests(token: string): Promise<DashboardRequest[]> {
+/**
+ * Distinguishes a legitimate empty list from a load failure so the
+ * dashboard never presents API failures as successful empty data.
+ */
+type ListResult<T> = { ok: true; items: T[] } | { ok: false; items: never[] };
+
+async function getServiceRequests(
+  token: string,
+): Promise<ListResult<DashboardRequest>> {
   try {
     const response = await dashboardApiFetch('/service-requests', token);
-    if (!response.ok) return [];
+    if (!response.ok) return { ok: false, items: [] };
     const data: unknown = await response.json();
-    if (!Array.isArray(data)) return [];
-    return data.filter(isApiServiceRequest).map(toDashboardRequest).reverse();
+    if (!Array.isArray(data)) return { ok: false, items: [] };
+    return {
+      ok: true,
+      items: data.filter(isApiServiceRequest).map(toDashboardRequest).reverse(),
+    };
   } catch {
-    return [];
+    return { ok: false, items: [] };
   }
 }
 
 async function getServiceRequestEvents(
   token: string,
   requestId: string,
-): Promise<ApiServiceRequestEvent[]> {
+): Promise<ListResult<ApiServiceRequestEvent>> {
   try {
     const response = await dashboardApiFetch(
       `/service-requests/${requestId}/history`,
       token,
     );
-    if (!response.ok) return [];
+    if (!response.ok) return { ok: false, items: [] };
     const data: unknown = await response.json();
-    if (!Array.isArray(data)) return [];
-    return data.filter(isApiServiceRequestEvent);
+    if (!Array.isArray(data)) return { ok: false, items: [] };
+    return { ok: true, items: data.filter(isApiServiceRequestEvent) };
   } catch {
-    return [];
+    return { ok: false, items: [] };
   }
 }
 
@@ -68,50 +79,73 @@ type Provider = {
   available: boolean;
 };
 
-async function getProviders(token: string): Promise<Provider[]> {
+async function getProviders(token: string): Promise<ListResult<Provider>> {
   try {
     const response = await dashboardApiFetch('/providers', token);
     const data: unknown = await response.json();
-    if (!response.ok || !Array.isArray(data)) return [];
-    return data.filter((value): value is Provider =>
-      typeof value === 'object' &&
-      value !== null &&
-      typeof (value as Record<string, unknown>).id === 'string' &&
-      typeof (value as Record<string, unknown>).name === 'string' &&
-      Array.isArray((value as Record<string, unknown>).specialties) &&
-      typeof (value as Record<string, unknown>).serviceZone === 'string' &&
-      ['pending', 'verified', 'suspended'].includes(
-        String((value as Record<string, unknown>).verificationStatus),
-      ) &&
-      typeof (value as Record<string, unknown>).available === 'boolean',
-    );
+    if (!response.ok || !Array.isArray(data)) return { ok: false, items: [] };
+    return {
+      ok: true,
+      items: data.filter((value): value is Provider =>
+        typeof value === 'object' &&
+        value !== null &&
+        typeof (value as Record<string, unknown>).id === 'string' &&
+        typeof (value as Record<string, unknown>).name === 'string' &&
+        Array.isArray((value as Record<string, unknown>).specialties) &&
+        typeof (value as Record<string, unknown>).serviceZone === 'string' &&
+        ['pending', 'verified', 'suspended'].includes(
+          String((value as Record<string, unknown>).verificationStatus),
+        ) &&
+        typeof (value as Record<string, unknown>).available === 'boolean',
+      ),
+    };
   } catch {
-    return [];
+    return { ok: false, items: [] };
   }
 }
 
 async function getSupportTickets(
   token: string,
-): Promise<DashboardSupportTicket[]> {
+): Promise<ListResult<DashboardSupportTicket>> {
   try {
     const response = await dashboardApiFetch('/support-tickets', token);
     const data: unknown = await response.json();
-    if (!response.ok || !Array.isArray(data)) return [];
-    return data.filter(isApiSupportTicket).map(toDashboardSupportTicket);
+    if (!response.ok || !Array.isArray(data)) return { ok: false, items: [] };
+    return {
+      ok: true,
+      items: data.filter(isApiSupportTicket).map(toDashboardSupportTicket),
+    };
   } catch {
-    return [];
+    return { ok: false, items: [] };
   }
 }
 
-async function getAuditEvents(token: string): Promise<DashboardAuditEvent[]> {
+async function getAuditEvents(token: string): Promise<ListResult<DashboardAuditEvent>> {
   try {
     const response = await dashboardApiFetch('/admin/audit-events', token);
     const data: unknown = await response.json();
-    if (!response.ok || !Array.isArray(data)) return [];
-    return data.filter(isApiAuditEvent).map(toDashboardAuditEvent);
+    if (!response.ok || !Array.isArray(data)) return { ok: false, items: [] };
+    return {
+      ok: true,
+      items: data.filter(isApiAuditEvent).map(toDashboardAuditEvent),
+    };
   } catch {
-    return [];
+    return { ok: false, items: [] };
   }
+}
+
+/** Arabic parts describing the marketplace opportunity state for one request. */
+function marketplaceSummaryParts(
+  opportunities: DashboardRequest['opportunities'],
+): string[] {
+  if (!opportunities) return [];
+  const parts: string[] = [];
+  if (opportunities.invited > 0) parts.push(`${opportunities.invited} مدعو`);
+  if (opportunities.quoted > 0) parts.push(`${opportunities.quoted} عرض مقدم`);
+  if (opportunities.withdrawn > 0) parts.push(`${opportunities.withdrawn} منسحب`);
+  if (opportunities.closed > 0) parts.push(`${opportunities.closed} مغلق`);
+  if (opportunities.rejected > 0) parts.push(`${opportunities.rejected} مرفوض`);
+  return parts;
 }
 
 const roleLabels = {
@@ -135,28 +169,41 @@ export default async function Home({ searchParams }: HomeProps) {
   const { token, staff } = await requireStaffSession();
   const { canDispatch, canSupport, canViewAudit } = staffCapabilities(staff.role);
   const isAdmin = staff.role === 'admin';
-  const [jobs, providers, supportTickets, auditEvents] = await Promise.all([
-    canDispatch ? getServiceRequests(token) : Promise.resolve([]),
-    canDispatch ? getProviders(token) : Promise.resolve([]),
-    canSupport ? getSupportTickets(token) : Promise.resolve([]),
-    canViewAudit ? getAuditEvents(token) : Promise.resolve([]),
-  ]);
+  const [jobsResult, providersResult, supportTicketsResult, auditEventsResult] =
+    await Promise.all([
+      canDispatch ? getServiceRequests(token) : Promise.resolve({ ok: true, items: [] }),
+      canDispatch ? getProviders(token) : Promise.resolve({ ok: true, items: [] }),
+      canSupport
+        ? getSupportTickets(token)
+        : Promise.resolve({ ok: true, items: [] }),
+      canViewAudit
+        ? getAuditEvents(token)
+        : Promise.resolve({ ok: true, items: [] }),
+    ]);
+  const jobs = jobsResult.ok ? jobsResult.items : [];
+  const providers = providersResult.ok ? providersResult.items : [];
+  const supportTickets = supportTicketsResult.ok
+    ? supportTicketsResult.items
+    : [];
+  const auditEvents = auditEventsResult.ok ? auditEventsResult.items : [];
   const requestEventLists = await Promise.all(
     jobs.map(async (job) => ({
       requestId: job.id,
       events: await getServiceRequestEvents(token, job.id),
     })),
   );
-  const eventsByRequest = new Map(
+  const eventsResultByRequest = new Map(
     requestEventLists.map(({ requestId, events }) => [requestId, events]),
   );
-  const pendingCount = jobs.filter((job) => job.status === 'بانتظار التوزيع').length;
-  const openSupportCount = supportTickets.filter(
-    (ticket) => ticket.status !== 'تم الحل',
-  ).length;
+  const pendingCount = jobsResult.ok
+    ? jobs.filter((job) => job.status === 'بانتظار التوزيع').length
+    : null;
+  const openSupportCount = supportTicketsResult.ok
+    ? supportTickets.filter((ticket) => ticket.status !== 'تم الحل').length
+    : null;
   const ratedJobs = jobs.filter((job) => typeof job.rating === 'number');
   const averageRating =
-    ratedJobs.length === 0
+    !jobsResult.ok || ratedJobs.length === 0
       ? '—'
       : (
           ratedJobs.reduce((total, job) => total + (job.rating ?? 0), 0) /
@@ -414,9 +461,9 @@ export default async function Home({ searchParams }: HomeProps) {
       </section>
 
       <section className={styles.metrics} aria-label="مؤشرات التشغيل">
-        {canDispatch && <article><span>الطلبات المستلمة</span><strong>{jobs.length}</strong></article>}
-        {canDispatch && <article><span>بانتظار التوزيع</span><strong>{pendingCount}</strong></article>}
-        {canSupport && <article><span>طلبات الدعم المفتوحة</span><strong>{openSupportCount}</strong></article>}
+        {canDispatch && <article><span>الطلبات المستلمة</span><strong>{jobsResult.ok ? jobs.length : '—'}</strong></article>}
+        {canDispatch && <article><span>بانتظار التوزيع</span><strong>{pendingCount === null ? '—' : pendingCount}</strong></article>}
+        {canSupport && <article><span>طلبات الدعم المفتوحة</span><strong>{openSupportCount === null ? '—' : openSupportCount}</strong></article>}
         {canDispatch && <article><span>متوسط التقييم</span><strong>{averageRating}</strong></article>}
       </section>
 
@@ -440,9 +487,16 @@ export default async function Home({ searchParams }: HomeProps) {
               <label><input type="checkbox" name="specialties" value="plumbing" /> سباكة وتسربات</label>
               <button type="submit">إضافة للمراجعة</button>
             </form>
-            {providers.length === 0 ? (
+            {!providersResult.ok && (
+              <div className={styles.loadError} role="alert">
+                تعذر تحميل قائمة مقدمي الخدمة؛ لا تظهر البيانات حاليًا. أعد المحاولة
+                بعد قليل.
+              </div>
+            )}
+            {providersResult.ok && providers.length === 0 ? (
               <div className={styles.empty}>أضف مقدم خدمة بعد إكمال التحقق خارج النظام؛ لا تحفظ وثائقه أو بياناته الشخصية هنا.</div>
-            ) : providers.map((provider) => (
+            ) : providersResult.ok ? (
+              providers.map((provider) => (
               <article className={styles.job} key={provider.id}>
                 <div><span className={styles.jobId}>{provider.id}</span><strong>{provider.name}</strong></div>
                 <span>{provider.serviceZone}</span>
@@ -485,7 +539,8 @@ export default async function Home({ searchParams }: HomeProps) {
                   </form>
                 )}
               </article>
-            ))}
+              ))
+            ) : null}
           </div>
         </section>
       )}
@@ -500,10 +555,30 @@ export default async function Home({ searchParams }: HomeProps) {
             <span className={styles.liveIndicator}>بيانات مباشرة من النظام</span>
           </div>
           <div className={styles.table}>
-            {jobs.length === 0 ? (
+            {!jobsResult.ok && (
+              <div className={styles.loadError} role="alert">
+                تعذر تحميل الطلبات؛ لا تظهر البيانات حاليًا. أعد المحاولة بعد
+                قليل.
+              </div>
+            )}
+            {jobsResult.ok && jobs.length === 0 ? (
               <div className={styles.empty}>لا توجد طلبات مستلمة بعد.</div>
-            ) : (
-              jobs.map((job) => (
+            ) : jobsResult.ok ? (
+              jobs.map((job) => {
+                const marketplaceParts = marketplaceSummaryParts(
+                  job.opportunities,
+                );
+                const openMarketplaceActivity =
+                  (job.opportunities?.invited ?? 0) +
+                    (job.opportunities?.quoted ?? 0) >
+                  0;
+                const eligibleProviders = providers.filter(
+                  (provider) =>
+                    provider.verificationStatus === 'verified' &&
+                    provider.available &&
+                    provider.specialties.includes(job.serviceId),
+                );
+                return (
                 <article className={styles.job} key={job.id}>
                   <div><span className={styles.jobId}>{job.id}</span><strong>{job.service}</strong></div>
                   <span>{job.area}</span>
@@ -514,14 +589,30 @@ export default async function Home({ searchParams }: HomeProps) {
                   )}
                   {job.quote && (
                     <div className={styles.quote}>
-                      <strong>عرض السعر: {(job.quote.amountHalalas / 100).toFixed(2)} ر.س</strong>
+                      <strong>
+                        {job.quote.providerName
+                          ? `عرض مقدم الخدمة (${job.quote.providerName}): ${(job.quote.amountHalalas / 100).toFixed(2)} ر.س`
+                          : `عرض السعر: ${(job.quote.amountHalalas / 100).toFixed(2)} ر.س`}
+                      </strong>
                       <span>{job.quote.scope}</span>
-                      <span className={job.quote.status === 'approved' ? styles.quoteApproved : job.quote.status === 'rejected' ? styles.quoteRejected : styles.quotePending}>
+                      <span className={job.quote.status === 'approved' ? styles.quoteApproved : job.quote.status === 'rejected' ? styles.quoteRejected : job.quote.status === 'withdrawn' ? styles.quoteWithdrawn : styles.quotePending}>
                         {job.quote.status === 'approved'
                           ? 'وافق العميل على العرض'
                           : job.quote.status === 'rejected'
                             ? 'رفض العميل العرض'
-                            : 'بانتظار موافقة العميل'}
+                            : job.quote.status === 'withdrawn'
+                              ? 'سحب مقدم الخدمة العرض'
+                              : 'بانتظار موافقة العميل'}
+                      </span>
+                    </div>
+                  )}
+                  {job.opportunities && (
+                    <div className={styles.marketplace}>
+                      <strong>مسار السوق</strong>
+                      <span>
+                        {marketplaceParts.length > 0
+                          ? marketplaceParts.join(' · ')
+                          : 'لا توجد فرص نشطة'}
                       </span>
                     </div>
                   )}
@@ -567,6 +658,11 @@ export default async function Home({ searchParams }: HomeProps) {
                   )}
                   {['تم التعيين', 'الفني في الطريق'].includes(job.status) &&
                     (!job.quote || job.quote.status === 'rejected') && (
+                    job.opportunities ? (
+                      <p className={styles.marketplaceNote}>
+                        هذا الطلب في مسار عروض السوق؛ لا يمكن إرسال عرض سعر يدوي.
+                      </p>
+                    ) : (
                     <form action={proposeQuote} className={styles.quoteForm}>
                       <input name="requestId" type="hidden" value={job.id} />
                       <input
@@ -590,42 +686,62 @@ export default async function Home({ searchParams }: HomeProps) {
                         {job.quote?.status === 'rejected' ? 'إرسال عرض بديل' : 'إرسال عرض السعر'}
                       </button>
                     </form>
+                    )
                   )}
-                  {(eventsByRequest.get(job.id)?.length ?? 0) > 0 && (
-                    <details className={styles.history}>
-                      <summary>سجل مراحل الطلب</summary>
-                      <ol>
-                        {(eventsByRequest.get(job.id) ?? []).map((event) => (
-                          <li key={`${event.type}-${event.createdAt}`}>
-                            <span>{requestEventLabel(event)}</span>
-                            <time dateTime={event.createdAt}>
-                              {new Intl.DateTimeFormat('ar-SA', {
-                                dateStyle: 'short',
-                                timeStyle: 'short',
-                              }).format(new Date(event.createdAt))}
-                            </time>
-                          </li>
-                        ))}
-                      </ol>
-                    </details>
-                  )}
+                  {(() => {
+                    const eventsResult =
+                      eventsResultByRequest.get(job.id) ??
+                      ({ ok: false, items: [] } as const);
+                    if (!eventsResult.ok) {
+                      return (
+                        <p className={styles.marketplaceNote}>
+                          تعذر تحميل سجل مراحل الطلب.
+                        </p>
+                      );
+                    }
+                    return eventsResult.items.length > 0 ? (
+                      <details className={styles.history}>
+                        <summary>سجل مراحل الطلب</summary>
+                        <ol>
+                          {eventsResult.items.map((event) => (
+                            <li key={`${event.type}-${event.createdAt}`}>
+                              <span>{requestEventLabel(event)}</span>
+                              <time dateTime={event.createdAt}>
+                                {new Intl.DateTimeFormat('ar-SA', {
+                                  dateStyle: 'short',
+                                  timeStyle: 'short',
+                                }).format(new Date(event.createdAt))}
+                              </time>
+                            </li>
+                          ))}
+                        </ol>
+                      </details>
+                    ) : null;
+                  })()}
                   {job.status === 'بانتظار التوزيع' && (
-                    <form action={assignProvider} className={styles.assignment}>
-                      <input name="requestId" type="hidden" value={job.id} />
-                      <select aria-label={`تعيين فني للطلب ${job.id}`} name="providerId" required>
-                        <option value="">اختر فنيًا</option>
-                        {providers
-                          .filter(
-                            (provider) =>
-                              provider.available &&
-                              provider.specialties.includes(job.serviceId),
-                          )
-                          .map((provider) => (
-                          <option key={provider.id} value={provider.id}>{provider.name}</option>
-                        ))}
-                      </select>
-                      <button type="submit">تعيين فني</button>
-                    </form>
+                    <div className={styles.assignmentBlock}>
+                      {openMarketplaceActivity && (
+                        <p className={styles.marketplaceNote}>
+                          التعيين اليدوي يغلق عروض السوق الجارية تلقائيًا.
+                        </p>
+                      )}
+                      {eligibleProviders.length === 0 ? (
+                        <p className={styles.marketplaceNote}>
+                          لا يوجد فني معتمد ومتاح حاليًا لهذه الخدمة.
+                        </p>
+                      ) : (
+                        <form action={assignProvider} className={styles.assignment}>
+                          <input name="requestId" type="hidden" value={job.id} />
+                          <select aria-label={`تعيين فني للطلب ${job.id}`} name="providerId" required>
+                            <option value="">اختر فنيًا</option>
+                            {eligibleProviders.map((provider) => (
+                              <option key={provider.id} value={provider.id}>{provider.name}</option>
+                            ))}
+                          </select>
+                          <button type="submit">تعيين فني</button>
+                        </form>
+                      )}
+                    </div>
                   )}
                   {(job.status === 'تم التعيين' ||
                     (job.status === 'الفني في الطريق' &&
@@ -639,8 +755,9 @@ export default async function Home({ searchParams }: HomeProps) {
                     </form>
                   )}
                 </article>
-              ))
-            )}
+                );
+              })
+            ) : null}
           </div>
         </section>
       )}
@@ -652,12 +769,19 @@ export default async function Home({ searchParams }: HomeProps) {
               <p className={styles.eyebrow}>دعم العملاء</p>
               <h2>طلبات المساعدة والشكاوى</h2>
             </div>
-            <span className={styles.liveIndicator}>{openSupportCount} تحتاج متابعة</span>
+            <span className={styles.liveIndicator}>{openSupportCount === null ? '—' : openSupportCount} تحتاج متابعة</span>
           </div>
           <div className={styles.table}>
-            {supportTickets.length === 0 ? (
+            {!supportTicketsResult.ok && (
+              <div className={styles.loadError} role="alert">
+                تعذر تحميل طلبات الدعم؛ لا تظهر البيانات حاليًا. أعد المحاولة بعد
+                قليل.
+              </div>
+            )}
+            {supportTicketsResult.ok && supportTickets.length === 0 ? (
               <div className={styles.empty}>لا توجد طلبات دعم حالياً.</div>
-            ) : supportTickets.map((ticket) => (
+            ) : supportTicketsResult.ok ? (
+              supportTickets.map((ticket) => (
               <article className={styles.job} key={ticket.id}>
                 <div><span className={styles.jobId}>{ticket.id}</span><strong>{ticket.category}</strong></div>
                 <span>الطلب: {ticket.requestId}</span>
@@ -671,7 +795,8 @@ export default async function Home({ searchParams }: HomeProps) {
                   </form>
                 )}
               </article>
-            ))}
+              ))
+            ) : null}
           </div>
         </section>
       )}
@@ -686,16 +811,24 @@ export default async function Home({ searchParams }: HomeProps) {
             <span className={styles.liveIndicator}>للمدير فقط</span>
           </div>
           <div className={styles.table}>
-            {auditEvents.length === 0 ? (
+            {!auditEventsResult.ok && (
+              <div className={styles.loadError} role="alert">
+                تعذر تحميل أحداث التدقيق؛ لا تظهر البيانات حاليًا. أعد المحاولة
+                بعد قليل.
+              </div>
+            )}
+            {auditEventsResult.ok && auditEvents.length === 0 ? (
               <div className={styles.empty}>لا توجد أحداث تدقيق بعد.</div>
-            ) : auditEvents.map((event) => (
+            ) : auditEventsResult.ok ? (
+              auditEvents.map((event) => (
               <article className={styles.job} key={event.id}>
                 <div><span className={styles.jobId}>{event.subjectId}</span><strong>{event.action}</strong></div>
                 <span>{event.actorName}</span>
                 <span>{event.oldStatus ?? '—'} ← {event.newStatus ?? '—'}</span>
                 <span>{new Intl.DateTimeFormat('ar-SA', { dateStyle: 'short', timeStyle: 'short' }).format(new Date(event.createdAt))}</span>
               </article>
-            ))}
+              ))
+            ) : null}
           </div>
         </section>
       )}
