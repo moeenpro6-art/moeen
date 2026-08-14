@@ -15,7 +15,6 @@ import {
   quoteIdent,
 } from '../test/setup/ownership';
 
-
 describe('ServiceRequestRepository', () => {
   it('requires a dedicated test database connection when running tests', () => {
     expect(
@@ -645,7 +644,198 @@ describe('ServiceRequestRepository', () => {
 
     await expect(
       repository.assignProvider(request.id, 'provider-1'),
-    ).rejects.toThrow('Request or available provider not found');
+    ).rejects.toThrow(
+      'Request is not pending dispatch; manual assignment is not allowed',
+    );
+  });
+
+  it('manual assignment with no marketplace activity still succeeds', async () => {
+    // Unique service id: no seeded or previously created provider can match,
+    // so the request has no auto-created opportunities or quotes at all.
+    const uniqueServiceId = `manual-clean-${randomUUID()}`;
+    const { request, customerId } = await createPendingRequest(uniqueServiceId);
+    const manual = await createVerifiedProvider([uniqueServiceId]);
+
+    const assigned = await repository.assignProvider(request.id, manual.id);
+
+    expect(assigned.status).toBe('assigned');
+    expect(assigned.assignedProvider?.id).toBe(manual.id);
+
+    const customerView = await repository.findByCustomerId(customerId);
+    const requestView = customerView.find((item) => item.id === request.id);
+    expect(requestView?.status).toBe('assigned');
+    expect(requestView?.assignedProvider?.id).toBe(manual.id);
+    expect(requestView?.payment).toBeUndefined();
+
+    const events = await readEventTypes(request.id);
+    expect(events).toEqual(['request_created', 'provider_assigned']);
+  });
+
+  it('manual assignment while marketplace quotes and opportunities are active reconciles them atomically', async () => {
+    const uniqueServiceId = `manual-reconcile-${randomUUID()}`;
+    const { request, customerId } = await createPendingRequest(uniqueServiceId);
+    const manual = await createVerifiedProvider([uniqueServiceId]);
+    const providerA = await createVerifiedProvider([uniqueServiceId]);
+    const providerB = await createVerifiedProvider([uniqueServiceId]);
+    await repository.inviteProvidersToRequest(request.id, [
+      providerA.id,
+      providerB.id,
+    ]);
+    const quoteA = await repository.submitProviderQuote(
+      request.id,
+      providerA.id,
+      15_000,
+      'عرض أ',
+    );
+    const quoteB = await repository.submitProviderQuote(
+      request.id,
+      providerB.id,
+      12_000,
+      'عرض ب',
+    );
+
+    const assigned = await repository.assignProvider(request.id, manual.id);
+
+    expect(assigned.status).toBe('assigned');
+    expect(assigned.assignedProvider?.id).toBe(manual.id);
+
+    const customerView = await repository.findByCustomerId(customerId);
+    const requestView = customerView.find((item) => item.id === request.id);
+    expect(requestView?.status).toBe('assigned');
+    expect(requestView?.assignedProvider?.id).toBe(manual.id);
+    expect(requestView?.payment).toBeUndefined();
+    expect(requestView?.quotes?.[0]?.status).toBe('rejected');
+
+    const viewA = await repository.listProviderOpportunities(providerA.id);
+    expect(viewA[0].opportunityStatus).toBe('closed');
+    expect(viewA[0].myQuote?.id).toBe(quoteA.id);
+    expect(viewA[0].myQuote?.status).toBe('rejected');
+    const viewB = await repository.listProviderOpportunities(providerB.id);
+    expect(viewB[0].opportunityStatus).toBe('closed');
+    expect(viewB[0].myQuote?.id).toBe(quoteB.id);
+    expect(viewB[0].myQuote?.status).toBe('rejected');
+
+    const events = await readEventTypes(request.id);
+    expect(events.filter((event) => event === 'quote_rejected')).toHaveLength(
+      2,
+    );
+    expect(
+      events.filter((event) => event === 'opportunity_closed'),
+    ).toHaveLength(2);
+    expect(events).toContain('provider_assigned');
+  });
+
+  it('quote approval after a completed manual assignment cannot replace the provider', async () => {
+    const uniqueServiceId = `manual-then-approve-${randomUUID()}`;
+    const { request, customerId } = await createPendingRequest(uniqueServiceId);
+    const manual = await createVerifiedProvider([uniqueServiceId]);
+    const quoted = await createVerifiedProvider([uniqueServiceId]);
+    await repository.inviteProvidersToRequest(request.id, [quoted.id]);
+    const quote = await repository.submitProviderQuote(
+      request.id,
+      quoted.id,
+      15_000,
+      'عرض',
+    );
+
+    await repository.assignProvider(request.id, manual.id);
+
+    await expect(
+      repository.decideQuote(request.id, customerId, quote.id, 'approved'),
+    ).rejects.toThrow(
+      'The request is no longer pending dispatch; the selected provider quote cannot be approved',
+    );
+
+    const customerView = await repository.findByCustomerId(customerId);
+    const requestView = customerView.find((item) => item.id === request.id);
+    expect(requestView?.status).toBe('assigned');
+    expect(requestView?.assignedProvider?.id).toBe(manual.id);
+    expect(requestView?.payment).toBeUndefined();
+
+    const quotedView = await repository.listProviderOpportunities(quoted.id);
+    expect(quotedView[0].opportunityStatus).toBe('closed');
+    expect(quotedView[0].myQuote?.status).toBe('rejected');
+
+    const events = await readEventTypes(request.id);
+    expect(events).not.toContain('quote_approved');
+    // Only the setup invite is recorded; the manual assignment adds no new
+    // invitation, just the closing events.
+    expect(
+      events.filter((event) => event === 'opportunity_invited'),
+    ).toHaveLength(1);
+    expect(
+      events.filter((event) => event === 'provider_assigned'),
+    ).toHaveLength(1);
+  });
+
+  it('concurrent manual assignment and customer quote approval yield exactly one coherent outcome', async () => {
+    const uniqueServiceId = `manual-race-${randomUUID()}`;
+    const { request, customerId } = await createPendingRequest(uniqueServiceId);
+    const manual = await createVerifiedProvider([uniqueServiceId]);
+    const quoted = await createVerifiedProvider([uniqueServiceId]);
+    await repository.inviteProvidersToRequest(request.id, [quoted.id]);
+    const quote = await repository.submitProviderQuote(
+      request.id,
+      quoted.id,
+      15_000,
+      'عرض',
+    );
+
+    const results = await Promise.allSettled([
+      repository.assignProvider(request.id, manual.id),
+      repository.decideQuote(request.id, customerId, quote.id, 'approved'),
+    ]);
+    expect(
+      results.filter((result) => result.status === 'fulfilled'),
+    ).toHaveLength(1);
+    expect(
+      results.filter((result) => result.status === 'rejected'),
+    ).toHaveLength(1);
+
+    const manualAssignmentWon = results[0].status === 'fulfilled';
+
+    const customerView = await repository.findByCustomerId(customerId);
+    const requestView = customerView.find((item) => item.id === request.id);
+    expect(requestView?.status).toBe('assigned');
+
+    if (manualAssignmentWon) {
+      expect(requestView?.assignedProvider?.id).toBe(manual.id);
+      expect(requestView?.payment).toBeUndefined();
+      expect(
+        results[1].status === 'rejected' &&
+          (results[1].reason as Error).message,
+      ).toBe(
+        'The request is no longer pending dispatch; the selected provider quote cannot be approved',
+      );
+    } else {
+      expect(requestView?.assignedProvider?.id).toBe(quoted.id);
+      expect(requestView?.payment).toMatchObject({
+        method: 'cash_on_completion',
+        status: 'cash_due',
+        amountHalalas: 15_000,
+      });
+      expect(
+        results[0].status === 'rejected' &&
+          (results[0].reason as Error).message,
+      ).toBe(
+        'Request is not pending dispatch; manual assignment is not allowed',
+      );
+    }
+
+    // Whichever operation won, the marketplace state is coherent: the
+    // opportunity is closed and the quote matches the winner.
+    const quotedView = await repository.listProviderOpportunities(quoted.id);
+    expect(quotedView[0].opportunityStatus).toBe('closed');
+    if (manualAssignmentWon) {
+      expect(quotedView[0].myQuote?.status).toBe('rejected');
+    } else {
+      expect(quotedView[0].myQuote?.status).toBe('approved');
+    }
+
+    const events = await readEventTypes(request.id);
+    expect(
+      events.filter((event) => event === 'provider_assigned'),
+    ).toHaveLength(1);
   });
 
   it('prevents a dispatcher from completing an assigned job before service starts', async () => {
