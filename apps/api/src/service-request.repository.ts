@@ -1121,15 +1121,33 @@ export class ServiceRequestRepository
     requestId: string,
     providerId: string,
   ): Promise<ServiceRequest> {
-    const databaseId = Number(requestId.replace('MOE-', '')) - 1000;
+    const databaseId = this.toRequestDatabaseId(requestId);
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
+      // Serialize on the same request row used by marketplace quote approval
+      // (decideQuote locks the request row first) and every other
+      // request-scoped transition. The eligibility check is revalidated on
+      // the locked row, so a concurrent quote approval that commits first
+      // makes this assignment fail instead of overwriting the winner.
+      const request = await client.query<{ status: ServiceRequest['status'] }>(
+        'SELECT status FROM service_requests WHERE id = $1 FOR UPDATE',
+        [databaseId],
+      );
+      const currentStatus = request.rows[0]?.status;
+      if (!currentStatus) {
+        throw new Error('Request not found');
+      }
+      if (currentStatus !== 'pending_dispatch') {
+        throw new Error(
+          'Request is not pending dispatch; manual assignment is not allowed',
+        );
+      }
       const result = await client.query<ServiceRequestRow>(
         `UPDATE service_requests r
          SET assigned_provider_id = p.id, status = 'assigned'
          FROM providers p
-         WHERE r.id = $1 AND r.status = 'pending_dispatch' AND p.id = $2 AND p.available = TRUE
+         WHERE r.id = $1 AND p.id = $2 AND p.available = TRUE
            AND p.verification_status = 'verified'
            AND r.service_id = ANY(p.specialties)
          RETURNING r.id, r.service_id, r.address, r.details, r.timing, r.status, r.created_at,
@@ -1140,6 +1158,39 @@ export class ServiceRequestRepository
       );
       const row = result.rows[0];
       if (!row) throw new Error('Request or available provider not found');
+      // Reconcile any active marketplace state atomically so the manually
+      // selected provider is the single authoritative provider: every active
+      // provider quote is rejected and every open opportunity is closed,
+      // mirroring the closing behavior of a quote approval.
+      const closedQuotes = await client.query<{ id: string }>(
+        `UPDATE service_quotes
+         SET status = 'rejected', decided_at = NOW()
+         WHERE service_request_id = $1 AND provider_id IS NOT NULL
+           AND status = 'proposed'
+         RETURNING id`,
+        [databaseId],
+      );
+      for (let index = 0; index < closedQuotes.rows.length; index += 1) {
+        await client.query(
+          `INSERT INTO service_request_events (service_request_id, type, status)
+           VALUES ($1, 'quote_rejected', 'assigned')`,
+          [databaseId],
+        );
+      }
+      const closedOpportunities = await client.query<{ id: string }>(
+        `UPDATE request_provider_opportunities
+         SET status = 'closed'
+         WHERE service_request_id = $1 AND status IN ('invited', 'quoted')
+         RETURNING id`,
+        [databaseId],
+      );
+      for (let index = 0; index < closedOpportunities.rows.length; index += 1) {
+        await client.query(
+          `INSERT INTO service_request_events (service_request_id, type, status)
+           VALUES ($1, 'opportunity_closed', 'assigned')`,
+          [databaseId],
+        );
+      }
       await client.query(
         `INSERT INTO service_request_events (service_request_id, type, status)
          VALUES ($1, 'provider_assigned', 'assigned')`,
@@ -1354,6 +1405,17 @@ export class ServiceRequestRepository
     try {
       await client.query('BEGIN');
       const quoteDatabaseId = this.toQuoteDatabaseId(quoteId);
+      // Lock the request row FIRST so a quote decision serializes on the same
+      // request row as manual assignment (assignProvider) and every other
+      // request-scoped transition, with a consistent request -> quote lock
+      // order that cannot deadlock against the manual-assignment
+      // reconciliation (which locks the request row and then the quotes).
+      // A nonexistent request still falls through to the joined quote query
+      // below and yields the same 'Pending customer quote not found' error.
+      await client.query(
+        'SELECT status FROM service_requests WHERE id = $1 FOR UPDATE',
+        [databaseId],
+      );
       const quote = await client.query<
         ServiceQuoteRow & { request_status: ServiceRequest['status'] }
       >(
@@ -1362,10 +1424,27 @@ export class ServiceRequestRepository
          FROM service_quotes q
          JOIN service_requests r ON r.id = q.service_request_id
          WHERE q.id = $1 AND q.service_request_id = $2 AND r.customer_id = $3
-         FOR UPDATE OF q, r`,
+         FOR UPDATE OF q`,
         [quoteDatabaseId, databaseId, this.toCustomerDatabaseId(customerId)],
       );
       const currentQuote = quote.rows[0];
+      // A marketplace quote may only assign the provider while the request is
+      // still pending dispatch. Once a manual assignment (or an earlier quote
+      // approval) has moved the request to 'assigned', a later approval must
+      // not replace the authoritative provider. Checked before the status
+      // check so a quote reconciled to 'rejected' by a manual assignment still
+      // fails with the accurate domain message instead of the misleading
+      // 'Pending customer quote not found'.
+      if (
+        currentQuote &&
+        decision === 'approved' &&
+        currentQuote.provider_id &&
+        currentQuote.request_status !== 'pending_dispatch'
+      ) {
+        throw new Error(
+          'The request is no longer pending dispatch; the selected provider quote cannot be approved',
+        );
+      }
       if (!currentQuote || currentQuote.status !== 'proposed') {
         throw new Error('Pending customer quote not found');
       }
