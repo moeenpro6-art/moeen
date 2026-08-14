@@ -1,4 +1,3 @@
-import { HttpException } from '@nestjs/common';
 import {
   LoginAttemptLimiter,
   type LoginAttemptStore,
@@ -15,7 +14,7 @@ describe('LoginAttemptLimiter', () => {
 
     await expect(
       limiter.assertAllowed('staff_login', 'operator@example.com'),
-    ).rejects.toMatchObject<HttpException>({ status: 429 });
+    ).rejects.toMatchObject({ status: 429 });
   });
 
   it('hashes the subject before recording and clearing failures', async () => {

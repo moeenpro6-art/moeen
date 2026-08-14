@@ -1,4 +1,8 @@
-import { AppService, type ServiceRequest } from './app.service';
+import {
+  AppService,
+  type ServiceRequest,
+  type ServiceRequestStore,
+} from './app.service';
 
 const persistedRequest: ServiceRequest = {
   id: 'MOE-1042',
@@ -15,7 +19,7 @@ describe('AppService', () => {
     const service = new AppService({
       create: jest.fn(),
       findAll: jest.fn(),
-    });
+    } as unknown as ServiceRequestStore);
 
     expect(service.getLaunchServices()).toEqual([
       { id: 'ac-cleaning', nameAr: 'تنظيف المكيفات' },
@@ -166,7 +170,7 @@ describe('AppService', () => {
       create: jest.fn().mockResolvedValue(persistedRequest),
       findCustomerBySession: jest.fn().mockResolvedValue(customer),
     };
-    const service = new AppService(store);
+    const service = new AppService(store as unknown as ServiceRequestStore);
 
     const created = await service.createMyServiceRequest(
       'customer-session-token',
@@ -188,7 +192,7 @@ describe('AppService', () => {
       findCustomerBySession: jest.fn().mockResolvedValue(customer),
       findByCustomerId: jest.fn().mockResolvedValue([persistedRequest]),
     };
-    const service = new AppService(store);
+    const service = new AppService(store as unknown as ServiceRequestStore);
 
     await expect(
       service.getMyServiceRequests('customer-session-token'),
@@ -267,7 +271,7 @@ describe('AppService', () => {
   it('rejects a request list when the customer session token is unknown', async () => {
     const service = new AppService({
       findCustomerBySession: jest.fn().mockResolvedValue(undefined),
-    });
+    } as unknown as ServiceRequestStore);
 
     await expect(service.getMyServiceRequests('invalid-token')).rejects.toThrow(
       'Unauthorized',
@@ -286,7 +290,7 @@ describe('AppService', () => {
       findCustomerBySession: jest.fn().mockResolvedValue(customer),
       rateRequest: jest.fn().mockResolvedValue(rated),
     };
-    const service = new AppService(store);
+    const service = new AppService(store as unknown as ServiceRequestStore);
 
     await expect(
       service.rateMyServiceRequest(
@@ -318,7 +322,7 @@ describe('AppService', () => {
       findCustomerBySession: jest.fn().mockResolvedValue(customer),
       createSupportTicket: jest.fn().mockResolvedValue(ticket),
     };
-    const service = new AppService(store);
+    const service = new AppService(store as unknown as ServiceRequestStore);
 
     await expect(
       service.createMySupportTicket(
