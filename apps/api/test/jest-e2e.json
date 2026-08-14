@@ -4,6 +4,7 @@
   "testEnvironment": "node",
   "testRegex": ".e2e-spec.ts$",
   "testTimeout": 30000,
+  "maxWorkers": 2,
   "setupFiles": [
     "./setup/setup-test-env.ts"
   ],

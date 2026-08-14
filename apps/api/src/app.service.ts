@@ -80,7 +80,11 @@ export type ServiceRequestEventType =
   | 'status_updated'
   | 'quote_proposed'
   | 'quote_approved'
-  | 'quote_rejected';
+  | 'quote_rejected'
+  | 'opportunity_invited'
+  | 'opportunity_closed'
+  | 'provider_quote_submitted'
+  | 'provider_quote_withdrawn';
 
 export type ServiceRequestEvent = {
   type: ServiceRequestEventType;

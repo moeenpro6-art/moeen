@@ -35,6 +35,7 @@ describe('AppController staff audit integration', () => {
       appService as unknown as AppService,
       staffAuthService as unknown as StaffAuthService,
       auditService as unknown as StaffAuditService,
+      {} as CustomerAuthService,
     );
 
     await (
@@ -92,6 +93,7 @@ describe('AppController staff audit integration', () => {
       appService as unknown as AppService,
       staffAuthService as unknown as StaffAuthService,
       auditService as unknown as StaffAuditService,
+      {} as CustomerAuthService,
     );
 
     await (
@@ -139,6 +141,7 @@ describe('AppController staff audit integration', () => {
       appService as unknown as AppService,
       staffAuthService as unknown as StaffAuthService,
       auditService as unknown as StaffAuditService,
+      {} as CustomerAuthService,
     );
 
     await (
@@ -186,6 +189,7 @@ describe('AppController staff audit integration', () => {
       appService as unknown as AppService,
       staffAuthService as unknown as StaffAuthService,
       auditService as unknown as StaffAuditService,
+      {} as CustomerAuthService,
     );
 
     await (
@@ -225,6 +229,7 @@ describe('AppController staff audit integration', () => {
       appService as unknown as AppService,
       staffAuthService as unknown as StaffAuthService,
       auditService as unknown as StaffAuditService,
+      {} as CustomerAuthService,
     );
 
     await controller.updateSupportTicketStatus(
@@ -263,6 +268,7 @@ describe('AppController staff audit integration', () => {
       appService as unknown as AppService,
       staffAuthService as unknown as StaffAuthService,
       auditService as unknown as StaffAuditService,
+      {} as CustomerAuthService,
     );
 
     await controller.assignProvider('Bearer staff-session', 'MOE-1048', {
@@ -412,6 +418,7 @@ describe('AppController staff audit integration', () => {
       appService as unknown as AppService,
       staffAuthService as unknown as StaffAuthService,
       auditService as unknown as StaffAuditService,
+      {} as CustomerAuthService,
     );
 
     await controller.updateStatus('Bearer staff-session', 'MOE-1048', {

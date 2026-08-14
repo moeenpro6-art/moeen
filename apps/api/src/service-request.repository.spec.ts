@@ -9,6 +9,11 @@ import {
 import { ServiceRequestRepository } from './service-request.repository';
 import { StaffAuthRepository } from './staff-auth.repository';
 import { generateOwnerToken, ownerTokenHash } from './test-db.guard';
+import {
+  createOwnedSchema,
+  dropOwnedSchemaAtomically,
+  quoteIdent,
+} from '../test/setup/ownership';
 const indexedProviderAccessCodeFixtures = [
   {
     providerId: 'PILOT-perf-0',
@@ -3059,51 +3064,11 @@ describe('ServiceRequestRepository', () => {
       },
     ];
 
-    // Q0-SEC ownership lifecycle: CREATE SCHEMA without IF NOT EXISTS, a
+    // Q0-SEC ownership lifecycle is UNIFIED on the shared helpers from
+    // test/setup/ownership.ts: CREATE SCHEMA without IF NOT EXISTS, a
     // verifiable marker inside the schema, and no DROP before the marker is
-    // proven to match this invocation's owner token.
-    async function createOwnedSchema(
-      pool: Pool,
-      schema: string,
-      tokenHash: string,
-    ): Promise<void> {
-      await pool.query(`CREATE SCHEMA "${schema}"`);
-      await pool.query(
-        `CREATE TABLE "${schema}".q0sec_run_ownership (
-           run_id TEXT NOT NULL,
-           owner_token_hash TEXT NOT NULL,
-           created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-         )`,
-      );
-      await pool.query(
-        `INSERT INTO "${schema}".q0sec_run_ownership (run_id, owner_token_hash)
-         VALUES ($1, $2)`,
-        [runId, tokenHash],
-      );
-    }
-
-    async function dropOwnedSchema(
-      pool: Pool,
-      schema: string,
-      tokenHash: string,
-    ): Promise<void> {
-      const marker = await pool.query<{
-        run_id: string;
-        owner_token_hash: string;
-      }>(
-        `SELECT run_id, owner_token_hash FROM "${schema}".q0sec_run_ownership`,
-      );
-      if (
-        marker.rows.length !== 1 ||
-        marker.rows[0].run_id !== runId ||
-        marker.rows[0].owner_token_hash !== tokenHash
-      ) {
-        throw new Error(
-          `Q0-SEC ownership: refusing to drop schema '${schema}' — marker missing or mismatch.`,
-        );
-      }
-      await pool.query(`DROP SCHEMA "${schema}" CASCADE`);
-    }
+    // proven to match this invocation's run id + owner token (atomically,
+    // inside one transaction per schema).
 
     // A repository instance bound to an explicit schema via its own
     // connection string. The repositories read TEST_DATABASE_URL at
@@ -3144,7 +3109,10 @@ describe('ServiceRequestRepository', () => {
       const res = await pool.query<{ def: string }>(
         `SELECT pg_get_constraintdef(c.oid) AS def
          FROM pg_constraint c
-         WHERE c.conrelid = to_regclass(format('%I.%I', $1::text, $2::text))
+         JOIN pg_class rel ON rel.oid = c.conrelid
+         JOIN pg_namespace n ON n.oid = rel.relnamespace
+         WHERE n.nspname = $1::text
+           AND rel.relname = $2::text
            AND c.conname = $3::text`,
         [schema, table, constraint],
       );
@@ -3172,8 +3140,8 @@ describe('ServiceRequestRepository', () => {
         const siblingRepo = repositoryFor(ServiceRequestRepository, sibling);
         const siblingStaff = repositoryFor(StaffAuthRepository, sibling);
         try {
-          await createOwnedSchema(adminPool, subject, tokenHash);
-          await createOwnedSchema(adminPool, sibling, tokenHash);
+          await createOwnedSchema(adminPool, subject, runId, tokenHash);
+          await createOwnedSchema(adminPool, sibling, runId, tokenHash);
 
           // Full independent baseline in BOTH schemas.
           await subjectRepo.initialize();
@@ -3270,11 +3238,14 @@ describe('ServiceRequestRepository', () => {
             ).toBe(othersBefore.get(other.constraint));
           }
         } finally {
-          // Ownership-verified cleanup — always, even on failure.
+          // Ownership-verified cleanup — always, even on failure (atomic
+          // per-schema transaction with marker proof).
+          const client = await adminPool.connect();
           try {
-            await dropOwnedSchema(adminPool, subject, tokenHash);
-            await dropOwnedSchema(adminPool, sibling, tokenHash);
+            await dropOwnedSchemaAtomically(client, subject, runId, tokenHash);
+            await dropOwnedSchemaAtomically(client, sibling, runId, tokenHash);
           } finally {
+            client.release();
             await adminPool.end();
             await subjectRepo.close();
             await subjectStaff.close();
@@ -3285,8 +3256,10 @@ describe('ServiceRequestRepository', () => {
       });
     }
 
-    it('survives concurrent catalog create/drop cycles in unique schemas (stress)', async () => {
+    it('survives concurrent catalog create/drop cycles in unique owned schemas (stress)', async () => {
       const cycles = 6;
+      const ownerToken = generateOwnerToken();
+      const tokenHash = ownerTokenHash(ownerToken);
       const names = Array.from(
         { length: cycles },
         (_, i) => `moeen_test_${runId}_s${i}_${randomBytes(3).toString('hex')}`,
@@ -3294,21 +3267,28 @@ describe('ServiceRequestRepository', () => {
       await withPool(async (pool) => {
         await Promise.all(
           names.map(async (name) => {
-            await pool.query(`CREATE SCHEMA "${name}"`);
+            // Same unified ownership lifecycle as every other temporary
+            // schema: plain CREATE, marker inside, atomic verified DROP.
+            await createOwnedSchema(pool, name, runId, tokenHash);
             await pool.query(
-              `CREATE TABLE "${name}".t (
+              `CREATE TABLE ${quoteIdent(name)}.t (
                  id INT PRIMARY KEY,
                  status TEXT NOT NULL
                    CHECK (status IN ('a', 'b', 'c'))
                )`,
             );
             await pool.query(
-              `ALTER TABLE "${name}".t
+              `ALTER TABLE ${quoteIdent(name)}.t
                  DROP CONSTRAINT IF EXISTS t_status_check,
                  ADD CONSTRAINT t_status_check
                    CHECK (status IN ('a', 'b', 'c', 'd'))`,
             );
-            await pool.query(`DROP SCHEMA "${name}" CASCADE`);
+            const client = await pool.connect();
+            try {
+              await dropOwnedSchemaAtomically(client, name, runId, tokenHash);
+            } finally {
+              client.release();
+            }
           }),
         );
         const leftover = await pool.query<{ n: number }>(
@@ -3319,5 +3299,308 @@ describe('ServiceRequestRepository', () => {
         expect(leftover.rows[0].n).toBe(0);
       });
     });
+
+    it('concurrent same-schema initialization is deterministic (serialized inspect/alter)', async () => {
+      // ONE owned schema, several independent repository instances racing to
+      // initialize it at the same time. Each initializer runs the same
+      // CREATE TABLE IF NOT EXISTS / DO-block sequence; the ACCESS EXCLUSIVE
+      // table lock taken before every inspect/alter protocol serializes the
+      // participants, so the run must complete without errors and leave the
+      // full canonical CHECK definitions in place — never a stale-OID
+      // deparse failure, never a partial or corrupted constraint.
+      const schema = `moeen_test_${runId}_c${randomBytes(3).toString('hex')}`;
+      const ownerToken = generateOwnerToken();
+      const tokenHash = ownerTokenHash(ownerToken);
+      const participants = 4;
+      const repos = Array.from({ length: participants }, () => ({
+        serviceRequests: repositoryFor(ServiceRequestRepository, schema),
+        staffAuth: repositoryFor(StaffAuthRepository, schema),
+      }));
+      const adminPool = new Pool({
+        connectionString: resolveDatabaseConnectionString(),
+      });
+      try {
+        await createOwnedSchema(adminPool, schema, runId, tokenHash);
+
+        // All participants start at the same time; every initialize() must
+        // converge on the same final catalog state.
+        await Promise.all(
+          repos.map(async (r) => {
+            await r.serviceRequests.initialize();
+            await r.staffAuth.initialize();
+          }),
+        );
+
+        // Every migrated constraint is the full canonical definition.
+        for (const c of CASES) {
+          const def = await constraintDef(
+            adminPool,
+            schema,
+            c.table,
+            c.constraint,
+          );
+          expect(def).not.toBeNull();
+          for (const value of c.required) {
+            expect(def).toContain(value);
+          }
+        }
+      } finally {
+        // Ownership-verified cleanup — always, even on failure.
+        const client = await adminPool.connect();
+        try {
+          await dropOwnedSchemaAtomically(client, schema, runId, tokenHash);
+        } finally {
+          client.release();
+          await adminPool.end();
+          for (const r of repos) {
+            await r.serviceRequests.close();
+            await r.staffAuth.close();
+          }
+        }
+      }
+    });
+
+    it('fault injection: a thrown error still cleans up, and an unowned schema is never dropped', async () => {
+      const owned = `moeen_test_${runId}_f${randomBytes(3).toString('hex')}`;
+      const foreign = `moeen_test_${runId}_f${randomBytes(3).toString('hex')}`;
+      const ownerToken = generateOwnerToken();
+      const tokenHash = ownerTokenHash(ownerToken);
+      let fault: unknown = null;
+      await withPool(async (pool) => {
+        await createOwnedSchema(pool, owned, runId, tokenHash);
+        // A schema this invocation does NOT own (no marker).
+        await pool.query(`CREATE SCHEMA ${quoteIdent(foreign)}`);
+        try {
+          try {
+            // Deliberate fault after creation, before the test body completes.
+            throw new Error('deliberate fault injected mid-test');
+          } catch (error) {
+            // The deliberate fault is the POINT of this test: capture it so
+            // the finally below still runs and the test can prove cleanup
+            // happened. Real cleanup errors are never swallowed — they still
+            // propagate.
+            fault = error;
+          } finally {
+            // The finally of the fault removes the OWNED schema — cleanup
+            // works even when a middle step failed — and PROVES the unowned
+            // schema is refused. A real cleanup failure propagates.
+            const client = await pool.connect();
+            try {
+              await dropOwnedSchemaAtomically(client, owned, runId, tokenHash);
+              await expect(
+                dropOwnedSchemaAtomically(client, foreign, runId, tokenHash),
+              ).rejects.toThrow(
+                /ownership marker is missing|marker table is not bound to the expected namespace OID/,
+              );
+            } finally {
+              client.release();
+            }
+          }
+
+          // The fault really happened…
+          expect(fault).toBeInstanceOf(Error);
+          expect((fault as Error).message).toBe(
+            'deliberate fault injected mid-test',
+          );
+          // …and the finally still removed the OWNED schema…
+          const ownedLeft = await pool.query<{ n: number }>(
+            `SELECT count(*)::int AS n FROM information_schema.schemata
+             WHERE schema_name = $1`,
+            [owned],
+          );
+          expect(ownedLeft.rows[0].n).toBe(0);
+          // …while the unowned schema was refused and therefore SURVIVES.
+          const foreignLeft = await pool.query<{ n: number }>(
+            `SELECT count(*)::int AS n FROM information_schema.schemata
+             WHERE schema_name = $1`,
+            [foreign],
+          );
+          expect(foreignLeft.rows[0].n).toBe(1);
+        } finally {
+          // Independent hygiene finally: remove the foreign schema this test
+          // created — exact name only — so even a failed assertion can never
+          // leave it behind. (Provably ours: created moments ago here.)
+          await pool.query(
+            `DROP SCHEMA IF EXISTS ${quoteIdent(foreign)} CASCADE`,
+          );
+        }
+        const leftover = await pool.query<{ n: number }>(
+          `SELECT count(*)::int AS n FROM information_schema.schemata
+           WHERE schema_name = ANY($1)`,
+          [[owned, foreign]],
+        );
+        expect(leftover.rows[0].n).toBe(0);
+      });
+    });
+  });
+});
+
+describe('pooled transaction cleanup invariant (Q0-SEC regression)', () => {
+  // Deterministic, DB-free regression tests for the fail-safe transaction
+  // cleanup: a transaction-scoped pool client must never be released back to
+  // the pg pool as healthy while a transaction may be open or aborted. Query
+  // failures are scripted per call (1-based) on a fake client, so no real
+  // database connection is ever made.
+
+  const scriptedClient = (failAt: Record<number, string>) => {
+    const queries: string[] = [];
+    const order: string[] = [];
+    const client = {
+      query: jest.fn((sql: string) => {
+        const failMessage = failAt[queries.length + 1];
+        queries.push(String(sql));
+        order.push(`query:${sql}`);
+        if (failMessage !== undefined) throw new Error(failMessage);
+        return { rows: [] };
+      }),
+      release: jest.fn((err?: Error) => {
+        order.push(err === undefined ? 'release:clean' : 'release:error');
+      }),
+    };
+    return { client, queries, order };
+  };
+
+  const connectSpyFor = (repo: ServiceRequestRepository, client: unknown) => {
+    const pool = (repo as unknown as { pool: Pool }).pool;
+    return jest.spyOn(pool, 'connect').mockResolvedValue(client as never);
+  };
+
+  const repositories: ServiceRequestRepository[] = [];
+
+  afterEach(async () => {
+    await Promise.all(repositories.splice(0).map((repo) => repo.close()));
+    jest.restoreAllMocks();
+  });
+
+  const freshRepository = () => {
+    const repo = new ServiceRequestRepository();
+    repositories.push(repo);
+    return repo;
+  };
+
+  it('initialize(): advisory-lock acquisition failure after BEGIN rolls back before releasing the client', async () => {
+    const repo = freshRepository();
+    const { client, queries, order } = scriptedClient({
+      2: 'simulated advisory-lock acquisition failure',
+    });
+    connectSpyFor(repo, client);
+
+    await expect(repo.initialize()).rejects.toThrow(
+      'simulated advisory-lock acquisition failure',
+    );
+
+    expect(queries[0]).toBe('BEGIN');
+    expect(queries).toContain('ROLLBACK');
+    expect(order.indexOf('query:ROLLBACK')).toBeLessThan(
+      order.indexOf('release:clean'),
+    );
+    expect(client.release).toHaveBeenCalledTimes(1);
+    expect(client.release).toHaveBeenCalledWith();
+    expect(order).not.toContain('release:error');
+  });
+
+  it('initialize(): rollback failure discards the client via release(error) instead of a healthy release', async () => {
+    const repo = freshRepository();
+    const { client, order } = scriptedClient({
+      2: 'simulated advisory-lock acquisition failure',
+      3: 'simulated rollback failure',
+    });
+    connectSpyFor(repo, client);
+
+    await expect(repo.initialize()).rejects.toThrow(
+      'simulated advisory-lock acquisition failure',
+    );
+
+    expect(order).toContain('query:ROLLBACK');
+    expect(order).toContain('release:error');
+    expect(order).not.toContain('release:clean');
+    expect(client.release).toHaveBeenCalledTimes(1);
+    expect(client.release).toHaveBeenCalledWith(expect.any(Error));
+  });
+
+  it('initialize(): BEGIN failure cannot leak an uncertain transaction state', async () => {
+    const repo = freshRepository();
+    const { client, queries, order } = scriptedClient({
+      1: 'simulated BEGIN failure',
+    });
+    connectSpyFor(repo, client);
+
+    await expect(repo.initialize()).rejects.toThrow('simulated BEGIN failure');
+
+    expect(queries[0]).toBe('BEGIN');
+    // ROLLBACK is still attempted (a harmless no-op outside a transaction),
+    // so the connection state is proven clean before the client is released.
+    expect(queries).toContain('ROLLBACK');
+    expect(order).toContain('release:clean');
+    expect(order).not.toContain('release:error');
+    expect(client.release).toHaveBeenCalledTimes(1);
+  });
+
+  it('initialize(): successful migration transaction commits and releases exactly once', async () => {
+    const repo = freshRepository();
+    const { client, queries, order } = scriptedClient({});
+    connectSpyFor(repo, client);
+
+    await expect(repo.initialize()).resolves.toBeUndefined();
+
+    expect(queries[0]).toBe('BEGIN');
+    expect(queries).toContain('COMMIT');
+    expect(order.filter((entry) => entry === 'release:clean')).toHaveLength(1);
+    expect(order).not.toContain('release:error');
+    expect(client.release).toHaveBeenCalledTimes(1);
+  });
+
+  it('reserveOtpRequest(): mid-transaction failure rolls back before a clean release', async () => {
+    const repo = freshRepository();
+    const { client, queries, order } = scriptedClient({
+      2: 'simulated advisory-lock acquisition failure',
+    });
+    connectSpyFor(repo, client);
+
+    await expect(
+      repo.reserveOtpRequest('+966****7777', new Date()),
+    ).rejects.toThrow('simulated advisory-lock acquisition failure');
+
+    expect(queries[0]).toBe('BEGIN');
+    expect(queries).toContain('ROLLBACK');
+    expect(order.indexOf('query:ROLLBACK')).toBeLessThan(
+      order.indexOf('release:clean'),
+    );
+    expect(client.release).toHaveBeenCalledTimes(1);
+    expect(client.release).toHaveBeenCalledWith();
+    expect(order).not.toContain('release:error');
+  });
+
+  it('reserveOtpRequest(): rollback failure destroys the pooled client', async () => {
+    const repo = freshRepository();
+    const { client, order } = scriptedClient({
+      2: 'simulated advisory-lock acquisition failure',
+      3: 'simulated rollback failure',
+    });
+    connectSpyFor(repo, client);
+
+    await expect(
+      repo.reserveOtpRequest('+966****7777', new Date()),
+    ).rejects.toThrow('simulated advisory-lock acquisition failure');
+
+    expect(order).toContain('release:error');
+    expect(order).not.toContain('release:clean');
+    expect(client.release).toHaveBeenCalledTimes(1);
+    expect(client.release).toHaveBeenCalledWith(expect.any(Error));
+  });
+
+  it('reserveOtpRequest(): successful transaction path is unchanged', async () => {
+    const repo = freshRepository();
+    const { client, queries, order } = scriptedClient({});
+    connectSpyFor(repo, client);
+
+    await expect(
+      repo.reserveOtpRequest('+966****7777', new Date()),
+    ).resolves.toBe('accepted');
+
+    expect(queries[0]).toBe('BEGIN');
+    expect(queries[queries.length - 1]).toBe('COMMIT');
+    expect(order.filter((entry) => entry === 'release:clean')).toHaveLength(1);
+    expect(client.release).toHaveBeenCalledTimes(1);
   });
 });

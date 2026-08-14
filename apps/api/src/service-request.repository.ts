@@ -162,6 +162,26 @@ export class ServiceRequestRepository
     connectionString: resolveDatabaseConnectionString(),
   });
 
+  /**
+   * Fail-safe cleanup for a transaction-scoped pool client.
+   *
+   * Whenever a transaction may have started, ROLLBACK is attempted before any
+   * release (ROLLBACK outside a transaction is a harmless no-op warning in
+   * PostgreSQL). When rollback succeeds the client is released to the pool
+   * normally; when rollback fails, the connection state cannot be proven
+   * clean, so the client is destroyed via the pg pool release-error semantics
+   * (`release(error)`) and is never returned to the pool as a healthy
+   * reusable connection. Exactly one release (or destroy) happens per call.
+   */
+  private async rollbackAndRelease(client: PoolClient): Promise<void> {
+    try {
+      await client.query('ROLLBACK');
+      client.release();
+    } catch (rollbackError) {
+      client.release(rollbackError as Error);
+    }
+  }
+
   async onModuleInit(): Promise<void> {
     await this.initialize();
   }
@@ -171,300 +191,409 @@ export class ServiceRequestRepository
   }
 
   async initialize(): Promise<void> {
-    await this.pool.query(`
-      CREATE TABLE IF NOT EXISTS customers (
-        id BIGSERIAL PRIMARY KEY,
-        phone TEXT UNIQUE NOT NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )
-    `);
-    await this.pool.query(`
-      CREATE TABLE IF NOT EXISTS customer_sessions (
-        token_hash TEXT PRIMARY KEY,
-        customer_id BIGINT NOT NULL REFERENCES customers(id),
-        expires_at TIMESTAMPTZ NOT NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )
-    `);
-    await this.pool.query(`
-      CREATE TABLE IF NOT EXISTS customer_otp_challenges (
-        challenge_id UUID PRIMARY KEY,
-        phone TEXT NOT NULL,
-        expires_at TIMESTAMPTZ NOT NULL,
-        failed_attempts SMALLINT NOT NULL DEFAULT 0 CHECK (failed_attempts >= 0),
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )
-    `);
-    await this.pool.query(
-      'CREATE INDEX IF NOT EXISTS customer_otp_challenges_expires_at_idx ON customer_otp_challenges (expires_at)',
-    );
-    await this.pool.query(`
-      CREATE TABLE IF NOT EXISTS customer_otp_request_attempts (
-        id BIGSERIAL PRIMARY KEY,
-        phone TEXT NOT NULL,
-        requested_at TIMESTAMPTZ NOT NULL
-      )
-    `);
-    await this.pool.query(
-      'CREATE INDEX IF NOT EXISTS customer_otp_request_attempts_phone_requested_at_idx ON customer_otp_request_attempts (phone, requested_at DESC)',
-    );
-    await this.pool.query(`
-      CREATE TABLE IF NOT EXISTS providers (
-        id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        specialties TEXT[] NOT NULL,
-        available BOOLEAN NOT NULL DEFAULT TRUE
-      )
-    `);
-    await this.pool.query(
-      "ALTER TABLE providers ADD COLUMN IF NOT EXISTS service_zone TEXT NOT NULL DEFAULT 'بريدة'",
-    );
-    await this.pool.query(
-      "ALTER TABLE providers ADD COLUMN IF NOT EXISTS verification_status TEXT NOT NULL DEFAULT 'pending' CHECK (verification_status IN ('pending', 'verified', 'suspended'))",
-    );
-    await this.pool.query(`
-      CREATE TABLE IF NOT EXISTS provider_access_credentials (
-        provider_id TEXT PRIMARY KEY REFERENCES providers(id),
-        access_code_hash TEXT UNIQUE NOT NULL,
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )
-    `);
-    // Indexed access-code lookup (SHA-256 lookup id) with a uniqueness
-    // constraint as the final protection. Idempotent; no destructive DDL.
-    await this.pool.query(
-      'ALTER TABLE provider_access_credentials ADD COLUMN IF NOT EXISTS lookup_id TEXT',
-    );
-    await this.pool.query(
-      `CREATE UNIQUE INDEX IF NOT EXISTS provider_access_lookup_idx
-       ON provider_access_credentials (lookup_id)
-       WHERE lookup_id IS NOT NULL`,
-    );
-    // Backfill lookup ids only where safely derivable: legacy SHA-256 hashes
-    // are exactly sha256(accessCode). Salted scrypt hashes cannot be derived
-    // and must be rotated by operations (login fails generically until then).
-    await this.pool.query(
-      `UPDATE provider_access_credentials
-       SET lookup_id = access_code_hash
-       WHERE lookup_id IS NULL AND access_code_hash ~ '^[a-f0-9]{64}$'`,
-    );
-    await this.pool.query(`
-      CREATE TABLE IF NOT EXISTS provider_sessions (
-        token_hash TEXT PRIMARY KEY,
-        provider_id TEXT NOT NULL REFERENCES providers(id),
-        expires_at TIMESTAMPTZ NOT NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )
-    `);
-    await this.pool.query(
-      'CREATE INDEX IF NOT EXISTS provider_sessions_provider_expires_idx ON provider_sessions (provider_id, expires_at DESC)',
-    );
-    if (process.env.NODE_ENV === 'test') {
-      await this.pool.query(`
-        INSERT INTO providers (id, name, specialties, available, service_zone, verification_status)
-        VALUES
-          ('provider-1', 'فريق التبريد السريع', ARRAY['ac-cleaning'], TRUE, 'بريدة', 'verified'),
-          ('provider-2', 'مؤسسة النظافة المنزلية', ARRAY['upholstery', 'home-cleaning', 'tank-cleaning'], TRUE, 'بريدة', 'verified'),
-          ('provider-3', 'فني السباكة محمد', ARRAY['plumbing'], TRUE, 'بريدة', 'verified')
-        ON CONFLICT (id) DO UPDATE
-        SET verification_status = 'verified', available = TRUE
-      `);
+    // Concurrent same-schema initialization is serialized on a
+    // schema-keyed advisory lock held for the WHOLE init protocol
+    // (transaction-scoped: released automatically at COMMIT/ROLLBACK).
+    // All statements run on ONE dedicated connection in ONE
+    // transaction, so the catalog races of concurrent
+    // CREATE TABLE/CREATE INDEX/ALTER (e.g. duplicate key on
+    // pg_type_typname_nsp_index) become deterministic: the loser blocks
+    // on the lock, then re-reads the committed state and every
+    // IF NOT EXISTS / DO-block migration converges.
+    const client = await this.pool.connect();
+    let released = false;
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        'SELECT pg_advisory_xact_lock(hashtextextended(current_schema(), 0))',
+      );
+      try {
+        await client.query(`
+          CREATE TABLE IF NOT EXISTS customers (
+            id BIGSERIAL PRIMARY KEY,
+            phone TEXT UNIQUE NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+          )
+        `);
+        await client.query(`
+          CREATE TABLE IF NOT EXISTS customer_sessions (
+            token_hash TEXT PRIMARY KEY,
+            customer_id BIGINT NOT NULL REFERENCES customers(id),
+            expires_at TIMESTAMPTZ NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+          )
+        `);
+        await client.query(`
+          CREATE TABLE IF NOT EXISTS customer_otp_challenges (
+            challenge_id UUID PRIMARY KEY,
+            phone TEXT NOT NULL,
+            expires_at TIMESTAMPTZ NOT NULL,
+            failed_attempts SMALLINT NOT NULL DEFAULT 0 CHECK (failed_attempts >= 0),
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+          )
+        `);
+        await client.query(
+          'CREATE INDEX IF NOT EXISTS customer_otp_challenges_expires_at_idx ON customer_otp_challenges (expires_at)',
+        );
+        await client.query(`
+          CREATE TABLE IF NOT EXISTS customer_otp_request_attempts (
+            id BIGSERIAL PRIMARY KEY,
+            phone TEXT NOT NULL,
+            requested_at TIMESTAMPTZ NOT NULL
+          )
+        `);
+        await client.query(
+          'CREATE INDEX IF NOT EXISTS customer_otp_request_attempts_phone_requested_at_idx ON customer_otp_request_attempts (phone, requested_at DESC)',
+        );
+        await client.query(`
+          CREATE TABLE IF NOT EXISTS providers (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            specialties TEXT[] NOT NULL,
+            available BOOLEAN NOT NULL DEFAULT TRUE
+          )
+        `);
+        await client.query(
+          "ALTER TABLE providers ADD COLUMN IF NOT EXISTS service_zone TEXT NOT NULL DEFAULT 'بريدة'",
+        );
+        await client.query(
+          "ALTER TABLE providers ADD COLUMN IF NOT EXISTS verification_status TEXT NOT NULL DEFAULT 'pending' CHECK (verification_status IN ('pending', 'verified', 'suspended'))",
+        );
+        await client.query(`
+          CREATE TABLE IF NOT EXISTS provider_access_credentials (
+            provider_id TEXT PRIMARY KEY REFERENCES providers(id),
+            access_code_hash TEXT UNIQUE NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+          )
+        `);
+        // Indexed access-code lookup (SHA-256 lookup id) with a uniqueness
+        // constraint as the final protection. Idempotent; no destructive DDL.
+        await client.query(
+          'ALTER TABLE provider_access_credentials ADD COLUMN IF NOT EXISTS lookup_id TEXT',
+        );
+        await client.query(
+          `CREATE UNIQUE INDEX IF NOT EXISTS provider_access_lookup_idx
+           ON provider_access_credentials (lookup_id)
+           WHERE lookup_id IS NOT NULL`,
+        );
+        // Backfill lookup ids only where safely derivable: legacy SHA-256 hashes
+        // are exactly sha256(accessCode). Salted scrypt hashes cannot be derived
+        // and must be rotated by operations (login fails generically until then).
+        await client.query(
+          `UPDATE provider_access_credentials
+           SET lookup_id = access_code_hash
+           WHERE lookup_id IS NULL AND access_code_hash ~ '^[a-f0-9]{64}$'`,
+        );
+        await client.query(`
+          CREATE TABLE IF NOT EXISTS provider_sessions (
+            token_hash TEXT PRIMARY KEY,
+            provider_id TEXT NOT NULL REFERENCES providers(id),
+            expires_at TIMESTAMPTZ NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+          )
+        `);
+        await client.query(
+          'CREATE INDEX IF NOT EXISTS provider_sessions_provider_expires_idx ON provider_sessions (provider_id, expires_at DESC)',
+        );
+        if (process.env.NODE_ENV === 'test') {
+          await client.query(`
+            INSERT INTO providers (id, name, specialties, available, service_zone, verification_status)
+            VALUES
+              ('provider-1', 'فريق التبريد السريع', ARRAY['ac-cleaning'], TRUE, 'بريدة', 'verified'),
+              ('provider-2', 'مؤسسة النظافة المنزلية', ARRAY['upholstery', 'home-cleaning', 'tank-cleaning'], TRUE, 'بريدة', 'verified'),
+              ('provider-3', 'فني السباكة محمد', ARRAY['plumbing'], TRUE, 'بريدة', 'verified')
+            ON CONFLICT (id) DO UPDATE
+            SET verification_status = 'verified', available = TRUE
+          `);
+        }
+        await client.query(`
+          CREATE TABLE IF NOT EXISTS service_requests (
+            id BIGSERIAL PRIMARY KEY,
+            service_id TEXT NOT NULL,
+            address TEXT NOT NULL,
+            details TEXT,
+            timing TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending_dispatch',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+          )
+        `);
+        await client.query(
+          'ALTER TABLE service_requests ADD COLUMN IF NOT EXISTS assigned_provider_id TEXT REFERENCES providers(id)',
+        );
+        await client.query(
+          'ALTER TABLE service_requests ADD COLUMN IF NOT EXISTS customer_id BIGINT REFERENCES customers(id)',
+        );
+        await client.query(
+          'ALTER TABLE service_requests ADD COLUMN IF NOT EXISTS rating SMALLINT CHECK (rating BETWEEN 1 AND 5)',
+        );
+        await client.query(
+          'ALTER TABLE service_requests ADD COLUMN IF NOT EXISTS rating_comment TEXT',
+        );
+        await client.query(`
+          CREATE TABLE IF NOT EXISTS service_request_events (
+            id BIGSERIAL PRIMARY KEY,
+            service_request_id BIGINT NOT NULL REFERENCES service_requests(id),
+            type TEXT NOT NULL CHECK (type IN ('request_created', 'provider_assigned', 'status_updated', 'quote_proposed', 'quote_approved', 'quote_rejected', 'opportunity_invited', 'opportunity_closed', 'provider_quote_submitted', 'provider_quote_withdrawn')),
+            status TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+          )
+        `);
+        await client.query(
+          'CREATE INDEX IF NOT EXISTS service_request_events_request_created_idx ON service_request_events (service_request_id, id)',
+        );
+        await client.query(`
+          CREATE TABLE IF NOT EXISTS service_quotes (
+            id BIGSERIAL PRIMARY KEY,
+            service_request_id BIGINT NOT NULL REFERENCES service_requests(id),
+            amount_halalas INTEGER NOT NULL CHECK (amount_halalas > 0),
+            scope TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('proposed', 'approved', 'rejected', 'withdrawn')) DEFAULT 'proposed',
+            proposed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            decided_at TIMESTAMPTZ
+          )
+        `);
+        await client.query(
+          'CREATE INDEX IF NOT EXISTS service_quotes_request_latest_idx ON service_quotes (service_request_id, id DESC)',
+        );
+        // Provider-owned marketplace quotes (additive; staff quotes keep provider_id NULL)
+        await client.query(
+          'ALTER TABLE service_quotes ADD COLUMN IF NOT EXISTS provider_id TEXT REFERENCES providers(id)',
+        );
+        await client.query(
+          'CREATE INDEX IF NOT EXISTS service_quotes_provider_idx ON service_quotes (provider_id)',
+        );
+        // Final concurrency protection: one active provider quote per provider per request
+        await client.query(
+          `CREATE UNIQUE INDEX IF NOT EXISTS service_quotes_one_active_per_provider
+           ON service_quotes (service_request_id, provider_id)
+           WHERE status IN ('proposed', 'approved') AND provider_id IS NOT NULL`,
+        );
+        await client.query(`
+          CREATE TABLE IF NOT EXISTS request_provider_opportunities (
+            id BIGSERIAL PRIMARY KEY,
+            service_request_id BIGINT NOT NULL REFERENCES service_requests(id),
+            provider_id TEXT NOT NULL REFERENCES providers(id),
+            status TEXT NOT NULL DEFAULT 'invited'
+              CHECK (status IN ('invited', 'quoted', 'withdrawn', 'closed', 'rejected')),
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (service_request_id, provider_id)
+          )
+        `);
+        await client.query(
+          'CREATE INDEX IF NOT EXISTS opportunities_provider_idx ON request_provider_opportunities (provider_id, status)',
+        );
+        // Extend the quote status CHECK with 'withdrawn' (controlled, idempotent,
+        // race-safe). The complete inspect/alter protocol is SERIALIZED on the
+        // exact schema-qualified table: an ACCESS EXCLUSIVE table lock is
+        // acquired BEFORE any introspection (pg_constraint scan +
+        // pg_get_constraintdef) and held through the ALTER inside the same
+        // statement/transaction, so the object inspected is guaranteed to be the
+        // object altered — no constraint OID can go stale between the two.
+        // Concurrent same-schema initializers block on the lock and then re-read
+        // the (already migrated) definition, so the outcome is deterministic.
+        // The OID picked is always from THIS schema's relation only (a single
+        // to_regclass lookup — no pg_get_constraintdef call inside any
+        // pg_constraint scan), so a schema being dropped concurrently by a
+        // parallel run can never make it open a dropped relation ("could not open
+        // relation with OID ..."); the ALTER runs with a schema-qualified, safely
+        // quoted table name — no dependence on search_path.
+        await client.query(`
+          DO $$
+          DECLARE
+            exact_schema text := current_schema();
+            selected_constraint_oid oid;
+            constraint_def text;
+          BEGIN
+            EXECUTE format(
+              'LOCK TABLE %I.%I IN ACCESS EXCLUSIVE MODE',
+              exact_schema, 'service_quotes'
+            );
+            SELECT c.oid
+              INTO selected_constraint_oid
+              FROM pg_constraint c
+             WHERE c.conrelid = to_regclass(
+                     format('%I.%I', exact_schema, 'service_quotes')
+                   )
+               AND c.conname = 'service_quotes_status_check';
+
+            IF selected_constraint_oid IS NOT NULL THEN
+              SELECT pg_get_constraintdef(selected_constraint_oid)
+                INTO constraint_def;
+            ELSE
+              constraint_def := NULL;
+            END IF;
+
+            IF constraint_def IS NULL OR NOT (
+              constraint_def LIKE '%proposed%'
+              AND constraint_def LIKE '%approved%'
+              AND constraint_def LIKE '%rejected%'
+              AND constraint_def LIKE '%withdrawn%'
+            ) THEN
+              BEGIN
+                EXECUTE format(
+                  'ALTER TABLE %I.%I DROP CONSTRAINT IF EXISTS service_quotes_status_check, ADD CONSTRAINT service_quotes_status_check CHECK (status IN (''proposed'', ''approved'', ''rejected'', ''withdrawn''))',
+                  exact_schema, 'service_quotes'
+                );
+              EXCEPTION WHEN duplicate_object THEN
+                NULL;
+              END;
+            END IF;
+          END $$;
+        `);
+        // Extend the event type CHECK with distinct marketplace event types
+        // (same serialized inspect/alter design as the quote CHECK migration
+        // above: ACCESS EXCLUSIVE lock on the exact schema-qualified table before
+        // introspection and through the ALTER, OID picked from the
+        // schema-qualified relation, pg_get_constraintdef called later on that
+        // single OID only, ALTER executed with a schema-qualified table name)
+        await client.query(`
+          DO $$
+          DECLARE
+            exact_schema text := current_schema();
+            selected_constraint_oid oid;
+            constraint_def text;
+          BEGIN
+            EXECUTE format(
+              'LOCK TABLE %I.%I IN ACCESS EXCLUSIVE MODE',
+              exact_schema, 'service_request_events'
+            );
+            SELECT c.oid
+              INTO selected_constraint_oid
+              FROM pg_constraint c
+             WHERE c.conrelid = to_regclass(
+                     format('%I.%I', exact_schema, 'service_request_events')
+                   )
+               AND c.conname = 'service_request_events_type_check';
+
+            IF selected_constraint_oid IS NOT NULL THEN
+              SELECT pg_get_constraintdef(selected_constraint_oid)
+                INTO constraint_def;
+            ELSE
+              constraint_def := NULL;
+            END IF;
+
+            IF constraint_def IS NULL OR NOT (
+              constraint_def LIKE '%request_created%'
+              AND constraint_def LIKE '%provider_assigned%'
+              AND constraint_def LIKE '%status_updated%'
+              AND constraint_def LIKE '%quote_proposed%'
+              AND constraint_def LIKE '%quote_approved%'
+              AND constraint_def LIKE '%quote_rejected%'
+              AND constraint_def LIKE '%opportunity_invited%'
+              AND constraint_def LIKE '%opportunity_closed%'
+              AND constraint_def LIKE '%provider_quote_submitted%'
+              AND constraint_def LIKE '%provider_quote_withdrawn%'
+            ) THEN
+              BEGIN
+                EXECUTE format(
+                  'ALTER TABLE %I.%I DROP CONSTRAINT IF EXISTS service_request_events_type_check, ADD CONSTRAINT service_request_events_type_check CHECK (type IN (''request_created'', ''provider_assigned'', ''status_updated'', ''quote_proposed'', ''quote_approved'', ''quote_rejected'', ''opportunity_invited'', ''opportunity_closed'', ''provider_quote_submitted'', ''provider_quote_withdrawn''))',
+                  exact_schema, 'service_request_events'
+                );
+              EXCEPTION WHEN duplicate_object THEN
+                NULL;
+              END;
+            END IF;
+          END $$;
+        `);
+        // Extend the opportunity status CHECK with 'rejected' (controlled,
+        // idempotent, race-safe — same serialized inspect/alter design as the
+        // quote CHECK migration above: ACCESS EXCLUSIVE lock on the exact
+        // schema-qualified table before introspection and through the ALTER)
+        await client.query(`
+          DO $$
+          DECLARE
+            exact_schema text := current_schema();
+            selected_constraint_oid oid;
+            constraint_def text;
+          BEGIN
+            EXECUTE format(
+              'LOCK TABLE %I.%I IN ACCESS EXCLUSIVE MODE',
+              exact_schema, 'request_provider_opportunities'
+            );
+            SELECT c.oid
+              INTO selected_constraint_oid
+              FROM pg_constraint c
+             WHERE c.conrelid = to_regclass(
+                     format('%I.%I', exact_schema, 'request_provider_opportunities')
+                   )
+               AND c.conname = 'request_provider_opportunities_status_check';
+
+            IF selected_constraint_oid IS NOT NULL THEN
+              SELECT pg_get_constraintdef(selected_constraint_oid)
+                INTO constraint_def;
+            ELSE
+              constraint_def := NULL;
+            END IF;
+
+            IF constraint_def IS NULL OR NOT (
+              constraint_def LIKE '%invited%'
+              AND constraint_def LIKE '%quoted%'
+              AND constraint_def LIKE '%withdrawn%'
+              AND constraint_def LIKE '%closed%'
+              AND constraint_def LIKE '%rejected%'
+            ) THEN
+              BEGIN
+                EXECUTE format(
+                  'ALTER TABLE %I.%I DROP CONSTRAINT IF EXISTS request_provider_opportunities_status_check, ADD CONSTRAINT request_provider_opportunities_status_check CHECK (status IN (''invited'', ''quoted'', ''withdrawn'', ''closed'', ''rejected''))',
+                  exact_schema, 'request_provider_opportunities'
+                );
+              EXCEPTION WHEN duplicate_object THEN
+                NULL;
+              END;
+            END IF;
+          END $$;
+        `);
+        await client.query(`
+          CREATE TABLE IF NOT EXISTS service_payments (
+            id BIGSERIAL PRIMARY KEY,
+            service_request_id BIGINT NOT NULL REFERENCES service_requests(id),
+            quote_id BIGINT NOT NULL UNIQUE REFERENCES service_quotes(id),
+            amount_halalas INTEGER NOT NULL CHECK (amount_halalas > 0),
+            currency CHAR(3) NOT NULL DEFAULT 'SAR' CHECK (currency = 'SAR'),
+            method TEXT NOT NULL CHECK (method IN ('cash_on_completion', 'paymob')),
+            status TEXT NOT NULL CHECK (status IN ('cash_due', 'cash_collected', 'checkout_created', 'paid', 'failed', 'refund_pending', 'refunded')),
+            collected_at TIMESTAMPTZ,
+            refunded_at TIMESTAMPTZ,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (service_request_id, quote_id)
+          )
+        `);
+        await client.query(
+          'ALTER TABLE service_payments ADD COLUMN IF NOT EXISTS refunded_at TIMESTAMPTZ',
+        );
+        await client.query(
+          'CREATE INDEX IF NOT EXISTS service_payments_request_created_idx ON service_payments (service_request_id, id DESC)',
+        );
+        await client.query(`
+          CREATE TABLE IF NOT EXISTS support_tickets (
+            id BIGSERIAL PRIMARY KEY,
+            service_request_id BIGINT NOT NULL REFERENCES service_requests(id),
+            customer_id BIGINT NOT NULL REFERENCES customers(id),
+            category TEXT NOT NULL,
+            comment TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+          )
+        `);
+        await client.query('COMMIT');
+      } catch (error) {
+        // The migration transaction is open (likely aborted) at this point:
+        // roll back before releasing, and never release a dirty client.
+        released = true;
+        await this.rollbackAndRelease(client);
+        throw error;
+      }
+      client.release();
+    } catch (error) {
+      // BEGIN or advisory-lock acquisition failed. A transaction may still be
+      // open, or the connection state may be uncertain, so use the fail-safe
+      // cleanup (attempt ROLLBACK; destroy the client if it cannot be proven
+      // clean) instead of releasing the client untouched.
+      if (!released) {
+        await this.rollbackAndRelease(client);
+      }
+      throw error;
     }
-    await this.pool.query(`
-      CREATE TABLE IF NOT EXISTS service_requests (
-        id BIGSERIAL PRIMARY KEY,
-        service_id TEXT NOT NULL,
-        address TEXT NOT NULL,
-        details TEXT,
-        timing TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'pending_dispatch',
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )
-    `);
-    await this.pool.query(
-      'ALTER TABLE service_requests ADD COLUMN IF NOT EXISTS assigned_provider_id TEXT REFERENCES providers(id)',
-    );
-    await this.pool.query(
-      'ALTER TABLE service_requests ADD COLUMN IF NOT EXISTS customer_id BIGINT REFERENCES customers(id)',
-    );
-    await this.pool.query(
-      'ALTER TABLE service_requests ADD COLUMN IF NOT EXISTS rating SMALLINT CHECK (rating BETWEEN 1 AND 5)',
-    );
-    await this.pool.query(
-      'ALTER TABLE service_requests ADD COLUMN IF NOT EXISTS rating_comment TEXT',
-    );
-    await this.pool.query(`
-      CREATE TABLE IF NOT EXISTS service_request_events (
-        id BIGSERIAL PRIMARY KEY,
-        service_request_id BIGINT NOT NULL REFERENCES service_requests(id),
-        type TEXT NOT NULL CHECK (type IN ('request_created', 'provider_assigned', 'status_updated', 'quote_proposed', 'quote_approved', 'quote_rejected', 'opportunity_invited', 'opportunity_closed', 'provider_quote_submitted', 'provider_quote_withdrawn')),
-        status TEXT NOT NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )
-    `);
-    await this.pool.query(
-      'CREATE INDEX IF NOT EXISTS service_request_events_request_created_idx ON service_request_events (service_request_id, id)',
-    );
-    await this.pool.query(`
-      CREATE TABLE IF NOT EXISTS service_quotes (
-        id BIGSERIAL PRIMARY KEY,
-        service_request_id BIGINT NOT NULL REFERENCES service_requests(id),
-        amount_halalas INTEGER NOT NULL CHECK (amount_halalas > 0),
-        scope TEXT NOT NULL,
-        status TEXT NOT NULL CHECK (status IN ('proposed', 'approved', 'rejected', 'withdrawn')) DEFAULT 'proposed',
-        proposed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        decided_at TIMESTAMPTZ
-      )
-    `);
-    await this.pool.query(
-      'CREATE INDEX IF NOT EXISTS service_quotes_request_latest_idx ON service_quotes (service_request_id, id DESC)',
-    );
-    // Provider-owned marketplace quotes (additive; staff quotes keep provider_id NULL)
-    await this.pool.query(
-      'ALTER TABLE service_quotes ADD COLUMN IF NOT EXISTS provider_id TEXT REFERENCES providers(id)',
-    );
-    await this.pool.query(
-      'CREATE INDEX IF NOT EXISTS service_quotes_provider_idx ON service_quotes (provider_id)',
-    );
-    // Final concurrency protection: one active provider quote per provider per request
-    await this.pool.query(
-      `CREATE UNIQUE INDEX IF NOT EXISTS service_quotes_one_active_per_provider
-       ON service_quotes (service_request_id, provider_id)
-       WHERE status IN ('proposed', 'approved') AND provider_id IS NOT NULL`,
-    );
-    await this.pool.query(`
-      CREATE TABLE IF NOT EXISTS request_provider_opportunities (
-        id BIGSERIAL PRIMARY KEY,
-        service_request_id BIGINT NOT NULL REFERENCES service_requests(id),
-        provider_id TEXT NOT NULL REFERENCES providers(id),
-        status TEXT NOT NULL DEFAULT 'invited'
-          CHECK (status IN ('invited', 'quoted', 'withdrawn', 'closed', 'rejected')),
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        UNIQUE (service_request_id, provider_id)
-      )
-    `);
-    await this.pool.query(
-      'CREATE INDEX IF NOT EXISTS opportunities_provider_idx ON request_provider_opportunities (provider_id, status)',
-    );
-    // Extend the quote status CHECK with 'withdrawn' (controlled, idempotent, race-safe)
-    // Scoped to the current schema's own table: an unqualified pg_constraint scan can
-    // match (and pg_get_constraintdef open) a same-named constraint from ANOTHER schema
-    // while that schema is being dropped concurrently (parallel test runs), which fails
-    // with "could not open relation with OID ...".
-    await this.pool.query(`
-      DO $$
-      BEGIN
-        IF NOT EXISTS (
-          SELECT 1 FROM pg_constraint c
-          WHERE c.conrelid = to_regclass(format('%I.%I', current_schema(), 'service_quotes'))
-            AND c.conname = 'service_quotes_status_check'
-            AND pg_get_constraintdef(c.oid) LIKE '%proposed%'
-            AND pg_get_constraintdef(c.oid) LIKE '%approved%'
-            AND pg_get_constraintdef(c.oid) LIKE '%rejected%'
-            AND pg_get_constraintdef(c.oid) LIKE '%withdrawn%'
-        ) THEN
-          BEGIN
-            ALTER TABLE service_quotes
-              DROP CONSTRAINT IF EXISTS service_quotes_status_check,
-              ADD CONSTRAINT service_quotes_status_check
-                CHECK (status IN ('proposed', 'approved', 'rejected', 'withdrawn'));
-          EXCEPTION WHEN duplicate_object THEN
-            NULL;
-          END;
-        END IF;
-      END $$;
-    `);
-    // Extend the event type CHECK with distinct marketplace event types
-    // (same current_schema() scoping as the quote CHECK migration above)
-    await this.pool.query(`
-      DO $$
-      BEGIN
-        IF NOT EXISTS (
-          SELECT 1 FROM pg_constraint c
-          WHERE c.conrelid = to_regclass(format('%I.%I', current_schema(), 'service_request_events'))
-            AND c.conname = 'service_request_events_type_check'
-            AND pg_get_constraintdef(c.oid) LIKE '%request_created%'
-            AND pg_get_constraintdef(c.oid) LIKE '%provider_assigned%'
-            AND pg_get_constraintdef(c.oid) LIKE '%status_updated%'
-            AND pg_get_constraintdef(c.oid) LIKE '%quote_proposed%'
-            AND pg_get_constraintdef(c.oid) LIKE '%quote_approved%'
-            AND pg_get_constraintdef(c.oid) LIKE '%quote_rejected%'
-            AND pg_get_constraintdef(c.oid) LIKE '%opportunity_invited%'
-            AND pg_get_constraintdef(c.oid) LIKE '%opportunity_closed%'
-            AND pg_get_constraintdef(c.oid) LIKE '%provider_quote_submitted%'
-            AND pg_get_constraintdef(c.oid) LIKE '%provider_quote_withdrawn%'
-        ) THEN
-          BEGIN
-            ALTER TABLE service_request_events
-              DROP CONSTRAINT IF EXISTS service_request_events_type_check,
-              ADD CONSTRAINT service_request_events_type_check
-                CHECK (type IN ('request_created', 'provider_assigned', 'status_updated',
-                                'quote_proposed', 'quote_approved', 'quote_rejected',
-                                'opportunity_invited', 'opportunity_closed',
-                                'provider_quote_submitted', 'provider_quote_withdrawn'));
-          EXCEPTION WHEN duplicate_object THEN
-            NULL;
-          END;
-        END IF;
-      END $$;
-    `);
-    // Extend the opportunity status CHECK with 'rejected' (controlled, idempotent, race-safe)
-    // (same current_schema() scoping as the quote CHECK migration above)
-    await this.pool.query(`
-      DO $$
-      BEGIN
-        IF NOT EXISTS (
-          SELECT 1 FROM pg_constraint c
-          WHERE c.conrelid = to_regclass(format('%I.%I', current_schema(), 'request_provider_opportunities'))
-            AND c.conname = 'request_provider_opportunities_status_check'
-            AND pg_get_constraintdef(c.oid) LIKE '%invited%'
-            AND pg_get_constraintdef(c.oid) LIKE '%quoted%'
-            AND pg_get_constraintdef(c.oid) LIKE '%withdrawn%'
-            AND pg_get_constraintdef(c.oid) LIKE '%closed%'
-            AND pg_get_constraintdef(c.oid) LIKE '%rejected%'
-        ) THEN
-          BEGIN
-            ALTER TABLE request_provider_opportunities
-              DROP CONSTRAINT IF EXISTS request_provider_opportunities_status_check,
-              ADD CONSTRAINT request_provider_opportunities_status_check
-                CHECK (status IN ('invited', 'quoted', 'withdrawn', 'closed', 'rejected'));
-          EXCEPTION WHEN duplicate_object THEN
-            NULL;
-          END;
-        END IF;
-      END $$;
-    `);
-    await this.pool.query(`
-      CREATE TABLE IF NOT EXISTS service_payments (
-        id BIGSERIAL PRIMARY KEY,
-        service_request_id BIGINT NOT NULL REFERENCES service_requests(id),
-        quote_id BIGINT NOT NULL UNIQUE REFERENCES service_quotes(id),
-        amount_halalas INTEGER NOT NULL CHECK (amount_halalas > 0),
-        currency CHAR(3) NOT NULL DEFAULT 'SAR' CHECK (currency = 'SAR'),
-        method TEXT NOT NULL CHECK (method IN ('cash_on_completion', 'paymob')),
-        status TEXT NOT NULL CHECK (status IN ('cash_due', 'cash_collected', 'checkout_created', 'paid', 'failed', 'refund_pending', 'refunded')),
-        collected_at TIMESTAMPTZ,
-        refunded_at TIMESTAMPTZ,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        UNIQUE (service_request_id, quote_id)
-      )
-    `);
-    await this.pool.query(
-      'ALTER TABLE service_payments ADD COLUMN IF NOT EXISTS refunded_at TIMESTAMPTZ',
-    );
-    await this.pool.query(
-      'CREATE INDEX IF NOT EXISTS service_payments_request_created_idx ON service_payments (service_request_id, id DESC)',
-    );
-    await this.pool.query(`
-      CREATE TABLE IF NOT EXISTS support_tickets (
-        id BIGSERIAL PRIMARY KEY,
-        service_request_id BIGINT NOT NULL REFERENCES service_requests(id),
-        customer_id BIGINT NOT NULL REFERENCES customers(id),
-        category TEXT NOT NULL,
-        comment TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'open',
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )
-    `);
   }
 
   async create(
@@ -500,12 +629,11 @@ export class ServiceRequestRepository
         row.status,
       );
       await client.query('COMMIT');
+      client.release();
       return this.toServiceRequest(row);
     } catch (error) {
-      await client.query('ROLLBACK');
+      await this.rollbackAndRelease(client);
       throw error;
-    } finally {
-      client.release();
     }
   }
 
@@ -850,11 +978,10 @@ export class ServiceRequestRepository
         [providerId],
       );
       await client.query('COMMIT');
-    } catch (error) {
-      await client.query('ROLLBACK').catch(() => undefined);
-      throw error;
-    } finally {
       client.release();
+    } catch (error) {
+      await this.rollbackAndRelease(client);
+      throw error;
     }
   }
 
@@ -1019,12 +1146,11 @@ export class ServiceRequestRepository
         [databaseId],
       );
       await client.query('COMMIT');
+      client.release();
       return this.toServiceRequest(row);
     } catch (error) {
-      await client.query('ROLLBACK');
+      await this.rollbackAndRelease(client);
       throw error;
-    } finally {
-      client.release();
     }
   }
 
@@ -1076,11 +1202,10 @@ export class ServiceRequestRepository
         [databaseId, status],
       );
       await client.query('COMMIT');
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
-    } finally {
       client.release();
+    } catch (error) {
+      await this.rollbackAndRelease(client);
+      throw error;
     }
 
     const request = (await this.findAll()).find(
@@ -1160,11 +1285,10 @@ export class ServiceRequestRepository
         [databaseId, status],
       );
       await client.query('COMMIT');
-    } catch (error) {
-      await client.query('ROLLBACK').catch(() => undefined);
-      throw error;
-    } finally {
       client.release();
+    } catch (error) {
+      await this.rollbackAndRelease(client);
+      throw error;
     }
 
     const request = (await this.findByProviderId(providerId)).find(
@@ -1224,12 +1348,11 @@ export class ServiceRequestRepository
         [databaseId, status],
       );
       await client.query('COMMIT');
+      client.release();
       return this.toServiceQuote(quote);
     } catch (error) {
-      await client.query('ROLLBACK');
+      await this.rollbackAndRelease(client);
       throw error;
-    } finally {
-      client.release();
     }
   }
 
@@ -1371,12 +1494,11 @@ export class ServiceRequestRepository
         ],
       );
       await client.query('COMMIT');
+      client.release();
       return this.toServiceQuote(updatedQuote);
     } catch (error) {
-      await client.query('ROLLBACK');
+      await this.rollbackAndRelease(client);
       throw error;
-    } finally {
-      client.release();
     }
   }
 
@@ -1455,12 +1577,11 @@ export class ServiceRequestRepository
         }
       }
       await client.query('COMMIT');
+      client.release();
       return created;
     } catch (error) {
-      await client.query('ROLLBACK');
+      await this.rollbackAndRelease(client);
       throw error;
-    } finally {
-      client.release();
     }
   }
 
@@ -1604,12 +1725,11 @@ export class ServiceRequestRepository
         [databaseId],
       );
       await client.query('COMMIT');
+      client.release();
       return this.toServiceQuote(insertedQuote);
     } catch (error) {
-      await client.query('ROLLBACK');
+      await this.rollbackAndRelease(client);
       throw error;
-    } finally {
-      client.release();
     }
   }
 
@@ -1657,12 +1777,11 @@ export class ServiceRequestRepository
         [currentQuote.request_id],
       );
       await client.query('COMMIT');
+      client.release();
       return this.toServiceQuote(updated.rows[0]);
     } catch (error) {
-      await client.query('ROLLBACK');
+      await this.rollbackAndRelease(client);
       throw error;
-    } finally {
-      client.release();
     }
   }
 
@@ -1706,12 +1825,11 @@ export class ServiceRequestRepository
         );
       }
       await client.query('COMMIT');
+      client.release();
       return { closed };
     } catch (error) {
-      await client.query('ROLLBACK');
+      await this.rollbackAndRelease(client);
       throw error;
-    } finally {
-      client.release();
     }
   }
 
@@ -1749,12 +1867,11 @@ export class ServiceRequestRepository
       const row = collected.rows[0];
       if (!row) throw new Error('Cash payment could not be collected');
       await client.query('COMMIT');
+      client.release();
       return this.toServicePayment(row);
     } catch (error) {
-      await client.query('ROLLBACK').catch(() => undefined);
+      await this.rollbackAndRelease(client);
       throw error;
-    } finally {
-      client.release();
     }
   }
 
@@ -1784,12 +1901,11 @@ export class ServiceRequestRepository
       const row = refunded.rows[0];
       if (!row) throw new Error('Cash payment could not be refunded');
       await client.query('COMMIT');
+      client.release();
       return this.toServicePayment(row);
     } catch (error) {
-      await client.query('ROLLBACK').catch(() => undefined);
+      await this.rollbackAndRelease(client);
       throw error;
-    } finally {
-      client.release();
     }
   }
 
@@ -1890,10 +2006,12 @@ export class ServiceRequestRepository
         requestedAt.getTime() - previousRequestAt.getTime() < 60_000
       ) {
         await client.query('COMMIT');
+        client.release();
         return 'cooldown';
       }
       if (recent.rows.length >= 5) {
         await client.query('COMMIT');
+        client.release();
         return 'limit';
       }
 
@@ -1907,12 +2025,11 @@ export class ServiceRequestRepository
         [windowStart],
       );
       await client.query('COMMIT');
+      client.release();
       return 'accepted';
     } catch (error) {
-      await client.query('ROLLBACK').catch(() => undefined);
+      await this.rollbackAndRelease(client);
       throw error;
-    } finally {
-      client.release();
     }
   }
 

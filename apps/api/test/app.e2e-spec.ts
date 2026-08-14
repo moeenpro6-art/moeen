@@ -114,8 +114,8 @@ async function createProviderAuthorization(
  * Removes ONLY the providers this suite registered (exact ids) plus their
  * dependent rows, in FK-safe order (bottom-up per the actual constraints:
  * service_payments → service_request_events → request_provider_opportunities
- * → service_quotes → service_requests → provider_sessions →
- * provider_access_credentials → providers). Runs inside one transaction;
+ * → service_quotes → support_tickets → service_requests → provider_sessions
+ * → provider_access_credentials → providers). Runs inside one transaction;
  * on any error it ROLLBACKs and rethrows. The registered ids are dropped
  * from the set ONLY after COMMIT, so repeated calls are idempotent no-ops.
  * No wildcard or prefix scans, no broad subqueries, no unregistered
@@ -162,6 +162,13 @@ async function removeCreatedProvidersForLegacyFlow(): Promise<void> {
       [ids],
     );
     await client.query(
+      `DELETE FROM support_tickets
+       WHERE service_request_id IN (
+         SELECT id FROM service_requests WHERE assigned_provider_id = ANY($1::text[])
+       )`,
+      [ids],
+    );
+    await client.query(
       `DELETE FROM service_requests WHERE assigned_provider_id = ANY($1::text[])`,
       [ids],
     );
@@ -185,7 +192,11 @@ async function removeCreatedProvidersForLegacyFlow(): Promise<void> {
     await client.query('ROLLBACK').catch(() => undefined);
     throw error;
   } finally {
+    // P2-3: release the client first, then close the helper's OWN pool (it is
+    // local to this helper — never the application's shared pool) so no open
+    // handles outlive the suite.
     client.release();
+    await pool.end();
   }
 }
 
@@ -2225,6 +2236,70 @@ describe('AppController (e2e)', () => {
         );
         expect(stays.rows[0].n).toBe(1);
       } finally {
+        await pool.end();
+      }
+    });
+
+    it('removes support tickets of tracked providers before their requests (FK regression)', async () => {
+      const registered = await createProviderAuthorization(app, [
+        'ac-cleaning',
+      ]);
+      const pool = new Pool({
+        connectionString: process.env.TEST_DATABASE_URL,
+      });
+      let customerId: string | undefined;
+      try {
+        // A support ticket whose FK (service_requests.id) is only reachable
+        // through a request assigned to the tracked provider — the OLD
+        // cleanup order (requests before tickets) failed on this FK with a
+        // NO ACTION violation and rolled back everything.
+        const phone = `+9665${randomUUID().replace(/-/g, '').slice(0, 9)}`;
+        const customer = await pool.query<{ id: string }>(
+          `INSERT INTO customers (phone) VALUES ($1) RETURNING id`,
+          [phone],
+        );
+        customerId = customer.rows[0].id;
+        const req = await pool.query<{ id: string }>(
+          `INSERT INTO service_requests
+             (service_id, address, details, timing, assigned_provider_id, customer_id)
+           VALUES ('ac-cleaning', 'address', 'details', 'asap', $1, $2)
+           RETURNING id`,
+          [registered.providerId, customerId],
+        );
+        const requestId = req.rows[0].id;
+        await pool.query(
+          `INSERT INTO support_tickets (service_request_id, customer_id, category, comment)
+           VALUES ($1, $2, 'billing', 'cleanup FK regression')`,
+          [requestId, customerId],
+        );
+
+        await removeCreatedProvidersForLegacyFlow();
+
+        // The whole dependent chain of the tracked provider is gone: the
+        // support ticket, the request and the provider itself.
+        const providerGone = await pool.query<{ n: number }>(
+          `SELECT count(*)::int AS n FROM providers WHERE id = $1`,
+          [registered.providerId],
+        );
+        expect(providerGone.rows[0].n).toBe(0);
+        const ticketGone = await pool.query<{ n: number }>(
+          `SELECT count(*)::int AS n FROM support_tickets WHERE service_request_id = $1`,
+          [requestId],
+        );
+        expect(ticketGone.rows[0].n).toBe(0);
+        const requestGone = await pool.query<{ n: number }>(
+          `SELECT count(*)::int AS n FROM service_requests WHERE id = $1`,
+          [requestId],
+        );
+        expect(requestGone.rows[0].n).toBe(0);
+      } finally {
+        // The customer row was created by this test, not by the provider
+        // flow — remove it here (exact id) so no residue survives.
+        if (customerId !== undefined) {
+          await pool
+            .query(`DELETE FROM customers WHERE id = $1`, [customerId])
+            .catch(() => undefined);
+        }
         await pool.end();
       }
     });
