@@ -13,11 +13,12 @@
     "start:debug": "nest start --debug --watch",
     "start:prod": "node dist/main",
     "lint": "eslint \"{src,apps,libs,test}/**/*.ts\" --fix",
-    "test": "jest",
-    "test:watch": "jest --watch",
-    "test:cov": "jest --coverage",
-    "test:debug": "node --inspect-brk -r tsconfig-paths/register -r ts-node/register node_modules/.bin/jest --runInBand",
-    "test:e2e": "jest --config ./test/jest-e2e.json"
+    "test": "node scripts/with-test-env.js jest",
+    "test:isolation": "node scripts/run-isolation-gate.js",
+    "test:watch": "node scripts/with-test-env.js jest --watch",
+    "test:cov": "node scripts/with-test-env.js jest --coverage",
+    "test:debug": "node scripts/with-test-env.js node --inspect-brk -r tsconfig-paths/register -r ts-node/register ./node_modules/jest/bin/jest.js --runInBand",
+    "test:e2e": "node scripts/with-test-env.js jest --config ./test/jest-e2e.json"
   },
   "dependencies": {
     "@nestjs/common": "^11.0.1",
@@ -62,6 +63,12 @@
     ],
     "rootDir": "src",
     "testRegex": ".*\\.spec\\.ts$",
+    "setupFiles": [
+      "<rootDir>/../test/setup/setup-test-env.ts"
+    ],
+    "globalSetup": "<rootDir>/../test/setup/global-setup.ts",
+    "globalTeardown": "<rootDir>/../test/setup/global-teardown.ts",
+    "maxWorkers": 2,
     "transform": {
       "^.+\\.(t|j)s$": "ts-jest"
     },

@@ -1,0 +1,17 @@
+{
+  "moduleFileExtensions": ["js", "json", "ts"],
+  "rootDir": "..",
+  "testEnvironment": "node",
+  "testMatch": ["**/isolation/**/*.spec.ts"],
+  "testTimeout": 150000,
+  "cache": false,
+  "maxWorkers": 2,
+  "setupFiles": [
+    "<rootDir>/test/setup/setup-test-env.ts"
+  ],
+  "globalSetup": "<rootDir>/test/setup/global-setup.ts",
+  "globalTeardown": "<rootDir>/test/setup/global-teardown.ts",
+  "transform": {
+    "^.+[.](t|j)s$": "ts-jest"
+  }
+}
