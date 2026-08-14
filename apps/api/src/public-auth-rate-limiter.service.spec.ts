@@ -1,4 +1,3 @@
-import { HttpException } from '@nestjs/common';
 import {
   PublicAuthRateLimiter,
   type PublicAuthAttemptStore,
@@ -14,7 +13,7 @@ describe('PublicAuthRateLimiter', () => {
 
     await expect(
       limiter.reserveOtpRequest('198.51.100.7'),
-    ).rejects.toMatchObject<HttpException>({ status: 429 });
+    ).rejects.toMatchObject({ status: 429 });
     expect(reservePublicAuthAttempt).toHaveBeenCalledWith(
       'customer_otp_request',
       expect.stringMatching(/^[a-f0-9]{64}$/),
@@ -60,6 +59,6 @@ describe('PublicAuthRateLimiter', () => {
 
     await expect(
       limiter.reserveProviderLogin('198.51.100.10'),
-    ).rejects.toMatchObject<HttpException>({ status: 429 });
+    ).rejects.toMatchObject({ status: 429 });
   });
 });

@@ -4,6 +4,12 @@
   "testEnvironment": "node",
   "testRegex": ".e2e-spec.ts$",
   "testTimeout": 30000,
+  "maxWorkers": 2,
+  "setupFiles": [
+    "./setup/setup-test-env.ts"
+  ],
+  "globalSetup": "./setup/global-setup.ts",
+  "globalTeardown": "./setup/global-teardown.ts",
   "transform": {
     "^.+[.](t|j)s$": "ts-jest"
   }
