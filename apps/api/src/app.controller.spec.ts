@@ -1,3 +1,4 @@
+import { NotFoundException } from '@nestjs/common';
 import { AppController } from './app.controller';
 import type { AppService } from './app.service';
 import type { StaffAuditService } from './staff-audit.service';
@@ -14,7 +15,7 @@ const actor = {
 };
 
 describe('AppController staff audit integration', () => {
-  it('registers a pilot provider as pending and records the admin action', async () => {
+  it('passes pilot registration audit metadata into the atomic command', async () => {
     const adminActor = { ...actor, role: 'admin' as const };
     const provider = {
       id: 'PILOT-provider',
@@ -55,18 +56,22 @@ describe('AppController staff audit integration', () => {
       serviceZone: provider.serviceZone,
     });
 
-    expect(auditService.record).toHaveBeenCalledWith(adminActor, {
-      action: 'provider.pilot_registered',
-      subjectType: 'provider',
-      subjectId: provider.id,
-      newState: {
-        verificationStatus: 'pending',
+    expect(appService.registerPilotProvider).toHaveBeenCalledWith(
+      {
+        name: provider.name,
+        specialties: provider.specialties,
         serviceZone: provider.serviceZone,
       },
-    });
+      {
+        staffId: adminActor.id,
+        action: 'provider.pilot_registered',
+        subjectType: 'provider',
+      },
+    );
+    expect(auditService.record).not.toHaveBeenCalled();
   });
 
-  it('verifies a pilot provider and retains the previous state in the audit trail', async () => {
+  it('passes verification audit metadata without a stale provider pre-read', async () => {
     const adminActor = { ...actor, role: 'admin' as const };
     const pendingProvider = {
       id: 'PILOT-provider',
@@ -105,16 +110,20 @@ describe('AppController staff audit integration', () => {
       }
     ).verifyPilotProvider('Bearer staff-session', pendingProvider.id);
 
-    expect(auditService.record).toHaveBeenCalledWith(adminActor, {
-      action: 'provider.pilot_verified',
-      subjectType: 'provider',
-      subjectId: pendingProvider.id,
-      oldState: { verificationStatus: 'pending', available: false },
-      newState: { verificationStatus: 'verified', available: true },
-    });
+    expect(appService.getProviders).not.toHaveBeenCalled();
+    expect(appService.verifyPilotProvider).toHaveBeenCalledWith(
+      pendingProvider.id,
+      {
+        staffId: adminActor.id,
+        action: 'provider.pilot_verified',
+        subjectType: 'provider',
+        subjectId: pendingProvider.id,
+      },
+    );
+    expect(auditService.record).not.toHaveBeenCalled();
   });
 
-  it('suspends a verified pilot provider and removes dispatch availability', async () => {
+  it('passes suspension audit metadata without a stale provider pre-read', async () => {
     const adminActor = { ...actor, role: 'admin' as const };
     const activeProvider = {
       id: 'PILOT-provider',
@@ -153,16 +162,20 @@ describe('AppController staff audit integration', () => {
       }
     ).suspendPilotProvider('Bearer staff-session', activeProvider.id);
 
-    expect(auditService.record).toHaveBeenCalledWith(adminActor, {
-      action: 'provider.pilot_suspended',
-      subjectType: 'provider',
-      subjectId: activeProvider.id,
-      oldState: { verificationStatus: 'verified', available: true },
-      newState: { verificationStatus: 'suspended', available: false },
-    });
+    expect(appService.getProviders).not.toHaveBeenCalled();
+    expect(appService.suspendPilotProvider).toHaveBeenCalledWith(
+      activeProvider.id,
+      {
+        staffId: adminActor.id,
+        action: 'provider.pilot_suspended',
+        subjectType: 'provider',
+        subjectId: activeProvider.id,
+      },
+    );
+    expect(auditService.record).not.toHaveBeenCalled();
   });
 
-  it('reactivates a suspended pilot provider only through the admin workflow', async () => {
+  it('passes reactivation audit metadata without a stale provider pre-read', async () => {
     const adminActor = { ...actor, role: 'admin' as const };
     const suspendedProvider = {
       id: 'PILOT-provider',
@@ -201,16 +214,20 @@ describe('AppController staff audit integration', () => {
       }
     ).reactivatePilotProvider('Bearer staff-session', suspendedProvider.id);
 
-    expect(auditService.record).toHaveBeenCalledWith(adminActor, {
-      action: 'provider.pilot_reactivated',
-      subjectType: 'provider',
-      subjectId: suspendedProvider.id,
-      oldState: { verificationStatus: 'suspended', available: false },
-      newState: { verificationStatus: 'verified', available: true },
-    });
+    expect(appService.getProviders).not.toHaveBeenCalled();
+    expect(appService.reactivatePilotProvider).toHaveBeenCalledWith(
+      suspendedProvider.id,
+      {
+        staffId: adminActor.id,
+        action: 'provider.pilot_reactivated',
+        subjectType: 'provider',
+        subjectId: suspendedProvider.id,
+      },
+    );
+    expect(auditService.record).not.toHaveBeenCalled();
   });
 
-  it('records the old and new support ticket status for an authorized support agent', async () => {
+  it('passes support status audit metadata without a stale ticket pre-read', async () => {
     const supportActor = { ...actor, role: 'support_agent' as const };
     const appService = {
       getSupportTickets: jest
@@ -240,16 +257,21 @@ describe('AppController staff audit integration', () => {
       },
     );
 
-    expect(auditService.record).toHaveBeenCalledWith(supportActor, {
-      action: 'support_ticket.status_updated',
-      subjectType: 'support_ticket',
-      subjectId: 'SUP-1006',
-      oldState: { status: 'open' },
-      newState: { status: 'in_progress' },
-    });
+    expect(appService.getSupportTickets).not.toHaveBeenCalled();
+    expect(appService.updateSupportTicketStatus).toHaveBeenCalledWith(
+      'SUP-1006',
+      'in_progress',
+      {
+        staffId: supportActor.id,
+        action: 'support_ticket.status_updated',
+        subjectType: 'support_ticket',
+        subjectId: 'SUP-1006',
+      },
+    );
+    expect(auditService.record).not.toHaveBeenCalled();
   });
 
-  it('records the previous request state after an authorized provider assignment', async () => {
+  it('passes assignment audit metadata without a stale request pre-read', async () => {
     const appService = {
       getServiceRequests: jest
         .fn()
@@ -275,13 +297,18 @@ describe('AppController staff audit integration', () => {
       providerId: 'provider-2',
     });
 
-    expect(auditService.record).toHaveBeenCalledWith(actor, {
-      action: 'request.provider_assigned',
-      subjectType: 'service_request',
-      subjectId: 'MOE-1048',
-      oldState: { status: 'pending_dispatch', providerId: null },
-      newState: { status: 'assigned', providerId: 'provider-2' },
-    });
+    expect(appService.getServiceRequests).not.toHaveBeenCalled();
+    expect(appService.assignProvider).toHaveBeenCalledWith(
+      'MOE-1048',
+      'provider-2',
+      {
+        staffId: actor.id,
+        action: 'request.provider_assigned',
+        subjectType: 'service_request',
+        subjectId: 'MOE-1048',
+      },
+    );
+    expect(auditService.record).not.toHaveBeenCalled();
   });
 
   it('returns the lifecycle history for an authenticated customer request', async () => {
@@ -321,7 +348,7 @@ describe('AppController staff audit integration', () => {
     );
   });
 
-  it('records an authorized quote proposal in the staff audit trail', async () => {
+  it('passes quote audit metadata into the atomic command', async () => {
     const quote = {
       id: 'QTE-7',
       amountHalalas: 15_000,
@@ -355,12 +382,18 @@ describe('AppController staff audit integration', () => {
         scope: quote.scope,
       }),
     ).resolves.toEqual(quote);
-    expect(auditService.record).toHaveBeenCalledWith(actor, {
-      action: 'request.quote_proposed',
-      subjectType: 'service_request',
-      subjectId: 'MOE-1048',
-      newState: { quoteStatus: 'proposed', amountHalalas: 15_000 },
-    });
+    expect(appService.proposeQuote).toHaveBeenCalledWith(
+      'MOE-1048',
+      15_000,
+      quote.scope,
+      {
+        staffId: actor.id,
+        action: 'request.quote_proposed',
+        subjectType: 'service_request',
+        subjectId: 'MOE-1048',
+      },
+    );
+    expect(auditService.record).not.toHaveBeenCalled();
   });
 
   it('returns lifecycle history to an authorized dispatcher', async () => {
@@ -400,7 +433,7 @@ describe('AppController staff audit integration', () => {
     expect(appService.getServiceRequestEvents).toHaveBeenCalledWith('MOE-1048');
   });
 
-  it('records the old and new request status after an authorized update', async () => {
+  it('passes request status audit metadata without a stale pre-read', async () => {
     const appService = {
       getServiceRequests: jest
         .fn()
@@ -425,13 +458,18 @@ describe('AppController staff audit integration', () => {
       status: 'on_the_way',
     });
 
-    expect(auditService.record).toHaveBeenCalledWith(actor, {
-      action: 'request.status_updated',
-      subjectType: 'service_request',
-      subjectId: 'MOE-1048',
-      oldState: { status: 'assigned' },
-      newState: { status: 'on_the_way' },
-    });
+    expect(appService.getServiceRequests).not.toHaveBeenCalled();
+    expect(appService.updateStatus).toHaveBeenCalledWith(
+      'MOE-1048',
+      'on_the_way',
+      {
+        staffId: actor.id,
+        action: 'request.status_updated',
+        subjectType: 'service_request',
+        subjectId: 'MOE-1048',
+      },
+    );
+    expect(auditService.record).not.toHaveBeenCalled();
   });
 
   it('rejects invalid provider invitation input before the store and records the audit trail', async () => {
@@ -467,7 +505,7 @@ describe('AppController staff audit integration', () => {
     expect(appService.inviteProvidersToRequest).not.toHaveBeenCalled();
   });
 
-  it('records a provider invitation in the staff audit trail', async () => {
+  it('passes invitation audit metadata into the atomic command', async () => {
     const opportunity = {
       requestId: 'MOE-1048',
       serviceId: 'ac-cleaning',
@@ -503,15 +541,137 @@ describe('AppController staff audit integration', () => {
     expect(appService.inviteProvidersToRequest).toHaveBeenCalledWith(
       'MOE-1048',
       ['provider-1', 'provider-1'],
-    );
-    expect(auditService.record).toHaveBeenCalledWith(
-      actor,
-      expect.objectContaining({
+      {
+        staffId: actor.id,
         action: 'request.opportunities_invited',
+        subjectType: 'service_request',
         subjectId: 'MOE-1048',
-      }),
+      },
     );
+    expect(auditService.record).not.toHaveBeenCalled();
   });
+
+  it('passes audit metadata for access-code, opportunity, and cash commands', async () => {
+    const adminActor = { ...actor, role: 'admin' as const };
+    const collected = {
+      id: 'PAY-1001',
+      amountHalalas: 15_000,
+      currency: 'SAR',
+      method: 'cash_on_completion' as const,
+      status: 'cash_collected' as const,
+      createdAt: '2026-08-05T01:00:00.000Z',
+    };
+    const refunded = { ...collected, status: 'refunded' as const };
+    const appService = {
+      setPilotProviderAccessCode: jest.fn().mockResolvedValue(undefined),
+      closeProviderOpportunity: jest.fn().mockResolvedValue({ closed: true }),
+      collectCashPayment: jest.fn().mockResolvedValue(collected),
+      refundCashPayment: jest.fn().mockResolvedValue(refunded),
+    };
+    const staffAuthService = {
+      getCurrentStaff: jest.fn().mockResolvedValue(adminActor),
+    };
+    const auditService = { record: jest.fn().mockResolvedValue(undefined) };
+    const controller = new AppController(
+      appService as unknown as AppService,
+      staffAuthService as unknown as StaffAuthService,
+      auditService as unknown as StaffAuditService,
+      {} as CustomerAuthService,
+    );
+
+    await controller.setPilotProviderAccessCode(
+      'Bearer staff-session',
+      'PILOT-provider',
+      { accessCode: 'test-access-code-1234' },
+    );
+    await controller.closeProviderOpportunity(
+      'Bearer staff-session',
+      'MOE-1048',
+      'provider-1',
+    );
+    await controller.collectCashPayment('Bearer staff-session', 'MOE-1048');
+    await controller.refundCashPayment('Bearer staff-session', 'MOE-1048');
+
+    expect(appService.setPilotProviderAccessCode).toHaveBeenCalledWith(
+      'PILOT-provider',
+      'test-access-code-1234',
+      {
+        staffId: adminActor.id,
+        action: 'provider.access_code_rotated',
+        subjectType: 'provider',
+        subjectId: 'PILOT-provider',
+      },
+    );
+    expect(appService.closeProviderOpportunity).toHaveBeenCalledWith(
+      'MOE-1048',
+      'provider-1',
+      {
+        staffId: adminActor.id,
+        action: 'request.opportunity_closed',
+        subjectType: 'service_request',
+        subjectId: 'MOE-1048',
+      },
+    );
+    expect(appService.collectCashPayment).toHaveBeenCalledWith('MOE-1048', {
+      staffId: adminActor.id,
+      action: 'payment.cash_collected',
+      subjectType: 'service_request',
+      subjectId: 'MOE-1048',
+    });
+    expect(appService.refundCashPayment).toHaveBeenCalledWith('MOE-1048', {
+      staffId: adminActor.id,
+      action: 'payment.cash_refunded',
+      subjectType: 'service_request',
+      subjectId: 'MOE-1048',
+    });
+    expect(auditService.record).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [
+      'verifyPilotProvider',
+      'verifyPilotProvider',
+      'Pending pilot provider not found',
+    ],
+    [
+      'suspendPilotProvider',
+      'suspendPilotProvider',
+      'Verified pilot provider not found',
+    ],
+    [
+      'reactivatePilotProvider',
+      'reactivatePilotProvider',
+      'Suspended pilot provider not found',
+    ],
+  ] as const)(
+    'preserves 404 mapping for the %s lifecycle precondition',
+    async (controllerMethod, serviceMethod, message) => {
+      const adminActor = { ...actor, role: 'admin' as const };
+      const appService = {
+        [serviceMethod]: jest.fn().mockRejectedValue(new Error(message)),
+      };
+      const controller = new AppController(
+        appService as unknown as AppService,
+        {
+          getCurrentStaff: jest.fn().mockResolvedValue(adminActor),
+        } as unknown as StaffAuthService,
+        {} as StaffAuditService,
+        {} as CustomerAuthService,
+      );
+
+      let thrown: unknown;
+      try {
+        await controller[controllerMethod](
+          'Bearer staff-session',
+          'PILOT-provider',
+        );
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(NotFoundException);
+      expect((thrown as NotFoundException).message).toBe(message);
+    },
+  );
 
   it('returns a generic 404 for every provider quote withdrawal failure', async () => {
     const appService = {
