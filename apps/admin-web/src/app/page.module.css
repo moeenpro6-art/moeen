@@ -838,3 +838,263 @@
     grid-template-columns: 1fr;
   }
 }
+
+/* Hybrid operations table: compact desktop rows with expandable operational detail. */
+.operationsTable {
+  gap: 0;
+  overflow: hidden;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  box-shadow: 0 4px 14px rgba(15, 23, 42, 0.025);
+}
+
+.operationsTable > .loadError,
+.operationsTable > .empty {
+  margin: 16px;
+}
+
+.tableHeader,
+.requestSummary {
+  display: grid;
+  grid-template-columns: minmax(180px, 1.35fr) minmax(150px, 1fr) minmax(150px, 1fr) minmax(126px, 0.82fr) minmax(125px, 0.76fr);
+  gap: 18px;
+  align-items: center;
+}
+
+.tableHeader {
+  min-height: 45px;
+  padding: 0 20px;
+  color: #64748b;
+  background: #f8fafc;
+  border-bottom: 1px solid var(--line);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.requestRow {
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+
+.requestRow:last-child {
+  border-bottom: 0;
+}
+
+.requestRow:hover {
+  background: #fcfefd;
+}
+
+.requestSummary {
+  min-height: 78px;
+  padding: 14px 20px;
+}
+
+.requestCell {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+  color: #475569;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.requestCell > span:not(.cellLabel):not(.status) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.requestPrimary strong {
+  overflow: hidden;
+  color: #1e3a4b;
+  font-size: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.requestPrimary .jobId {
+  margin-bottom: 1px;
+}
+
+.cellLabel {
+  display: none;
+  color: #94a3b8;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.requestActions {
+  display: flex;
+  justify-content: flex-start;
+  align-items: center;
+  min-width: 0;
+}
+
+.rating {
+  display: inline-flex;
+  align-items: center;
+  padding: 7px 9px;
+  color: #8a5a00;
+  background: #fff8dc;
+  border: 1px solid #f3dfa5;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.requestDetails {
+  border-top: 1px solid transparent;
+}
+
+.requestDetails[open] {
+  background: #fbfdfd;
+  border-top-color: #dbe7e8;
+}
+
+.requestDetails summary {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  align-items: center;
+  min-height: 42px;
+  padding: 10px 20px;
+  color: var(--teal);
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 800;
+  list-style: none;
+}
+
+.requestDetails summary::-webkit-details-marker {
+  display: none;
+}
+
+.requestDetails summary::after {
+  content: '⌄';
+  color: #0f766e;
+  font-size: 19px;
+  line-height: 1;
+  transition: transform 160ms ease;
+}
+
+.requestDetails[open] summary::after {
+  transform: rotate(180deg);
+}
+
+.detailsHint {
+  margin-inline-start: auto;
+  color: #94a3b8;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.requestDetailsPanel {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(225px, 1fr));
+  gap: 12px;
+  padding: 4px 20px 20px;
+  border-top: 1px solid #edf2f4;
+}
+
+.requestDetailsPanel > .assignment,
+.requestDetailsPanel > .quoteForm,
+.requestDetailsPanel > .assignmentBlock,
+.requestDetailsPanel > .marketplaceNote,
+.requestDetailsPanel > .history {
+  align-self: start;
+}
+
+.requestDetailsPanel > .assignment,
+.requestDetailsPanel > .quoteForm,
+.requestDetailsPanel > .assignmentBlock,
+.requestDetailsPanel > .marketplaceNote {
+  min-height: 100%;
+}
+
+.requestDetailsPanel > .quoteForm {
+  grid-template-columns: minmax(110px, 0.55fr) minmax(150px, 1fr) auto;
+  min-width: 0;
+}
+
+@media (max-width: 820px) {
+  .operationsTable {
+    overflow: visible;
+    background: transparent;
+    border: 0;
+    box-shadow: none;
+  }
+
+  .tableHeader {
+    display: none;
+  }
+
+  .operationsTable > .loadError,
+  .operationsTable > .empty {
+    margin: 0;
+  }
+
+  .operationsTable {
+    display: grid;
+    gap: 10px;
+  }
+
+  .requestRow {
+    overflow: hidden;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+  }
+
+  .requestSummary {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 14px 16px;
+    min-height: 0;
+    padding: 16px;
+  }
+
+  .requestCell {
+    font-size: 13px;
+  }
+
+  .requestCell > span:not(.cellLabel):not(.status),
+  .requestPrimary strong {
+    overflow: visible;
+    text-overflow: clip;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .cellLabel {
+    display: block;
+  }
+
+  .requestActions {
+    align-items: flex-end;
+  }
+
+  .requestDetails summary {
+    min-height: 46px;
+    padding: 11px 16px;
+  }
+
+  .requestDetailsPanel {
+    grid-template-columns: 1fr;
+    padding: 4px 16px 16px;
+  }
+}
+
+@media (max-width: 460px) {
+  .requestSummary {
+    grid-template-columns: 1fr;
+  }
+
+  .requestDetails summary {
+    align-items: flex-start;
+  }
+
+  .detailsHint {
+    display: none;
+  }
+}

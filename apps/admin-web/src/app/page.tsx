@@ -629,7 +629,14 @@ export default async function Home({ searchParams }: HomeProps) {
             </div>
             <span className={styles.liveIndicator}>بيانات مباشرة من النظام</span>
           </div>
-          <div className={styles.table}>
+          <div className={`${styles.table} ${styles.operationsTable}`}>
+            <div className={styles.tableHeader} aria-hidden="true">
+              <span>الطلب</span>
+              <span>الموقع</span>
+              <span>مقدم الخدمة</span>
+              <span>الحالة</span>
+              <span>التقييم</span>
+            </div>
             {!jobsResult.ok && (
               <div className={styles.loadError} role="alert">
                 تعذر تحميل الطلبات؛ لا تظهر البيانات حاليًا. أعد المحاولة بعد
@@ -654,16 +661,42 @@ export default async function Home({ searchParams }: HomeProps) {
                     provider.specialties.includes(job.serviceId),
                 );
                 return (
-                <article className={styles.job} key={job.id}>
-                  <div><span className={styles.jobId}>{job.id}</span><strong>{job.service}</strong></div>
-                  <span>{job.area}</span>
-                  <span>{job.provider}</span>
-                  <span className={`${styles.status} ${requestStatusTone(job.status)}`}>
-                    {job.status}
-                  </span>
-                  {job.rating !== undefined && (
-                    <span title={job.ratingComment ?? 'بدون تعليق'}>★ {job.rating}/5</span>
-                  )}
+                <article className={styles.requestRow} key={job.id}>
+                  <div className={styles.requestSummary}>
+                    <div className={`${styles.requestCell} ${styles.requestPrimary}`}>
+                      <span className={styles.cellLabel}>الطلب</span>
+                      <span className={styles.jobId}>{job.id}</span>
+                      <strong>{job.service}</strong>
+                    </div>
+                    <div className={styles.requestCell}>
+                      <span className={styles.cellLabel}>الموقع</span>
+                      <span>{job.area}</span>
+                    </div>
+                    <div className={styles.requestCell}>
+                      <span className={styles.cellLabel}>مقدم الخدمة</span>
+                      <span>{job.provider}</span>
+                    </div>
+                    <div className={styles.requestCell}>
+                      <span className={styles.cellLabel}>الحالة</span>
+                      <span className={`${styles.status} ${requestStatusTone(job.status)}`}>
+                        {job.status}
+                      </span>
+                    </div>
+                    <div className={styles.requestActions}>
+                      {job.rating !== undefined && (
+                        <span className={styles.rating} title={job.ratingComment ?? 'بدون تعليق'}>
+                          ★ {job.rating}/5
+                        </span>
+                      )}
+                    </div>
+                  </div>
+
+                  <details className={styles.requestDetails}>
+                    <summary>
+                      <span>التفاصيل والإجراءات</span>
+                      <span className={styles.detailsHint}>عرض السعر، الدفع، السوق والسجل</span>
+                    </summary>
+                    <div className={styles.requestDetailsPanel}>
                   {job.quote && (
                     <div className={styles.quote}>
                       <strong>
@@ -831,6 +864,8 @@ export default async function Home({ searchParams }: HomeProps) {
                       {job.status === 'قيد التنفيذ' && <button name="status" value="completed">إكمال الخدمة</button>}
                     </form>
                   )}
+                    </div>
+                  </details>
                 </article>
                 );
               })
