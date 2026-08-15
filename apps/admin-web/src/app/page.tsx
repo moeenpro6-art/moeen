@@ -154,6 +154,23 @@ const roleLabels = {
   support_agent: 'موظف الدعم',
 };
 
+function requestStatusTone(status: string): string {
+  if (status === 'بانتظار التوزيع') return styles.statusWarning;
+  if (['تم التعيين', 'الفني في الطريق', 'قيد التنفيذ'].includes(status)) {
+    return styles.statusInfo;
+  }
+  if (status === 'مكتمل') return styles.statusSuccess;
+  if (status === 'ملغي') return styles.statusDanger;
+  return styles.statusNeutral;
+}
+
+function supportStatusTone(status: string): string {
+  if (status === 'جديد') return styles.statusWarning;
+  if (status === 'قيد المتابعة') return styles.statusInfo;
+  if (status === 'تم الحل') return styles.statusSuccess;
+  return styles.statusNeutral;
+}
+
 function requireSuccessfulStaffAction(response: Response): void {
   const redirectPath = staffActionFailureRedirect(response.status);
   if (redirectPath) redirect(redirectPath);
@@ -427,40 +444,84 @@ export default async function Home({ searchParams }: HomeProps) {
   }
 
   return (
-    <main className={styles.page}>
-      <header className={styles.header}>
-        <div>
-          <p className={styles.eyebrow}>لوحة التشغيل · بريدة، القصيم</p>
-          <h1>معين</h1>
+    <div className={styles.shell}>
+      <aside className={styles.sidebar} aria-label="التنقل الرئيسي">
+        <div className={styles.brandBlock}>
+          <span className={styles.brandMark} aria-hidden="true">م</span>
+          <div>
+            <strong>معين</strong>
+            <span>لوحة العمليات</span>
+          </div>
         </div>
-        <div>
-          <p>{staff.displayName} · {roleLabels[staff.role]}</p>
+
+        <div className={styles.staffCard}>
+          <span className={styles.avatar} aria-hidden="true">
+            {staff.displayName.slice(0, 1)}
+          </span>
+          <div>
+            <strong>{staff.displayName}</strong>
+            <span>{roleLabels[staff.role]}</span>
+          </div>
+        </div>
+
+        <nav className={styles.navigation} aria-label="أقسام لوحة العمليات">
+          <a className={styles.activeNav} href="#overview">نظرة عامة</a>
+          {isAdmin && <a href="#providers">مقدمو الخدمة</a>}
+          {canDispatch && <a href="#requests">الطلبات</a>}
+          {canSupport && <a href="#support">الدعم</a>}
+          {canViewAudit && <a href="#audit">سجل التدقيق</a>}
+        </nav>
+
+        <div className={styles.sidebarFooter}>
+          <span>مركز عمليات بريدة</span>
           <form action={logoutStaffAction}>
-            <button type="submit">تسجيل الخروج</button>
+            <button className={styles.logoutButton} type="submit">
+              تسجيل الخروج
+            </button>
           </form>
         </div>
-      </header>
+      </aside>
 
-      <section className={styles.hero}>
-        <div>
-          <p className={styles.eyebrow}>نظرة اليوم</p>
-          <h2>شغّل كل طلب بثقة ووضوح.</h2>
-        </div>
-        <p>تظهر لك فقط المهام المسموح بها وفق صلاحية حسابك.</p>
-        {error === 'forbidden' && (
-          <p className={styles.accessError} role="alert">
-            ليس لديك صلاحية لتنفيذ هذا الإجراء.
-          </p>
-        )}
-        {error === 'rotation' && (
-          <p className={styles.accessError} role="alert">
-            تعذر حفظ/تدوير رمز الوصول. جرّب رمزًا جديدًا غير مستخدم، ثم أعد
-            المحاولة.
-          </p>
-        )}
-      </section>
+      <main className={styles.page}>
+        <header className={styles.header}>
+          <div>
+            <p className={styles.eyebrow}>لوحة التشغيل · بريدة، القصيم</p>
+            <h1>صباح الخير، {staff.displayName}</h1>
+            <p className={styles.headerDescription}>
+              تابع سير الطلبات، التوزيع، ودعم العملاء من مساحة عمل واحدة.
+            </p>
+          </div>
+          <div className={styles.headerMeta}>
+            <span className={styles.liveIndicator}>النظام متصل</span>
+            <span className={styles.roleChip}>{roleLabels[staff.role]}</span>
+          </div>
+        </header>
 
-      <section className={styles.metrics} aria-label="مؤشرات التشغيل">
+        <section className={styles.hero} id="overview" aria-labelledby="overview-title">
+          <div>
+            <p className={styles.heroEyebrow}>ملخص اليوم</p>
+            <h2 id="overview-title">كل التفاصيل التشغيلية، بوضوح وسرعة.</h2>
+            <p>
+              تظهر لك المهام المسموح بها وفق صلاحية حسابك، مع مؤشرات مباشرة تساعدك على ترتيب الأولويات.
+            </p>
+          </div>
+          <div className={styles.heroAccent} aria-hidden="true">
+            <span>تشغيل</span>
+            <strong>مركّز</strong>
+          </div>
+          {error === 'forbidden' && (
+            <p className={styles.accessError} role="alert">
+              ليس لديك صلاحية لتنفيذ هذا الإجراء.
+            </p>
+          )}
+          {error === 'rotation' && (
+            <p className={styles.accessError} role="alert">
+              تعذر حفظ/تدوير رمز الوصول. جرّب رمزًا جديدًا غير مستخدم، ثم أعد المحاولة.
+            </p>
+          )}
+        </section>
+
+        <section className={styles.metrics} aria-label="مؤشرات التشغيل">
         {canDispatch && <article><span>الطلبات المستلمة</span><strong>{jobsResult.ok ? jobs.length : '—'}</strong></article>}
         {canDispatch && <article><span>بانتظار التوزيع</span><strong>{pendingCount === null ? '—' : pendingCount}</strong></article>}
         {canSupport && <article><span>طلبات الدعم المفتوحة</span><strong>{openSupportCount === null ? '—' : openSupportCount}</strong></article>}
@@ -468,7 +529,7 @@ export default async function Home({ searchParams }: HomeProps) {
       </section>
 
       {isAdmin && (
-        <section className={styles.tableSection}>
+        <section className={styles.tableSection} id="providers">
           <div className={styles.sectionTitle}>
             <div>
               <p className={styles.eyebrow}>تجربة بريدة المضبوطة</p>
@@ -501,7 +562,21 @@ export default async function Home({ searchParams }: HomeProps) {
                 <div><span className={styles.jobId}>{provider.id}</span><strong>{provider.name}</strong></div>
                 <span>{provider.serviceZone}</span>
                 <span>{provider.specialties.join(' · ')}</span>
-                <span className={styles.status}>{provider.verificationStatus === 'verified' ? 'معتمد وجاهز للتعيين' : provider.verificationStatus === 'pending' ? 'بانتظار الاعتماد' : 'موقوف'}</span>
+                <span
+                  className={`${styles.status} ${
+                    provider.verificationStatus === 'verified'
+                      ? styles.statusSuccess
+                      : provider.verificationStatus === 'pending'
+                        ? styles.statusWarning
+                        : styles.statusDanger
+                  }`}
+                >
+                  {provider.verificationStatus === 'verified'
+                    ? 'معتمد وجاهز للتعيين'
+                    : provider.verificationStatus === 'pending'
+                      ? 'بانتظار الاعتماد'
+                      : 'موقوف'}
+                </span>
                 {provider.verificationStatus === 'pending' && (
                   <form action={verifyPilotProvider} className={styles.assignment}>
                     <input name="providerId" type="hidden" value={provider.id} />
@@ -546,7 +621,7 @@ export default async function Home({ searchParams }: HomeProps) {
       )}
 
       {canDispatch && (
-        <section className={styles.tableSection}>
+        <section className={styles.tableSection} id="requests">
           <div className={styles.sectionTitle}>
             <div>
               <p className={styles.eyebrow}>التشغيل</p>
@@ -583,7 +658,9 @@ export default async function Home({ searchParams }: HomeProps) {
                   <div><span className={styles.jobId}>{job.id}</span><strong>{job.service}</strong></div>
                   <span>{job.area}</span>
                   <span>{job.provider}</span>
-                  <span className={styles.status}>{job.status}</span>
+                  <span className={`${styles.status} ${requestStatusTone(job.status)}`}>
+                    {job.status}
+                  </span>
                   {job.rating !== undefined && (
                     <span title={job.ratingComment ?? 'بدون تعليق'}>★ {job.rating}/5</span>
                   )}
@@ -763,7 +840,7 @@ export default async function Home({ searchParams }: HomeProps) {
       )}
 
       {canSupport && (
-        <section className={styles.tableSection}>
+        <section className={styles.tableSection} id="support">
           <div className={styles.sectionTitle}>
             <div>
               <p className={styles.eyebrow}>دعم العملاء</p>
@@ -786,7 +863,9 @@ export default async function Home({ searchParams }: HomeProps) {
                 <div><span className={styles.jobId}>{ticket.id}</span><strong>{ticket.category}</strong></div>
                 <span>الطلب: {ticket.requestId}</span>
                 <span>{ticket.comment}</span>
-                <span className={styles.status}>{ticket.status}</span>
+                <span className={`${styles.status} ${supportStatusTone(ticket.status)}`}>
+                  {ticket.status}
+                </span>
                 {ticket.status !== 'تم الحل' && (
                   <form action={updateSupportTicketStatus} className={styles.assignment}>
                     <input name="ticketId" type="hidden" value={ticket.id} />
@@ -802,7 +881,7 @@ export default async function Home({ searchParams }: HomeProps) {
       )}
 
       {canViewAudit && (
-        <section className={styles.tableSection}>
+        <section className={styles.tableSection} id="audit">
           <div className={styles.sectionTitle}>
             <div>
               <p className={styles.eyebrow}>الأمان والتدقيق</p>
@@ -832,6 +911,7 @@ export default async function Home({ searchParams }: HomeProps) {
           </div>
         </section>
       )}
-    </main>
+      </main>
+    </div>
   );
 }
