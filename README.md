@@ -39,14 +39,15 @@ MOEEN_INITIAL_ADMIN_PASSWORD=use-a-strong-local-password
 STAFF_SESSION_TTL_DAYS=7
 ```
 
-Then run:
+Then migrate the database and start the API:
 
 ```bash
 cd apps/api
+npm run migrate:dev
 npm run start:dev
 ```
 
-API runs at `http://localhost:3002`; categories are available at `http://localhost:3002/services`.
+The API repeats the same fail-closed migration check before it starts listening. A release artifact uses `npm run migrate` after `npm run build`. API runs at `http://localhost:3002`; categories are available at `http://localhost:3002/services`.
 
 ### Admin dashboard
 

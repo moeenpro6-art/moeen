@@ -10,12 +10,15 @@ pg_isready -h localhost -p 5433 -d moeen
 
 Do not connect project migrations or tests to the Odoo PostgreSQL service on port `5432`.
 
-Start the API:
+Run the versioned database migrations before starting a release or whenever a new migration is pulled. The API also runs this same fail-closed migration check before NestJS starts listening:
 
 ```bash
 cd apps/api
+npm run migrate:dev
 npm run start:dev
 ```
+
+Production artifacts use `npm run migrate` after `npm run build`. The runner takes a PostgreSQL advisory lock per database/schema, records successful versions in `moeen_schema_migrations`, verifies migration checksums, and leaves failed versions unrecorded. Never point this command at Odoo on port `5432`.
 
 Start the protected dashboard in a separate terminal:
 
