@@ -59,6 +59,36 @@ export type StaffAuditEvent = {
   createdAt: string;
 };
 
+/**
+ * Identity fields of a required staff audit record. The old/new state
+ * snapshots are intentionally NOT part of the spec: they are captured by the
+ * executing command inside its own transaction, so the audit always reflects
+ * authoritative in-transaction state (B5 invariant).
+ *
+ * `subjectId` is optional only for CREATE commands (e.g. pilot provider
+ * registration), where the subject row does not exist yet; the executing
+ * command resolves it from the row it creates inside the same transaction.
+ * Every update/transition command supplies it.
+ */
+export type StaffAuditSpec = {
+  staffId: string;
+  action: string;
+  subjectType: string;
+  subjectId?: string;
+};
+
+/**
+ * Single source of truth for the STF-<n> external staff id -> staff_users
+ * BIGSERIAL id mapping. Shared by StaffAuthRepository and by the audited
+ * domain commands that insert staff_audit_events rows inside their own
+ * transaction (B5 atomic audit).
+ */
+export function toStaffDatabaseId(staffId: string): number {
+  const match = /^STF-(\d+)$/.exec(staffId);
+  if (!match) throw new Error('Invalid staff id');
+  return Number(match[1]) - 1000;
+}
+
 @Injectable()
 export class StaffAuthRepository
   implements StaffAuthStore, OnModuleInit, OnModuleDestroy
@@ -458,9 +488,7 @@ export class StaffAuthRepository
   }
 
   private toDatabaseId(staffId: string): number {
-    const match = /^STF-(\d+)$/.exec(staffId);
-    if (!match) throw new Error('Invalid staff id');
-    return Number(match[1]) - 1000;
+    return toStaffDatabaseId(staffId);
   }
 
   private toPrincipal(row: StaffRow): StaffPrincipal {

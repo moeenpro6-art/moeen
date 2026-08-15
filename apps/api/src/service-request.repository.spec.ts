@@ -236,6 +236,193 @@ describe('ServiceRequestRepository', () => {
     expect(assigned.assignedProvider?.id).toBe(provider.id);
   });
 
+  it('commits a provider verification and its authoritative audit snapshots together', async () => {
+    const staff = await staffAuthRepository.createStaff({
+      email: `b5-provider-${randomUUID()}@example.test`,
+      displayName: 'مدير تدقيق B5',
+      role: 'admin',
+      passwordHash: 'test-only-not-authenticated',
+    });
+    const provider = await repository.createPilotProvider({
+      name: `مقدم تدقيق ${randomUUID().slice(0, 8)}`,
+      specialties: ['ac-cleaning'],
+      serviceZone: 'بريدة',
+    });
+    const probe = new Pool({
+      connectionString: resolveDatabaseConnectionString(),
+    });
+    try {
+      // Deliberately establish a value that no stale controller projection
+      // supplies. The audit must read it from the locked row in the command's
+      // own transaction.
+      await probe.query('UPDATE providers SET available = TRUE WHERE id = $1', [
+        provider.id,
+      ]);
+
+      await expect(
+        repository.updatePilotProviderVerification(
+          provider.id,
+          'verified',
+          {
+            staffId: staff.id,
+            action: 'provider.pilot_verified.b5',
+            subjectType: 'provider',
+            subjectId: provider.id,
+          },
+          'pending',
+        ),
+      ).resolves.toMatchObject({
+        verificationStatus: 'verified',
+        available: true,
+      });
+
+      const audit = (
+        await staffAuthRepository.listAuditEvents({ subjectId: provider.id })
+      ).find((event) => event.action === 'provider.pilot_verified.b5');
+      expect(audit).toMatchObject({
+        actor: { id: staff.id },
+        subjectType: 'provider',
+        subjectId: provider.id,
+        oldState: { verificationStatus: 'pending', available: true },
+        newState: { verificationStatus: 'verified', available: true },
+      });
+    } finally {
+      await probe.end();
+    }
+  });
+
+  it('commits manual assignment, marketplace reconciliation, and its audit together', async () => {
+    const staff = await staffAuthRepository.createStaff({
+      email: `b5-assignment-${randomUUID()}@example.test`,
+      displayName: 'مشغل تدقيق B5',
+      role: 'dispatcher',
+      passwordHash: 'test-only-not-authenticated',
+    });
+    const uniqueServiceId = `b5-assignment-${randomUUID()}`;
+    const { request, customerId } = await createPendingRequest(uniqueServiceId);
+    const quotedA = await createVerifiedProvider([uniqueServiceId]);
+    const quotedB = await createVerifiedProvider([uniqueServiceId]);
+    const manual = await createVerifiedProvider([uniqueServiceId]);
+    await repository.inviteProvidersToRequest(request.id, [
+      quotedA.id,
+      quotedB.id,
+    ]);
+    await repository.submitProviderQuote(
+      request.id,
+      quotedA.id,
+      15_000,
+      'عرض أ',
+    );
+    await repository.submitProviderQuote(
+      request.id,
+      quotedB.id,
+      12_000,
+      'عرض ب',
+    );
+
+    const assigned = await repository.assignProvider(request.id, manual.id, {
+      staffId: staff.id,
+      action: 'request.provider_assigned.b5',
+      subjectType: 'service_request',
+      subjectId: request.id,
+    });
+
+    expect(assigned).toMatchObject({
+      status: 'assigned',
+      assignedProvider: { id: manual.id },
+    });
+    const customerView = await repository.findByCustomerId(customerId);
+    expect(
+      customerView
+        .find((item) => item.id === request.id)
+        ?.quotes?.map((quote) => quote.status),
+    ).toEqual(['rejected', 'rejected']);
+    await expect(
+      repository.listProviderOpportunities(quotedA.id),
+    ).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          requestId: request.id,
+          opportunityStatus: 'closed',
+        }),
+      ]),
+    );
+    const audit = (
+      await staffAuthRepository.listAuditEvents({ subjectId: request.id })
+    ).find((event) => event.action === 'request.provider_assigned.b5');
+    expect(audit).toMatchObject({
+      actor: { id: staff.id },
+      oldState: { status: 'pending_dispatch', providerId: null },
+      newState: { status: 'assigned', providerId: manual.id },
+    });
+  });
+
+  it('rolls back manual assignment when the in-transaction audit insert fails', async () => {
+    const uniqueServiceId = `b5-rollback-${randomUUID()}`;
+    const { request } = await createPendingRequest(uniqueServiceId);
+    const provider = await createVerifiedProvider([uniqueServiceId]);
+
+    await expect(
+      repository.assignProvider(request.id, provider.id, {
+        // Well-formed external id, but no corresponding staff_users FK row.
+        staffId: 'STF-999999999',
+        action: 'request.provider_assigned.rollback.b5',
+        subjectType: 'service_request',
+        subjectId: request.id,
+      }),
+    ).rejects.toMatchObject({ code: '23503' });
+
+    const unchanged = (await repository.findAll()).find(
+      (item) => item.id === request.id,
+    );
+    expect(unchanged).toMatchObject({ status: 'pending_dispatch' });
+    expect(unchanged?.assignedProvider).toBeUndefined();
+    expect(
+      (
+        await staffAuthRepository.listAuditEvents({ subjectId: request.id })
+      ).some(
+        (event) => event.action === 'request.provider_assigned.rollback.b5',
+      ),
+    ).toBe(false);
+  });
+
+  it('does not audit a provider invitation when duplicate and ineligible inputs insert no opportunities', async () => {
+    const staff = await staffAuthRepository.createStaff({
+      email: `b5-invite-noop-${randomUUID()}@example.test`,
+      displayName: 'مشغل دعوات B5',
+      role: 'dispatcher',
+      passwordHash: 'test-only-not-authenticated',
+    });
+    const uniqueServiceId = `b5-invite-noop-${randomUUID()}`;
+    const { request } = await createPendingRequest(uniqueServiceId);
+    const alreadyInvited = await createVerifiedProvider([uniqueServiceId]);
+    const ineligible = await repository.createPilotProvider({
+      name: `مقدم معلق ${randomUUID().slice(0, 8)}`,
+      specialties: [uniqueServiceId],
+      serviceZone: 'بريدة',
+    });
+    await repository.inviteProvidersToRequest(request.id, [alreadyInvited.id]);
+
+    await expect(
+      repository.inviteProvidersToRequest(
+        request.id,
+        [alreadyInvited.id, ineligible.id],
+        {
+          staffId: staff.id,
+          action: 'request.providers_invited.noop.b5',
+          subjectType: 'service_request',
+          subjectId: request.id,
+        },
+      ),
+    ).resolves.toEqual([]);
+
+    expect(
+      (
+        await staffAuthRepository.listAuditEvents({ subjectId: request.id })
+      ).some((event) => event.action === 'request.providers_invited.noop.b5'),
+    ).toBe(false);
+  });
+
   it('blocks an approved pilot provider from an incompatible service category', async () => {
     const customer = await repository.upsertCustomer('+966500123458');
     const request = await repository.create(
@@ -914,6 +1101,131 @@ describe('ServiceRequestRepository', () => {
     );
   });
 
+  it('audits cash collection with authoritative locked payment states and canonical identity', async () => {
+    const staff = await staffAuthRepository.createStaff({
+      email: `b5-collect-${randomUUID()}@example.test`,
+      displayName: 'محصل نقدي B5',
+      role: 'dispatcher',
+      passwordHash: 'test-only-not-authenticated',
+    });
+    const { request, payment } = await createCompletedCashDueRequest();
+
+    const collected = await repository.collectCashPayment(request.id, {
+      staffId: staff.id,
+      action: 'payment.cash_collected.state.b5',
+      subjectType: 'service_request',
+      subjectId: request.id,
+    });
+
+    expect(collected).toMatchObject({
+      id: payment.id,
+      status: 'cash_collected',
+    });
+    const audit = (
+      await staffAuthRepository.listAuditEvents({ subjectId: request.id })
+    ).find((event) => event.action === 'payment.cash_collected.state.b5');
+    expect(audit).toMatchObject({
+      oldState: {
+        paymentId: payment.id,
+        method: 'cash_on_completion',
+        status: 'cash_due',
+        amountHalalas: 15_000,
+        currency: 'SAR',
+      },
+      newState: {
+        paymentId: payment.id,
+        method: 'cash_on_completion',
+        status: 'cash_collected',
+        amountHalalas: 15_000,
+        currency: 'SAR',
+      },
+    });
+    expect(audit?.oldState?.paymentId).toMatch(/^PAY-\d+$/);
+    expect(audit?.newState?.paymentId).toMatch(/^PAY-\d+$/);
+  });
+
+  it('rolls back cash collection when its audit insert fails', async () => {
+    const { request, customerId, payment } =
+      await createCompletedCashDueRequest();
+
+    await expect(
+      repository.collectCashPayment(request.id, {
+        staffId: 'STF-999999999',
+        action: 'payment.cash_collected.rollback.b5',
+        subjectType: 'service_request',
+        subjectId: request.id,
+      }),
+    ).rejects.toMatchObject({ code: '23503' });
+
+    expect(
+      (await repository.findByCustomerId(customerId)).find(
+        (item) => item.id === request.id,
+      )?.payment,
+    ).toMatchObject({ id: payment.id, status: 'cash_due' });
+  });
+
+  it('audits cash refund with authoritative locked payment states and canonical identity', async () => {
+    const staff = await staffAuthRepository.createStaff({
+      email: `b5-refund-${randomUUID()}@example.test`,
+      displayName: 'مسؤول استرداد B5',
+      role: 'admin',
+      passwordHash: 'test-only-not-authenticated',
+    });
+    const { request, payment } = await createCompletedCashDueRequest();
+    await repository.collectCashPayment(request.id);
+
+    const refunded = await repository.refundCashPayment(request.id, {
+      staffId: staff.id,
+      action: 'payment.cash_refunded.state.b5',
+      subjectType: 'service_request',
+      subjectId: request.id,
+    });
+
+    expect(refunded).toMatchObject({ id: payment.id, status: 'refunded' });
+    const audit = (
+      await staffAuthRepository.listAuditEvents({ subjectId: request.id })
+    ).find((event) => event.action === 'payment.cash_refunded.state.b5');
+    expect(audit).toMatchObject({
+      oldState: {
+        paymentId: payment.id,
+        method: 'cash_on_completion',
+        status: 'cash_collected',
+        amountHalalas: 15_000,
+        currency: 'SAR',
+      },
+      newState: {
+        paymentId: payment.id,
+        method: 'cash_on_completion',
+        status: 'refunded',
+        amountHalalas: 15_000,
+        currency: 'SAR',
+      },
+    });
+    expect(audit?.oldState?.paymentId).toMatch(/^PAY-\d+$/);
+    expect(audit?.newState?.paymentId).toMatch(/^PAY-\d+$/);
+  });
+
+  it('rolls back cash refund when its audit insert fails', async () => {
+    const { request, customerId, payment } =
+      await createCompletedCashDueRequest();
+    await repository.collectCashPayment(request.id);
+
+    await expect(
+      repository.refundCashPayment(request.id, {
+        staffId: 'STF-999999999',
+        action: 'payment.cash_refunded.rollback.b5',
+        subjectType: 'service_request',
+        subjectId: request.id,
+      }),
+    ).rejects.toMatchObject({ code: '23503' });
+
+    expect(
+      (await repository.findByCustomerId(customerId)).find(
+        (item) => item.id === request.id,
+      )?.payment,
+    ).toMatchObject({ id: payment.id, status: 'cash_collected' });
+  });
+
   it('persists a request under the owning customer and returns it only for that customer', async () => {
     const customer = await repository.upsertCustomer('+966****0111');
     const created = await repository.create(
@@ -1024,6 +1336,27 @@ describe('ServiceRequestRepository', () => {
     return repository.updatePilotProviderVerification(provider.id, 'verified');
   }
 
+  async function createCompletedCashDueRequest() {
+    const uniqueServiceId = `b5-cash-${randomUUID()}`;
+    const { request, customerId } = await createPendingRequest(uniqueServiceId);
+    const provider = await createVerifiedProvider([uniqueServiceId]);
+    await repository.assignProvider(request.id, provider.id);
+    await repository.updateStatus(request.id, 'on_the_way');
+    const quote = await repository.proposeQuote(
+      request.id,
+      15_000,
+      'خدمة نقدية لاختبار تدقيق B5',
+    );
+    await repository.decideQuote(request.id, customerId, quote.id, 'approved');
+    await repository.updateStatus(request.id, 'in_progress');
+    await repository.updateStatus(request.id, 'completed');
+    const payment = (await repository.findByCustomerId(customerId)).find(
+      (item) => item.id === request.id,
+    )?.payment;
+    if (!payment) throw new Error('B5 cash payment fixture was not created');
+    return { request, customerId, payment };
+  }
+
   async function createPendingRequest(serviceId = 'ac-cleaning') {
     const customer = await repository.upsertCustomer(
       `+9665${String(Math.floor(10_000_000 + Math.random() * 89_999_999))}`,
@@ -1055,6 +1388,36 @@ describe('ServiceRequestRepository', () => {
       await probe.end();
     }
   }
+
+  it('does not audit an opportunity close when no row is mutated', async () => {
+    const staff = await staffAuthRepository.createStaff({
+      email: `b5-close-noop-${randomUUID()}@example.test`,
+      displayName: 'مشغل إغلاق B5',
+      role: 'dispatcher',
+      passwordHash: 'test-only-not-authenticated',
+    });
+    const uniqueServiceId = `b5-close-noop-${randomUUID()}`;
+    const { request } = await createPendingRequest(uniqueServiceId);
+    const neverInvited = await createVerifiedProvider([uniqueServiceId]);
+
+    await expect(
+      repository.closeProviderOpportunity(request.id, neverInvited.id, {
+        staffId: staff.id,
+        action: 'request.provider_opportunity_closed.noop.b5',
+        subjectType: 'service_request',
+        subjectId: request.id,
+      }),
+    ).resolves.toEqual({ closed: false });
+
+    expect(
+      (
+        await staffAuthRepository.listAuditEvents({ subjectId: request.id })
+      ).some(
+        (event) =>
+          event.action === 'request.provider_opportunity_closed.noop.b5',
+      ),
+    ).toBe(false);
+  });
 
   it('invites only eligible providers and records opportunity events', async () => {
     // Request is created first so the providers below do not exist at

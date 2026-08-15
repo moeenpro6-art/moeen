@@ -227,17 +227,11 @@ export class AppController {
     @Body() input: import('./app.service').CreatePilotProvider,
   ): Promise<import('./app.service').PilotProvider> {
     const actor = await this.requireStaff(authorization, ['admin']);
-    const provider = await this.appService.registerPilotProvider(input);
-    await this.staffAuditService.record(actor, {
+    return this.appService.registerPilotProvider(input, {
+      staffId: actor.id,
       action: 'provider.pilot_registered',
       subjectType: 'provider',
-      subjectId: provider.id,
-      newState: {
-        verificationStatus: provider.verificationStatus,
-        serviceZone: provider.serviceZone,
-      },
     });
-    return provider;
   }
 
   @Post('providers/:providerId/access-code')
@@ -251,6 +245,12 @@ export class AppController {
       await this.appService.setPilotProviderAccessCode(
         providerId,
         body.accessCode ?? '',
+        {
+          staffId: actor.id,
+          action: 'provider.access_code_rotated',
+          subjectType: 'provider',
+          subjectId: providerId,
+        },
       );
     } catch (error) {
       if (
@@ -273,12 +273,6 @@ export class AppController {
       }
       throw error;
     }
-    await this.staffAuditService.record(actor, {
-      action: 'provider.access_code_rotated',
-      subjectType: 'provider',
-      subjectId: providerId,
-      newState: { accessCodeRotated: true },
-    });
   }
 
   @Patch('providers/:providerId/verification')
@@ -287,27 +281,26 @@ export class AppController {
     @Param('providerId') providerId: string,
   ): Promise<import('./app.service').PilotProvider> {
     const actor = await this.requireStaff(authorization, ['admin']);
-    const currentProvider = (await this.appService.getProviders()).find(
-      (provider) => provider.id === providerId,
-    );
-    if (!currentProvider || currentProvider.verificationStatus !== 'pending') {
-      throw new NotFoundException('Pending pilot provider not found');
+    try {
+      return await this.appService.verifyPilotProvider(providerId, {
+        staffId: actor.id,
+        action: 'provider.pilot_verified',
+        subjectType: 'provider',
+        subjectId: providerId,
+      });
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        [
+          'Invalid pilot provider',
+          'Pilot provider not found',
+          'Pending pilot provider not found',
+        ].includes(error.message)
+      ) {
+        throw new NotFoundException('Pending pilot provider not found');
+      }
+      throw error;
     }
-    const provider = await this.appService.verifyPilotProvider(providerId);
-    await this.staffAuditService.record(actor, {
-      action: 'provider.pilot_verified',
-      subjectType: 'provider',
-      subjectId: provider.id,
-      oldState: {
-        verificationStatus: currentProvider.verificationStatus,
-        available: currentProvider.available,
-      },
-      newState: {
-        verificationStatus: provider.verificationStatus,
-        available: provider.available,
-      },
-    });
-    return provider;
   }
 
   @Patch('providers/:providerId/suspension')
@@ -316,27 +309,26 @@ export class AppController {
     @Param('providerId') providerId: string,
   ): Promise<import('./app.service').PilotProvider> {
     const actor = await this.requireStaff(authorization, ['admin']);
-    const currentProvider = (await this.appService.getProviders()).find(
-      (provider) => provider.id === providerId,
-    );
-    if (!currentProvider || currentProvider.verificationStatus !== 'verified') {
-      throw new NotFoundException('Verified pilot provider not found');
+    try {
+      return await this.appService.suspendPilotProvider(providerId, {
+        staffId: actor.id,
+        action: 'provider.pilot_suspended',
+        subjectType: 'provider',
+        subjectId: providerId,
+      });
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        [
+          'Invalid pilot provider',
+          'Pilot provider not found',
+          'Verified pilot provider not found',
+        ].includes(error.message)
+      ) {
+        throw new NotFoundException('Verified pilot provider not found');
+      }
+      throw error;
     }
-    const provider = await this.appService.suspendPilotProvider(providerId);
-    await this.staffAuditService.record(actor, {
-      action: 'provider.pilot_suspended',
-      subjectType: 'provider',
-      subjectId: provider.id,
-      oldState: {
-        verificationStatus: currentProvider.verificationStatus,
-        available: currentProvider.available,
-      },
-      newState: {
-        verificationStatus: provider.verificationStatus,
-        available: provider.available,
-      },
-    });
-    return provider;
   }
 
   @Patch('providers/:providerId/reactivation')
@@ -345,30 +337,26 @@ export class AppController {
     @Param('providerId') providerId: string,
   ): Promise<import('./app.service').PilotProvider> {
     const actor = await this.requireStaff(authorization, ['admin']);
-    const currentProvider = (await this.appService.getProviders()).find(
-      (provider) => provider.id === providerId,
-    );
-    if (
-      !currentProvider ||
-      currentProvider.verificationStatus !== 'suspended'
-    ) {
-      throw new NotFoundException('Suspended pilot provider not found');
+    try {
+      return await this.appService.reactivatePilotProvider(providerId, {
+        staffId: actor.id,
+        action: 'provider.pilot_reactivated',
+        subjectType: 'provider',
+        subjectId: providerId,
+      });
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        [
+          'Invalid pilot provider',
+          'Pilot provider not found',
+          'Suspended pilot provider not found',
+        ].includes(error.message)
+      ) {
+        throw new NotFoundException('Suspended pilot provider not found');
+      }
+      throw error;
     }
-    const provider = await this.appService.reactivatePilotProvider(providerId);
-    await this.staffAuditService.record(actor, {
-      action: 'provider.pilot_reactivated',
-      subjectType: 'provider',
-      subjectId: provider.id,
-      oldState: {
-        verificationStatus: currentProvider.verificationStatus,
-        available: currentProvider.available,
-      },
-      newState: {
-        verificationStatus: provider.verificationStatus,
-        available: provider.available,
-      },
-    });
-    return provider;
   }
 
   @Post('service-requests')
@@ -550,21 +538,12 @@ export class AppController {
       'admin',
       'support_agent',
     ]);
-    const previous = (await this.appService.getSupportTickets()).find(
-      (ticket) => ticket.id === ticketId,
-    );
-    const updated = await this.appService.updateSupportTicketStatus(
-      ticketId,
-      body.status,
-    );
-    await this.staffAuditService.record(actor, {
+    return this.appService.updateSupportTicketStatus(ticketId, body.status, {
+      staffId: actor.id,
       action: 'support_ticket.status_updated',
       subjectType: 'support_ticket',
       subjectId: ticketId,
-      oldState: { status: previous?.status ?? null },
-      newState: { status: updated.status },
     });
-    return updated;
   }
 
   @Patch('service-requests/:id/assignment')
@@ -577,27 +556,12 @@ export class AppController {
       'admin',
       'dispatcher',
     ]);
-    const previous = (await this.appService.getServiceRequests()).find(
-      (request) => request.id === requestId,
-    );
-    const updated = await this.appService.assignProvider(
-      requestId,
-      body.providerId,
-    );
-    await this.staffAuditService.record(actor, {
+    return this.appService.assignProvider(requestId, body.providerId, {
+      staffId: actor.id,
       action: 'request.provider_assigned',
       subjectType: 'service_request',
       subjectId: requestId,
-      oldState: {
-        status: previous?.status ?? null,
-        providerId: previous?.assignedProvider?.id ?? null,
-      },
-      newState: {
-        status: updated.status,
-        providerId: updated.assignedProvider?.id ?? body.providerId,
-      },
     });
-    return updated;
   }
 
   @Post('service-requests/:id/quotes')
@@ -615,16 +579,13 @@ export class AppController {
         requestId,
         body.amountHalalas,
         body.scope,
-      );
-      await this.staffAuditService.record(actor, {
-        action: 'request.quote_proposed',
-        subjectType: 'service_request',
-        subjectId: requestId,
-        newState: {
-          quoteStatus: quote.status,
-          amountHalalas: quote.amountHalalas,
+        {
+          staffId: actor.id,
+          action: 'request.quote_proposed',
+          subjectType: 'service_request',
+          subjectId: requestId,
         },
-      });
+      );
       return quote;
     } catch (error) {
       if (
@@ -652,15 +613,13 @@ export class AppController {
     const created = await this.appService.inviteProvidersToRequest(
       requestId,
       providerIds,
-    );
-    await this.staffAuditService.record(actor, {
-      action: 'request.opportunities_invited',
-      subjectType: 'service_request',
-      subjectId: requestId,
-      newState: {
-        invitedProviderIds: created.map((item) => item.requestId),
+      {
+        staffId: actor.id,
+        action: 'request.opportunities_invited',
+        subjectType: 'service_request',
+        subjectId: requestId,
       },
-    });
+    );
     return created;
   }
 
@@ -677,13 +636,13 @@ export class AppController {
     const result = await this.appService.closeProviderOpportunity(
       requestId,
       providerId,
+      {
+        staffId: actor.id,
+        action: 'request.opportunity_closed',
+        subjectType: 'service_request',
+        subjectId: requestId,
+      },
     );
-    await this.staffAuditService.record(actor, {
-      action: 'request.opportunity_closed',
-      subjectType: 'service_request',
-      subjectId: requestId,
-      newState: { providerId, closed: result.closed },
-    });
     return result;
   }
 
@@ -697,20 +656,12 @@ export class AppController {
       'dispatcher',
     ]);
     try {
-      const payment = await this.appService.collectCashPayment(requestId);
-      await this.staffAuditService.record(actor, {
+      return await this.appService.collectCashPayment(requestId, {
+        staffId: actor.id,
         action: 'payment.cash_collected',
         subjectType: 'service_request',
         subjectId: requestId,
-        newState: {
-          paymentId: payment.id,
-          method: payment.method,
-          status: payment.status,
-          amountHalalas: payment.amountHalalas,
-          currency: payment.currency,
-        },
       });
-      return payment;
     } catch (error) {
       if (
         error instanceof Error &&
@@ -733,20 +684,12 @@ export class AppController {
   ): Promise<import('./app.service').ServicePayment> {
     const actor = await this.requireStaff(authorization, ['admin']);
     try {
-      const payment = await this.appService.refundCashPayment(requestId);
-      await this.staffAuditService.record(actor, {
+      return await this.appService.refundCashPayment(requestId, {
+        staffId: actor.id,
         action: 'payment.cash_refunded',
         subjectType: 'service_request',
         subjectId: requestId,
-        newState: {
-          paymentId: payment.id,
-          method: payment.method,
-          status: payment.status,
-          amountHalalas: payment.amountHalalas,
-          currency: payment.currency,
-        },
       });
-      return payment;
     } catch (error) {
       if (
         error instanceof Error &&
@@ -771,12 +714,13 @@ export class AppController {
       'admin',
       'dispatcher',
     ]);
-    const previous = (await this.appService.getServiceRequests()).find(
-      (request) => request.id === requestId,
-    );
-    let updated: ServiceRequest;
     try {
-      updated = await this.appService.updateStatus(requestId, body.status);
+      return await this.appService.updateStatus(requestId, body.status, {
+        staffId: actor.id,
+        action: 'request.status_updated',
+        subjectType: 'service_request',
+        subjectId: requestId,
+      });
     } catch (error) {
       if (
         error instanceof Error &&
@@ -788,14 +732,6 @@ export class AppController {
       }
       throw error;
     }
-    await this.staffAuditService.record(actor, {
-      action: 'request.status_updated',
-      subjectType: 'service_request',
-      subjectId: requestId,
-      oldState: { status: previous?.status ?? null },
-      newState: { status: updated.status },
-    });
-    return updated;
   }
 
   @Get('service-requests/:id/history')

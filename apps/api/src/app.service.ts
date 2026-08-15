@@ -5,6 +5,7 @@ import {
   UnauthorizedException,
 } from '@nestjs/common';
 import { ServiceRequestRepository } from './service-request.repository';
+import type { StaffAuditSpec } from './staff-auth.repository';
 
 export type LaunchService = {
   id: string;
@@ -235,7 +236,11 @@ export interface ServiceRequestStore {
   findProviderBySession(
     token: string,
   ): Promise<ProviderAppPrincipal | undefined>;
-  setProviderAccessCode(providerId: string, accessCode: string): Promise<void>;
+  setProviderAccessCode(
+    providerId: string,
+    accessCode: string,
+    audit?: StaffAuditSpec,
+  ): Promise<void>;
   createProviderSession(providerId: string, token: string): Promise<void>;
   revokeProviderSession(token: string): Promise<void>;
   updateProviderAvailability(
@@ -243,18 +248,25 @@ export interface ServiceRequestStore {
     available: boolean,
   ): Promise<ProviderAppPrincipal>;
   findProviders(): Promise<PilotProvider[]>;
-  createPilotProvider(input: CreatePilotProvider): Promise<PilotProvider>;
+  createPilotProvider(
+    input: CreatePilotProvider,
+    audit?: StaffAuditSpec,
+  ): Promise<PilotProvider>;
   updatePilotProviderVerification(
     providerId: string,
     verificationStatus: PilotProviderVerificationStatus,
+    audit?: StaffAuditSpec,
+    expectedCurrentStatus?: PilotProviderVerificationStatus,
   ): Promise<PilotProvider>;
   assignProvider(
     requestId: string,
     providerId: string,
+    audit?: StaffAuditSpec,
   ): Promise<ServiceRequest>;
   updateStatus(
     requestId: string,
     status: ServiceRequestStatus,
+    audit?: StaffAuditSpec,
   ): Promise<ServiceRequest>;
   updateStatusForProvider(
     requestId: string,
@@ -268,6 +280,7 @@ export interface ServiceRequestStore {
     requestId: string,
     amountHalalas: number,
     scope: string,
+    audit?: StaffAuditSpec,
   ): Promise<ServiceQuote>;
   decideQuote(
     requestId: string,
@@ -278,6 +291,7 @@ export interface ServiceRequestStore {
   inviteProvidersToRequest(
     requestId: string,
     providerIds: string[],
+    audit?: StaffAuditSpec,
   ): Promise<ProviderOpportunity[]>;
   listProviderOpportunities(providerId: string): Promise<ProviderOpportunity[]>;
   submitProviderQuote(
@@ -293,9 +307,16 @@ export interface ServiceRequestStore {
   closeProviderOpportunity(
     requestId: string,
     providerId: string,
+    audit?: StaffAuditSpec,
   ): Promise<{ closed: boolean }>;
-  collectCashPayment(requestId: string): Promise<ServicePayment>;
-  refundCashPayment(requestId: string): Promise<ServicePayment>;
+  collectCashPayment(
+    requestId: string,
+    audit?: StaffAuditSpec,
+  ): Promise<ServicePayment>;
+  refundCashPayment(
+    requestId: string,
+    audit?: StaffAuditSpec,
+  ): Promise<ServicePayment>;
   rateRequest(
     requestId: string,
     customerId: string,
@@ -312,6 +333,7 @@ export interface ServiceRequestStore {
   updateSupportTicketStatus(
     ticketId: string,
     status: SupportTicketStatus,
+    audit?: StaffAuditSpec,
   ): Promise<SupportTicket>;
   upsertCustomer(phone: string): Promise<Customer>;
   createCustomerSession(customerId: string, token: string): Promise<void>;
@@ -433,11 +455,16 @@ export class AppService {
   updateSupportTicketStatus(
     ticketId: string,
     status: SupportTicketStatus,
+    audit?: StaffAuditSpec,
   ): Promise<SupportTicket> {
     if (!['in_progress', 'resolved'].includes(status)) {
       throw new Error('Unsupported support ticket status');
     }
-    return this.serviceRequestStore.updateSupportTicketStatus(ticketId, status);
+    return this.serviceRequestStore.updateSupportTicketStatus(
+      ticketId,
+      status,
+      audit,
+    );
   }
 
   getProviders(): Promise<PilotProvider[]> {
@@ -446,6 +473,7 @@ export class AppService {
 
   async registerPilotProvider(
     input: CreatePilotProvider,
+    audit?: StaffAuditSpec,
   ): Promise<PilotProvider> {
     const name = input.name.trim();
     const serviceZone = input.serviceZone.trim();
@@ -458,46 +486,65 @@ export class AppService {
     if (name.length < 2 || serviceZone.length < 2 || specialties.length === 0) {
       throw new Error('Invalid pilot provider');
     }
-    return this.serviceRequestStore.createPilotProvider({
-      name,
-      specialties,
-      serviceZone,
-    });
+    return this.serviceRequestStore.createPilotProvider(
+      {
+        name,
+        specialties,
+        serviceZone,
+      },
+      audit,
+    );
   }
 
-  async verifyPilotProvider(providerId: string): Promise<PilotProvider> {
+  async verifyPilotProvider(
+    providerId: string,
+    audit?: StaffAuditSpec,
+  ): Promise<PilotProvider> {
     if (!providerId.startsWith('PILOT-')) {
       throw new Error('Invalid pilot provider');
     }
     return this.serviceRequestStore.updatePilotProviderVerification(
       providerId,
       'verified',
+      audit,
+      'pending',
     );
   }
 
-  async suspendPilotProvider(providerId: string): Promise<PilotProvider> {
+  async suspendPilotProvider(
+    providerId: string,
+    audit?: StaffAuditSpec,
+  ): Promise<PilotProvider> {
     if (!providerId.startsWith('PILOT-')) {
       throw new Error('Invalid pilot provider');
     }
     return this.serviceRequestStore.updatePilotProviderVerification(
       providerId,
       'suspended',
+      audit,
+      'verified',
     );
   }
 
-  async reactivatePilotProvider(providerId: string): Promise<PilotProvider> {
+  async reactivatePilotProvider(
+    providerId: string,
+    audit?: StaffAuditSpec,
+  ): Promise<PilotProvider> {
     if (!providerId.startsWith('PILOT-')) {
       throw new Error('Invalid pilot provider');
     }
     return this.serviceRequestStore.updatePilotProviderVerification(
       providerId,
       'verified',
+      audit,
+      'suspended',
     );
   }
 
   async setPilotProviderAccessCode(
     providerId: string,
     accessCode: string,
+    audit?: StaffAuditSpec,
   ): Promise<void> {
     if (providerId.trim().length < 3 || accessCode.trim().length < 16) {
       throw new Error('Invalid provider access code');
@@ -505,6 +552,7 @@ export class AppService {
     await this.serviceRequestStore.setProviderAccessCode(
       providerId,
       accessCode.trim(),
+      audit,
     );
   }
 
@@ -530,21 +578,28 @@ export class AppService {
   assignProvider(
     requestId: string,
     providerId: string,
+    audit?: StaffAuditSpec,
   ): Promise<ServiceRequest> {
-    return this.serviceRequestStore.assignProvider(requestId, providerId);
+    return this.serviceRequestStore.assignProvider(
+      requestId,
+      providerId,
+      audit,
+    );
   }
 
   updateStatus(
     requestId: string,
     status: ServiceRequestStatus,
+    audit?: StaffAuditSpec,
   ): Promise<ServiceRequest> {
-    return this.serviceRequestStore.updateStatus(requestId, status);
+    return this.serviceRequestStore.updateStatus(requestId, status, audit);
   }
 
   async proposeQuote(
     requestId: string,
     amountHalalas: number,
     scope: string,
+    audit?: StaffAuditSpec,
   ): Promise<ServiceQuote> {
     const normalizedScope = scope.trim();
     if (
@@ -558,16 +613,19 @@ export class AppService {
       requestId,
       amountHalalas,
       normalizedScope,
+      audit,
     );
   }
 
   async inviteProvidersToRequest(
     requestId: string,
     providerIds: unknown,
+    audit?: StaffAuditSpec,
   ): Promise<ProviderOpportunity[]> {
     return this.serviceRequestStore.inviteProvidersToRequest(
       requestId,
       this.normalizeProviderInvitationIds(providerIds),
+      audit,
     );
   }
 
@@ -626,25 +684,33 @@ export class AppService {
   closeProviderOpportunity(
     requestId: string,
     providerId: string,
+    audit?: StaffAuditSpec,
   ): Promise<{ closed: boolean }> {
     return this.serviceRequestStore.closeProviderOpportunity(
       requestId,
       providerId,
+      audit,
     );
   }
 
-  async collectCashPayment(requestId: string): Promise<ServicePayment> {
+  async collectCashPayment(
+    requestId: string,
+    audit?: StaffAuditSpec,
+  ): Promise<ServicePayment> {
     if (!/^MOE-\d+$/.test(requestId)) {
       throw new Error('Invalid service request');
     }
-    return this.serviceRequestStore.collectCashPayment(requestId);
+    return this.serviceRequestStore.collectCashPayment(requestId, audit);
   }
 
-  async refundCashPayment(requestId: string): Promise<ServicePayment> {
+  async refundCashPayment(
+    requestId: string,
+    audit?: StaffAuditSpec,
+  ): Promise<ServicePayment> {
     if (!/^MOE-\d+$/.test(requestId)) {
       throw new Error('Invalid service request');
     }
-    return this.serviceRequestStore.refundCashPayment(requestId);
+    return this.serviceRequestStore.refundCashPayment(requestId, audit);
   }
 
   async decideMyQuote(

@@ -59,11 +59,14 @@ describe('AppService', () => {
         serviceZone: '  حي الصفراء، بريدة  ',
       }),
     ).resolves.toEqual(provider);
-    expect(store.createPilotProvider).toHaveBeenCalledWith({
-      name: 'فريق اختبار التبريد',
-      specialties: ['ac-cleaning'],
-      serviceZone: 'حي الصفراء، بريدة',
-    });
+    expect(store.createPilotProvider).toHaveBeenCalledWith(
+      {
+        name: 'فريق اختبار التبريد',
+        specialties: ['ac-cleaning'],
+        serviceZone: 'حي الصفراء، بريدة',
+      },
+      undefined,
+    );
   });
 
   it('allows an admin workflow to verify a pending pilot provider', async () => {
@@ -92,6 +95,8 @@ describe('AppService', () => {
     expect(store.updatePilotProviderVerification).toHaveBeenCalledWith(
       'PILOT-provider',
       'verified',
+      undefined,
+      'pending',
     );
   });
 
@@ -123,6 +128,8 @@ describe('AppService', () => {
     expect(store.updatePilotProviderVerification).toHaveBeenCalledWith(
       'PILOT-provider',
       'suspended',
+      undefined,
+      'verified',
     );
   });
 
@@ -154,6 +161,8 @@ describe('AppService', () => {
     expect(store.updatePilotProviderVerification).toHaveBeenCalledWith(
       'PILOT-provider',
       'verified',
+      undefined,
+      'suspended',
     );
   });
 
@@ -233,6 +242,7 @@ describe('AppService', () => {
       'MOE-1042',
       15_000,
       'إصلاح تسرب تحت المغسلة',
+      undefined,
     );
   });
 
@@ -371,10 +381,54 @@ describe('AppService', () => {
         'p2',
       ]),
     ).resolves.toEqual([]);
-    expect(store.inviteProvidersToRequest).toHaveBeenCalledWith('MOE-1042', [
-      'p1',
-      'p2',
-    ]);
+    expect(store.inviteProvidersToRequest).toHaveBeenCalledWith(
+      'MOE-1042',
+      ['p1', 'p2'],
+      undefined,
+    );
+  });
+
+  it('passes staff audit metadata through opportunity closure and cash operations', async () => {
+    const audit = {
+      staffId: 'STF-1001',
+      action: 'test.action',
+      subjectType: 'service_request',
+      subjectId: 'MOE-1042',
+    };
+    const closed = { closed: true };
+    const payment = {
+      id: 'PAY-1001',
+      amountHalalas: 15_000,
+      currency: 'SAR',
+      method: 'cash_on_completion' as const,
+      status: 'cash_collected' as const,
+      createdAt: '2026-08-05T01:00:00.000Z',
+    };
+    const refunded = { ...payment, status: 'refunded' as const };
+    const store = {
+      closeProviderOpportunity: jest.fn().mockResolvedValue(closed),
+      collectCashPayment: jest.fn().mockResolvedValue(payment),
+      refundCashPayment: jest.fn().mockResolvedValue(refunded),
+    };
+    const service = new AppService(store as never);
+
+    await expect(
+      service.closeProviderOpportunity('MOE-1042', 'provider-1', audit),
+    ).resolves.toEqual(closed);
+    await expect(
+      service.collectCashPayment('MOE-1042', audit),
+    ).resolves.toEqual(payment);
+    await expect(service.refundCashPayment('MOE-1042', audit)).resolves.toEqual(
+      refunded,
+    );
+
+    expect(store.closeProviderOpportunity).toHaveBeenCalledWith(
+      'MOE-1042',
+      'provider-1',
+      audit,
+    );
+    expect(store.collectCashPayment).toHaveBeenCalledWith('MOE-1042', audit);
+    expect(store.refundCashPayment).toHaveBeenCalledWith('MOE-1042', audit);
   });
 
   it('normalizes a provider quote before it is submitted', async () => {

@@ -33,6 +33,10 @@ import type {
   SupportTicket,
   SupportTicketStatus,
 } from './app.service';
+import {
+  toStaffDatabaseId,
+  type StaffAuditSpec,
+} from './staff-auth.repository';
 
 type ServiceRequestRow = {
   id: string;
@@ -188,6 +192,35 @@ export class ServiceRequestRepository
     } catch (rollbackError) {
       client.release(rollbackError as Error);
     }
+  }
+
+  /**
+   * Inserts a required staff audit record on the CALLER'S transaction client
+   * (B5 atomic audit). The spec carries only identity fields; oldState and
+   * newState are the authoritative in-transaction snapshots captured by the
+   * executing command. Any failure (including the staff_users FK check) makes
+   * the enclosing transaction roll back, so the domain mutation and its audit
+   * evidence commit or fail together.
+   */
+  private async insertStaffAuditEvent(
+    client: PoolClient,
+    spec: StaffAuditSpec,
+    oldState?: Record<string, unknown>,
+    newState?: Record<string, unknown>,
+  ): Promise<void> {
+    await client.query(
+      `INSERT INTO staff_audit_events
+        (staff_user_id, action, subject_type, subject_id, old_state, new_state)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [
+        toStaffDatabaseId(spec.staffId),
+        spec.action,
+        spec.subjectType,
+        spec.subjectId,
+        oldState ?? null,
+        newState ?? null,
+      ],
+    );
   }
 
   async onModuleInit(): Promise<void> {
@@ -970,6 +1003,7 @@ export class ServiceRequestRepository
   async setProviderAccessCode(
     providerId: string,
     accessCode: string,
+    audit?: StaffAuditSpec,
   ): Promise<void> {
     const accessCodeHash = await hashProviderAccessCode(accessCode);
     const lookupId = providerAccessCodeLookupId(accessCode);
@@ -1001,6 +1035,13 @@ export class ServiceRequestRepository
         'DELETE FROM provider_sessions WHERE provider_id = $1',
         [providerId],
       );
+      // The access code itself is a secret and is never written to the audit
+      // trail; only the rotation fact is recorded.
+      if (audit) {
+        await this.insertStaffAuditEvent(client, audit, undefined, {
+          accessCodeRotated: true,
+        });
+      }
       await client.query('COMMIT');
       client.release();
     } catch (error) {
@@ -1105,45 +1146,127 @@ export class ServiceRequestRepository
 
   async createPilotProvider(
     input: CreatePilotProvider,
+    audit?: StaffAuditSpec,
   ): Promise<PilotProvider> {
-    const result = await this.pool.query<PilotProviderRow>(
-      `INSERT INTO providers (
-         id, name, specialties, available, service_zone, verification_status
-       )
-       VALUES ($1, $2, $3, FALSE, $4, 'pending')
-       RETURNING id, name, specialties, available, service_zone, verification_status`,
-      [
-        `PILOT-${randomUUID()}`,
-        input.name,
-        input.specialties,
-        input.serviceZone,
-      ],
-    );
-    const row = result.rows[0];
-    if (!row) throw new Error('Pilot provider could not be created');
-    return this.toPilotProvider(row);
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await client.query<PilotProviderRow>(
+        `INSERT INTO providers (
+           id, name, specialties, available, service_zone, verification_status
+         )
+         VALUES ($1, $2, $3, FALSE, $4, 'pending')
+         RETURNING id, name, specialties, available, service_zone, verification_status`,
+        [
+          `PILOT-${randomUUID()}`,
+          input.name,
+          input.specialties,
+          input.serviceZone,
+        ],
+      );
+      const row = result.rows[0];
+      if (!row) throw new Error('Pilot provider could not be created');
+      if (audit) {
+        await this.insertStaffAuditEvent(
+          client,
+          // The subject row is created by this command, so the subject id is
+          // resolved from the created row inside the same transaction (the
+          // caller cannot know it beforehand).
+          { ...audit, subjectId: row.id },
+          undefined,
+          {
+            verificationStatus: row.verification_status,
+            serviceZone: row.service_zone,
+          },
+        );
+      }
+      await client.query('COMMIT');
+      client.release();
+      return this.toPilotProvider(row);
+    } catch (error) {
+      await this.rollbackAndRelease(client);
+      throw error;
+    }
   }
 
   async updatePilotProviderVerification(
     providerId: string,
     verificationStatus: PilotProviderVerificationStatus,
+    audit?: StaffAuditSpec,
+    expectedCurrentStatus?: PilotProviderVerificationStatus,
   ): Promise<PilotProvider> {
-    const result = await this.pool.query<PilotProviderRow>(
-      `UPDATE providers
-       SET verification_status = $2,
-           available = CASE WHEN $2 = 'verified' THEN TRUE ELSE FALSE END
-       WHERE id = $1
-       RETURNING id, name, specialties, available, service_zone, verification_status`,
-      [providerId, verificationStatus],
-    );
-    const row = result.rows[0];
-    if (!row) throw new Error('Pilot provider not found');
-    return this.toPilotProvider(row);
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      // Authoritative old state: locked read on the provider row, inside the
+      // same transaction that performs the mutation (B5 invariant).
+      const current = await client.query<{
+        verification_status: PilotProviderVerificationStatus;
+        available: boolean;
+      }>(
+        `SELECT verification_status, available
+         FROM providers
+         WHERE id = $1
+         FOR UPDATE`,
+        [providerId],
+      );
+      const currentRow = current.rows[0];
+      if (!currentRow) throw new Error('Pilot provider not found');
+      // The workflow precondition (verify only from pending, suspend only from
+      // verified, reactivate only from suspended) used to be a stale
+      // controller-side read. It is enforced here on the locked row so the
+      // transition gate is atomic with the mutation (B5 invariant).
+      if (
+        expectedCurrentStatus &&
+        currentRow.verification_status !== expectedCurrentStatus
+      ) {
+        const notFoundMessages: Record<
+          PilotProviderVerificationStatus,
+          string
+        > = {
+          pending: 'Pending pilot provider not found',
+          verified: 'Verified pilot provider not found',
+          suspended: 'Suspended pilot provider not found',
+        };
+        throw new Error(notFoundMessages[expectedCurrentStatus]);
+      }
+      const result = await client.query<PilotProviderRow>(
+        `UPDATE providers
+         SET verification_status = $2,
+             available = CASE WHEN $2 = 'verified' THEN TRUE ELSE FALSE END
+         WHERE id = $1
+         RETURNING id, name, specialties, available, service_zone, verification_status`,
+        [providerId, verificationStatus],
+      );
+      const row = result.rows[0];
+      if (!row) throw new Error('Pilot provider not found');
+      if (audit) {
+        await this.insertStaffAuditEvent(
+          client,
+          audit,
+          {
+            verificationStatus: currentRow.verification_status,
+            available: currentRow.available,
+          },
+          {
+            verificationStatus: row.verification_status,
+            available: row.available,
+          },
+        );
+      }
+      await client.query('COMMIT');
+      client.release();
+      return this.toPilotProvider(row);
+    } catch (error) {
+      await this.rollbackAndRelease(client);
+      throw error;
+    }
   }
 
   async assignProvider(
     requestId: string,
     providerId: string,
+    audit?: StaffAuditSpec,
   ): Promise<ServiceRequest> {
     const databaseId = this.toRequestDatabaseId(requestId);
     const client = await this.pool.connect();
@@ -1154,8 +1277,12 @@ export class ServiceRequestRepository
       // request-scoped transition. The eligibility check is revalidated on
       // the locked row, so a concurrent quote approval that commits first
       // makes this assignment fail instead of overwriting the winner.
-      const request = await client.query<{ status: ServiceRequest['status'] }>(
-        'SELECT status FROM service_requests WHERE id = $1 FOR UPDATE',
+      const request = await client.query<{
+        status: ServiceRequest['status'];
+        assigned_provider_id: string | null;
+      }>(
+        `SELECT status, assigned_provider_id
+         FROM service_requests WHERE id = $1 FOR UPDATE`,
         [databaseId],
       );
       const currentStatus = request.rows[0]?.status;
@@ -1220,6 +1347,20 @@ export class ServiceRequestRepository
          VALUES ($1, 'provider_assigned', 'assigned')`,
         [databaseId],
       );
+      if (audit) {
+        await this.insertStaffAuditEvent(
+          client,
+          audit,
+          {
+            status: currentStatus,
+            providerId: request.rows[0]?.assigned_provider_id ?? null,
+          },
+          {
+            status: row.status,
+            providerId: row.assigned_provider_id ?? providerId,
+          },
+        );
+      }
       await client.query('COMMIT');
       client.release();
       return this.toServiceRequest(row);
@@ -1232,6 +1373,7 @@ export class ServiceRequestRepository
   async updateStatus(
     requestId: string,
     status: ServiceRequest['status'],
+    audit?: StaffAuditSpec,
   ): Promise<ServiceRequest> {
     const allowedPreviousStatuses: Record<string, ServiceRequest['status'][]> =
       {
@@ -1276,6 +1418,14 @@ export class ServiceRequestRepository
          VALUES ($1, 'status_updated', $2)`,
         [databaseId, status],
       );
+      if (audit) {
+        await this.insertStaffAuditEvent(
+          client,
+          audit,
+          { status: currentStatus },
+          { status },
+        );
+      }
       await client.query('COMMIT');
       client.release();
     } catch (error) {
@@ -1364,6 +1514,7 @@ export class ServiceRequestRepository
     requestId: string,
     amountHalalas: number,
     scope: string,
+    audit?: StaffAuditSpec,
   ): Promise<ServiceQuote> {
     const databaseId = this.toRequestDatabaseId(requestId);
     const client = await this.pool.connect();
@@ -1409,6 +1560,12 @@ export class ServiceRequestRepository
          VALUES ($1, 'quote_proposed', $2)`,
         [databaseId, status],
       );
+      if (audit) {
+        await this.insertStaffAuditEvent(client, audit, undefined, {
+          quoteStatus: quote.status,
+          amountHalalas: quote.amount_halalas,
+        });
+      }
       await client.query('COMMIT');
       client.release();
       return this.toServiceQuote(quote);
@@ -1595,6 +1752,7 @@ export class ServiceRequestRepository
   async inviteProvidersToRequest(
     requestId: string,
     providerIds: string[],
+    audit?: StaffAuditSpec,
   ): Promise<ProviderOpportunity[]> {
     const databaseId = this.toRequestDatabaseId(requestId);
     const uniqueProviderIds = [...new Set(providerIds)];
@@ -1644,6 +1802,7 @@ export class ServiceRequestRepository
         [uniqueProviderIds, currentRequest.service_id],
       );
       const created: ProviderOpportunity[] = [];
+      const insertedProviderIds: string[] = [];
       for (const providerId of eligible.rows.map((row) => row.provider_id)) {
         const inserted = await client.query<{ id: string }>(
           `INSERT INTO request_provider_opportunities (service_request_id, provider_id)
@@ -1664,7 +1823,19 @@ export class ServiceRequestRepository
             timing: currentRequest.timing,
             opportunityStatus: 'invited',
           });
+          insertedProviderIds.push(providerId);
         }
+      }
+      if (audit && insertedProviderIds.length > 0) {
+        await this.insertStaffAuditEvent(
+          client,
+          audit,
+          undefined,
+          // The REAL provider ids actually inserted (previously the audit
+          // recorded the request id for every entry — a projection bug that
+          // the in-transaction rewrite fixes).
+          { invitedProviderIds: insertedProviderIds },
+        );
       }
       await client.query('COMMIT');
       client.release();
@@ -1887,6 +2058,7 @@ export class ServiceRequestRepository
   async closeProviderOpportunity(
     requestId: string,
     providerId: string,
+    audit?: StaffAuditSpec,
   ): Promise<{ closed: boolean }> {
     const databaseId = this.toRequestDatabaseId(requestId);
     const client = await this.pool.connect();
@@ -1914,6 +2086,12 @@ export class ServiceRequestRepository
           [databaseId, requestStatus],
         );
       }
+      if (audit && closed) {
+        await this.insertStaffAuditEvent(client, audit, undefined, {
+          providerId,
+          closed,
+        });
+      }
       await client.query('COMMIT');
       client.release();
       return { closed };
@@ -1923,7 +2101,10 @@ export class ServiceRequestRepository
     }
   }
 
-  async collectCashPayment(requestId: string): Promise<ServicePayment> {
+  async collectCashPayment(
+    requestId: string,
+    audit?: StaffAuditSpec,
+  ): Promise<ServicePayment> {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
@@ -1956,6 +2137,14 @@ export class ServiceRequestRepository
       );
       const row = collected.rows[0];
       if (!row) throw new Error('Cash payment could not be collected');
+      if (audit) {
+        await this.insertStaffAuditEvent(
+          client,
+          audit,
+          this.toPaymentAuditState(currentPayment),
+          this.toPaymentAuditState(row),
+        );
+      }
       await client.query('COMMIT');
       client.release();
       return this.toServicePayment(row);
@@ -1965,7 +2154,10 @@ export class ServiceRequestRepository
     }
   }
 
-  async refundCashPayment(requestId: string): Promise<ServicePayment> {
+  async refundCashPayment(
+    requestId: string,
+    audit?: StaffAuditSpec,
+  ): Promise<ServicePayment> {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
@@ -1990,6 +2182,14 @@ export class ServiceRequestRepository
       );
       const row = refunded.rows[0];
       if (!row) throw new Error('Cash payment could not be refunded');
+      if (audit) {
+        await this.insertStaffAuditEvent(
+          client,
+          audit,
+          this.toPaymentAuditState(currentPayment),
+          this.toPaymentAuditState(row),
+        );
+      }
       await client.query('COMMIT');
       client.release();
       return this.toServicePayment(row);
@@ -2062,15 +2262,42 @@ export class ServiceRequestRepository
   async updateSupportTicketStatus(
     ticketId: string,
     status: SupportTicketStatus,
+    audit?: StaffAuditSpec,
   ): Promise<SupportTicket> {
-    const result = await this.pool.query<SupportTicketRow>(
-      `UPDATE support_tickets SET status = $1
-       WHERE id = $2
-       RETURNING id, service_request_id, category, comment, status, created_at`,
-      [status, this.toSupportTicketDatabaseId(ticketId)],
-    );
-    if (!result.rows[0]) throw new Error('Support ticket not found');
-    return this.toSupportTicket(result.rows[0]);
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      // Authoritative old state: locked read inside the same transaction that
+      // performs the mutation (B5 invariant).
+      const current = await client.query<{ status: SupportTicketStatus }>(
+        'SELECT status FROM support_tickets WHERE id = $1 FOR UPDATE',
+        [this.toSupportTicketDatabaseId(ticketId)],
+      );
+      const currentStatus = current.rows[0]?.status;
+      if (!currentStatus) throw new Error('Support ticket not found');
+      const result = await client.query<SupportTicketRow>(
+        `UPDATE support_tickets SET status = $1
+         WHERE id = $2
+         RETURNING id, service_request_id, category, comment, status, created_at`,
+        [status, this.toSupportTicketDatabaseId(ticketId)],
+      );
+      const row = result.rows[0];
+      if (!row) throw new Error('Support ticket not found');
+      if (audit) {
+        await this.insertStaffAuditEvent(
+          client,
+          audit,
+          { status: currentStatus },
+          { status: row.status },
+        );
+      }
+      await client.query('COMMIT');
+      client.release();
+      return this.toSupportTicket(row);
+    } catch (error) {
+      await this.rollbackAndRelease(client);
+      throw error;
+    }
   }
 
   async reserveOtpRequest(
@@ -2329,6 +2556,16 @@ export class ServiceRequestRepository
       createdAt: row.created_at.toISOString(),
       collectedAt: row.collected_at?.toISOString(),
       refundedAt: row.refunded_at?.toISOString(),
+    };
+  }
+
+  private toPaymentAuditState(row: ServicePaymentRow): Record<string, unknown> {
+    return {
+      paymentId: `PAY-${row.id}`,
+      method: row.method,
+      status: row.status,
+      amountHalalas: row.amount_halalas,
+      currency: row.currency,
     };
   }
 
