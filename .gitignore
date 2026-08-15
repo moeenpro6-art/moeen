@@ -25,4 +25,5 @@ build/
 *.jks
 *.log
 *.sql
+!apps/api/src/database/migrations/*.sql
 uploads/
