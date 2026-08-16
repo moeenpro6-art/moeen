@@ -2,10 +2,21 @@ import {
   Inject,
   Injectable,
   BadRequestException,
+  ConflictException,
   UnauthorizedException,
 } from '@nestjs/common';
 import { ServiceRequestRepository } from './service-request.repository';
 import type { StaffAuditSpec } from './staff-auth.repository';
+import {
+  RequestImageCreateOrchestrator,
+  RequestSubmissionConflictError,
+  RequestSubmissionReplayError,
+  type CreateServiceRequestMultipartResult,
+  type ServiceRequestMultipartInput,
+  type ServiceRequestSubmissionContext,
+} from './request-image-create.contracts';
+import { RequestImageService } from './request-image.service';
+import type { StoredRequestImage } from './request-image.types';
 
 export type LaunchService = {
   id: string;
@@ -224,7 +235,14 @@ export interface ServiceRequestStore {
   create(
     input: CreateServiceRequest,
     customerId: string,
+    submission?: ServiceRequestSubmissionContext,
+    images?: StoredRequestImage[],
   ): Promise<ServiceRequest>;
+  findRequestByCustomerSubmission(
+    customerId: string,
+    clientSubmissionId: string,
+  ): Promise<ServiceRequest | undefined>;
+  findRequestImages(requestId: string): Promise<StoredRequestImage[]>;
   findAll(): Promise<ServiceRequest[]>;
   findByCustomerId(customerId: string): Promise<ServiceRequest[]>;
   findByProviderId(providerId: string): Promise<ServiceRequest[]>;
@@ -344,6 +362,7 @@ export class AppService {
   constructor(
     @Inject(ServiceRequestRepository)
     private readonly serviceRequestStore: ServiceRequestStore,
+    private readonly requestImageService: RequestImageService = undefined as never,
   ) {}
 
   getHello(): string {
@@ -365,10 +384,152 @@ export class AppService {
     input: unknown,
   ): Promise<ServiceRequest> {
     const customer = await this.getCustomerForToken(token);
+    return this.createAuthenticatedServiceRequest(customer, input);
+  }
+
+  createAuthenticatedServiceRequest(
+    customer: Customer,
+    input: unknown,
+  ): Promise<ServiceRequest> {
     return this.serviceRequestStore.create(
       validateCreateServiceRequest(input),
       customer.id,
     );
+  }
+
+  /**
+   * Multipart creation with server-canonicalized images and atomic
+   * idempotency (Slice 2B).
+   *
+   * Execution order is fixed so that an authenticated-only flow is followed
+   * by strictly bounded, compensating work:
+   *
+   *   1. canonicalize (decode/resize/hash — rejects invalid or excessive
+   *      inputs before anything is uploaded),
+   *   2. compute the content fingerprint over normalized fields + ordered
+   *      image hashes,
+   *   3. upload canonical objects to storage (best-effort compensation
+   *      deletes them if anything later fails),
+   *   4. persist the request row, submission idempotency columns and image
+   *      metadata in ONE repository transaction (unique-index arbitration:
+   *      same key + same content replays the committed request, same key +
+   *      different content conflicts with 409),
+   *   5. sign and return image DTOs only for committed images.
+   *
+   * Uploaded objects are compensated only while the repository transaction
+   * has NOT committed (database failure, idempotency conflict, replay of an
+   * already-committed submission): in those paths create() rejects and every
+   * object uploaded for that attempt is an orphan. Once the create
+   * transaction resolves it has committed and the committed rows own the
+   * uploaded objects — a later failure (such as signing DTOs) propagates
+   * without deleting them, and a retry with the same Idempotency-Key
+   * replays the committed request and image metadata.
+   */
+  async createAuthenticatedServiceRequestWithImages(
+    customer: Customer,
+    input: ServiceRequestMultipartInput,
+    idempotencyKey: string,
+  ): Promise<ServiceRequest & CreateServiceRequestMultipartResult> {
+    const orchestrator = this.imageOrchestrator();
+    const canonical = await orchestrator.canonicalizeImages(input.images);
+    const createInput = {
+      serviceId: input.serviceId,
+      address: input.address,
+      details: input.details,
+      timing: input.timing,
+    };
+    const submissionFingerprint = await orchestrator.computeFingerprint(
+      createInput,
+      canonical,
+    );
+    const uploadedKeys = await orchestrator.uploadImages(canonical);
+    const submission: ServiceRequestSubmissionContext = {
+      clientSubmissionId: idempotencyKey,
+      submissionFingerprint,
+    };
+    const storedImages = canonical.map((image) => ({
+      id: image.id,
+      storageKey: image.storageKey,
+      mimeType: image.mimeType,
+      byteSize: image.byteSize,
+      contentSha256: image.contentSha256,
+      sortOrder: image.sortOrder,
+    }));
+    let created: ServiceRequest;
+    try {
+      created = await this.serviceRequestStore.create(
+        createInput,
+        customer.id,
+        submission,
+        storedImages,
+      );
+    } catch (error) {
+      // Compensation is scoped to the un-committed create attempt only:
+      // create() rejects before COMMIT on database failure, idempotency
+      // conflict, and replay paths, so every object uploaded for THIS
+      // attempt is an orphan that must be removed. Objects owned by a
+      // committed (winner) request are never deleted here.
+      await this.compensateUploadedObjects(uploadedKeys);
+      if (error instanceof RequestSubmissionReplayError) {
+        const original =
+          await this.serviceRequestStore.findRequestByCustomerSubmission(
+            customer.id,
+            idempotencyKey,
+          );
+        if (!original) throw error;
+        const committedImages =
+          await this.serviceRequestStore.findRequestImages(original.id);
+        const images =
+          committedImages.length > 0
+            ? await orchestrator.toPublicDtos(committedImages)
+            : undefined;
+        return images ? { ...original, images } : original;
+      }
+      if (error instanceof RequestSubmissionConflictError) {
+        throw new ConflictException(error.message);
+      }
+      throw error;
+    }
+
+    // create() resolved: the transaction COMMITTED and the committed
+    // service_request_images rows now own the uploaded objects. Failures
+    // after this point (e.g. DTO signing) propagate normally WITHOUT
+    // compensation, and a retry with the same Idempotency-Key replays the
+    // committed request and image metadata.
+    const images =
+      canonical.length > 0
+        ? await orchestrator.toPublicDtos(storedImages)
+        : undefined;
+    return images ? { ...created, images } : created;
+  }
+
+  /**
+   * Test-friendly access to the image orchestration pipeline. The
+   * orchestrator is stateless; a fresh instance is built per call from the
+   * injected {@link RequestImageService} so no state can leak between
+   * requests.
+   */
+  private imageOrchestrator(): RequestImageCreateOrchestrator {
+    return new RequestImageCreateOrchestrator(
+      (files) => this.requestImageService.canonicalize(files),
+      (request, orderedContentHashes) =>
+        this.requestImageService.fingerprint(request, orderedContentHashes),
+      (images) => this.requestImageService.upload(images),
+      (keys) => this.requestImageService.deleteBestEffort(keys),
+      (images) => this.requestImageService.toDtos(images),
+    );
+  }
+
+  /**
+   * Compensating object cleanup that can never mask the primary failure.
+   */
+  private async compensateUploadedObjects(keys: string[]): Promise<void> {
+    if (keys.length === 0) return;
+    try {
+      await this.imageOrchestrator().cleanUploadedObjects(keys);
+    } catch {
+      // A scheduled reconciliation command reports exact unreferenced keys.
+    }
   }
 
   getServiceRequests(): Promise<ServiceRequest[]> {

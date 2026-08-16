@@ -37,6 +37,7 @@ const CURRENT_TABLES = [
   'service_payments',
   'service_quotes',
   'service_request_events',
+  'service_request_images',
   'service_requests',
   'staff_audit_events',
   'staff_sessions',
@@ -110,6 +111,17 @@ describe('database migration discovery', () => {
     await expect(loadMigrations(directory)).rejects.toThrow(
       "First database migration must be version '0001'",
     );
+  });
+
+  it('ships the immutable service-request-images migration after the v1 baseline', async () => {
+    const migrations = await loadMigrations(defaultMigrationsDirectory());
+
+    expect(
+      migrations.map(({ version, filename }) => ({ version, filename })),
+    ).toEqual([
+      { version: '0001', filename: '0001_current_schema.sql' },
+      { version: '0002', filename: '0002_service_request_images.sql' },
+    ]);
   });
 });
 
@@ -202,12 +214,12 @@ describe('versioned PostgreSQL migrations', () => {
     await rootPool?.end();
   });
 
-  it('migrates empty and existing-current schemas idempotently and never records a failed migration', async () => {
+  it('migrates an empty schema through v1 and v2 and is then idempotent', async () => {
     const first = await runDatabaseMigrations(
       pool,
       defaultMigrationsDirectory(),
     );
-    expect(first).toEqual({ applied: ['0001'], baselined: [] });
+    expect(first).toEqual({ applied: ['0001', '0002'], baselined: [] });
 
     const tables = await pool.query<{ table_name: string }>(
       `SELECT table_name
@@ -226,58 +238,10 @@ describe('versioned PostgreSQL migrations', () => {
     );
     expect(second).toEqual({ applied: [], baselined: [] });
 
-    await pool.query('DROP TABLE moeen_schema_migrations');
-    const baseline = await runDatabaseMigrations(
-      pool,
-      defaultMigrationsDirectory(),
-    );
-    expect(baseline).toEqual({ applied: [], baselined: ['0001'] });
-    const recordedBaseline = await pool.query<{
-      version: string;
-      execution_mode: string;
-    }>(
-      'SELECT version, execution_mode FROM moeen_schema_migrations ORDER BY version',
-    );
-    expect(recordedBaseline.rows).toEqual([
-      { version: '0001', execution_mode: 'baselined' },
-    ]);
-
-    const failureDirectory = await mkdtemp(
-      join(tmpdir(), 'moeen-failing-migrations-'),
-    );
-    try {
-      const current = await loadMigrations(defaultMigrationsDirectory());
-      await writeFile(
-        join(failureDirectory, current[0].filename),
-        current[0].sql,
-      );
-      await writeFile(
-        join(failureDirectory, '0002_intentional_failure.sql'),
-        'CREATE TABLE must_rollback (id INTEGER); SELECT missing_column FROM missing_table;',
-      );
-
-      await expect(
-        runDatabaseMigrations(pool, failureDirectory),
-      ).rejects.toThrow();
-      const failedRecord = await pool.query<{ count: number }>(
-        `SELECT count(*)::int AS count
-           FROM moeen_schema_migrations
-          WHERE version = '0002'`,
-      );
-      expect(failedRecord.rows[0].count).toBe(0);
-      const rolledBackTable = await pool.query<{ relation: string | null }>(
-        'SELECT to_regclass($1)::text AS relation',
-        [`${schema}.must_rollback`],
-      );
-      expect(rolledBackTable.rows[0].relation).toBeNull();
-    } finally {
-      await rm(failureDirectory, { recursive: true, force: true });
-    }
-
     const history = await pool.query<{ version: string }>(
       'SELECT version FROM moeen_schema_migrations ORDER BY version',
     );
-    expect(history.rows).toEqual([{ version: '0001' }]);
+    expect(history.rows).toEqual([{ version: '0001' }, { version: '0002' }]);
 
     const historyRelation = `${quoteIdent(schema)}.${quoteIdent(
       'moeen_schema_migrations',
@@ -285,7 +249,158 @@ describe('versioned PostgreSQL migrations', () => {
     const historyCount = await rootPool.query<{ count: number }>(
       `SELECT count(*)::int AS count FROM ${historyRelation}`,
     );
-    expect(historyCount.rows[0].count).toBe(1);
+    expect(historyCount.rows[0].count).toBe(2);
+  });
+
+  it('baselines an exact legacy v1 schema and applies only v2', async () => {
+    const { schema: legacySchema, pool: legacyPool } =
+      await createIsolatedSchemaPool('b1_legacy_v1');
+    const v1Directory = await mkdtemp(join(tmpdir(), 'moeen-v1-migrations-'));
+    try {
+      const [v1] = await loadMigrations(defaultMigrationsDirectory());
+      await writeFile(join(v1Directory, v1.filename), v1.sql);
+      await runDatabaseMigrations(legacyPool, v1Directory);
+      await legacyPool.query('DROP TABLE moeen_schema_migrations');
+
+      await expect(runDatabaseMigrations(legacyPool)).resolves.toEqual({
+        applied: ['0002'],
+        baselined: ['0001'],
+      });
+      const history = await legacyPool.query<{
+        version: string;
+        execution_mode: string;
+      }>(
+        'SELECT version, execution_mode FROM moeen_schema_migrations ORDER BY version',
+      );
+      expect(history.rows).toEqual([
+        { version: '0001', execution_mode: 'baselined' },
+        { version: '0002', execution_mode: 'applied' },
+      ]);
+    } finally {
+      await rm(v1Directory, { recursive: true, force: true });
+      await dropIsolatedSchema(legacyPool, legacySchema);
+    }
+  });
+
+  it('applies v2 to a database with valid v1 history', async () => {
+    const { schema: v1Schema, pool: v1Pool } =
+      await createIsolatedSchemaPool('b1_v1_history');
+    const v1Directory = await mkdtemp(join(tmpdir(), 'moeen-v1-history-'));
+    try {
+      const [v1] = await loadMigrations(defaultMigrationsDirectory());
+      await writeFile(join(v1Directory, v1.filename), v1.sql);
+      await runDatabaseMigrations(v1Pool, v1Directory);
+
+      await expect(runDatabaseMigrations(v1Pool)).resolves.toEqual({
+        applied: ['0002'],
+        baselined: [],
+      });
+    } finally {
+      await rm(v1Directory, { recursive: true, force: true });
+      await dropIsolatedSchema(v1Pool, v1Schema);
+    }
+  });
+
+  it('rolls back a failed 0002 without recording history or leaving v2 shape', async () => {
+    const { schema: failureSchema, pool: failurePool } =
+      await createIsolatedSchemaPool('b1_failed_v2');
+    const failureDirectory = await mkdtemp(
+      join(tmpdir(), 'moeen-failing-v2-migrations-'),
+    );
+    try {
+      const [v1] = await loadMigrations(defaultMigrationsDirectory());
+      await writeFile(join(failureDirectory, v1.filename), v1.sql);
+      await writeFile(
+        join(failureDirectory, '0002_service_request_images.sql'),
+        'ALTER TABLE service_requests ADD COLUMN client_submission_id UUID; CREATE TABLE must_rollback (id INTEGER); SELECT missing_column FROM missing_table;',
+      );
+
+      await expect(
+        runDatabaseMigrations(failurePool, failureDirectory),
+      ).rejects.toThrow();
+      const failedRecord = await failurePool.query<{ count: number }>(
+        `SELECT count(*)::int AS count
+           FROM moeen_schema_migrations
+          WHERE version = '0002'`,
+      );
+      expect(failedRecord.rows[0].count).toBe(0);
+      const shape = await failurePool.query<{
+        image_table: string | null;
+        submission_column_count: number;
+        rollback_table: string | null;
+      }>(
+        `SELECT to_regclass(format('%I.%I', current_schema(), 'service_request_images'))::text AS image_table,
+                (SELECT count(*)::int
+                   FROM information_schema.columns
+                  WHERE table_schema = current_schema()
+                    AND table_name = 'service_requests'
+                    AND column_name = 'client_submission_id') AS submission_column_count,
+                to_regclass(format('%I.%I', current_schema(), 'must_rollback'))::text AS rollback_table`,
+      );
+      expect(shape.rows[0]).toEqual({
+        image_table: null,
+        submission_column_count: 0,
+        rollback_table: null,
+      });
+    } finally {
+      await rm(failureDirectory, { recursive: true, force: true });
+      await dropIsolatedSchema(failurePool, failureSchema);
+    }
+  });
+
+  it('refuses a pre-created v2 schema without migration history', async () => {
+    const { schema: precreatedSchema, pool: precreatedPool } =
+      await createIsolatedSchemaPool('b1_precreated_v2');
+    try {
+      await runDatabaseMigrations(precreatedPool);
+      await precreatedPool.query('DROP TABLE moeen_schema_migrations');
+
+      await expect(runDatabaseMigrations(precreatedPool)).rejects.toThrow(
+        "Refusing to apply initial database migration '0001'",
+      );
+      const history = await precreatedPool.query<{ relation: string | null }>(
+        `SELECT to_regclass(
+           format('%I.%I', current_schema(), 'moeen_schema_migrations')
+         )::text AS relation`,
+      );
+      expect(history.rows[0].relation).toBeNull();
+    } finally {
+      await dropIsolatedSchema(precreatedPool, precreatedSchema);
+    }
+  });
+
+  it('refuses a v2 schema that drifts from the applied 0002 constraint contract', async () => {
+    const { schema: driftSchema, pool: driftPool } =
+      await createIsolatedSchemaPool('b1_v2_constraint_drift');
+    try {
+      await runDatabaseMigrations(driftPool);
+      await driftPool.query(
+        'ALTER TABLE service_request_images DROP CONSTRAINT service_request_images_sort_order_check',
+      );
+
+      await expect(runDatabaseMigrations(driftPool)).rejects.toThrow(
+        "Database schema does not satisfy applied migration '0002'",
+      );
+    } finally {
+      await dropIsolatedSchema(driftPool, driftSchema);
+    }
+  });
+
+  it('refuses a v2 schema that drifts from the applied 0002 column contract', async () => {
+    const { schema: driftSchema, pool: driftPool } =
+      await createIsolatedSchemaPool('b1_v2_column_drift');
+    try {
+      await runDatabaseMigrations(driftPool);
+      await driftPool.query(
+        'ALTER TABLE service_request_images ALTER COLUMN byte_size TYPE BIGINT',
+      );
+
+      await expect(runDatabaseMigrations(driftPool)).rejects.toThrow(
+        "Database schema does not satisfy applied migration '0002'",
+      );
+    } finally {
+      await dropIsolatedSchema(driftPool, driftSchema);
+    }
   });
 
   it('refuses a non-empty partial schema before replaying the initial migration', async () => {
@@ -320,18 +435,26 @@ describe('versioned PostgreSQL migrations', () => {
   it('accepts the exact 0001 foreign-key set and normal BIGSERIAL sequence semantics', async () => {
     const { schema: exactSchema, pool: exactPool } =
       await createIsolatedSchemaPool('b1_exact_contract');
+    const v1Directory = await mkdtemp(join(tmpdir(), 'moeen-exact-v1-'));
     try {
-      await expect(runDatabaseMigrations(exactPool)).resolves.toEqual({
+      const [v1] = await loadMigrations(defaultMigrationsDirectory());
+      await writeFile(join(v1Directory, v1.filename), v1.sql);
+      await expect(
+        runDatabaseMigrations(exactPool, v1Directory),
+      ).resolves.toEqual({
         applied: ['0001'],
         baselined: [],
       });
       await exactPool.query('DROP TABLE moeen_schema_migrations');
 
-      await expect(runDatabaseMigrations(exactPool)).resolves.toEqual({
+      await expect(
+        runDatabaseMigrations(exactPool, v1Directory),
+      ).resolves.toEqual({
         applied: [],
         baselined: ['0001'],
       });
     } finally {
+      await rm(v1Directory, { recursive: true, force: true });
       await dropIsolatedSchema(exactPool, exactSchema);
     }
   });
@@ -813,17 +936,17 @@ describe('versioned PostgreSQL migrations', () => {
       await historyPool.query(
         `INSERT INTO moeen_schema_migrations
            (version, name, checksum, execution_mode)
-         VALUES ('0002', 'unknown', repeat('1', 64), 'applied')`,
+         VALUES ('0003', 'unknown', repeat('1', 64), 'applied')`,
       );
       await expect(runDatabaseMigrations(historyPool)).rejects.toThrow(
-        "Database migration '0002' is applied but missing from this release",
+        "Database migration '0003' is applied but missing from this release",
       );
     } finally {
       await dropIsolatedSchema(historyPool, historySchema);
     }
   });
 
-  it('applies a pending repair when a valid migration history already exists', async () => {
+  it('applies a pending migration when valid v2 history already exists', async () => {
     const { schema: repairSchema, pool: repairPool } =
       await createIsolatedSchemaPool('b1_repair');
     const repairDirectory = await mkdtemp(
@@ -831,20 +954,20 @@ describe('versioned PostgreSQL migrations', () => {
     );
     try {
       await runDatabaseMigrations(repairPool);
-      await repairPool.query('DROP INDEX staff_sessions_expires_at_idx');
       const current = await loadMigrations(defaultMigrationsDirectory());
-      await writeFile(
-        join(repairDirectory, current[0].filename),
-        current[0].sql,
+      await Promise.all(
+        current.map((migration) =>
+          writeFile(join(repairDirectory, migration.filename), migration.sql),
+        ),
       );
       await writeFile(
-        join(repairDirectory, '0002_restore_staff_session_index.sql'),
-        'CREATE INDEX staff_sessions_expires_at_idx ON staff_sessions (expires_at);',
+        join(repairDirectory, '0003_add_valid_history_probe.sql'),
+        'CREATE TABLE valid_history_probe (id INTEGER PRIMARY KEY);',
       );
 
       await expect(
         runDatabaseMigrations(repairPool, repairDirectory),
-      ).resolves.toEqual({ applied: ['0002'], baselined: [] });
+      ).resolves.toEqual({ applied: ['0003'], baselined: [] });
     } finally {
       await rm(repairDirectory, { recursive: true, force: true });
       await dropIsolatedSchema(repairPool, repairSchema);

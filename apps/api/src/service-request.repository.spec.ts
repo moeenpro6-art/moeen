@@ -10,6 +10,12 @@ import { ServiceRequestRepository } from './service-request.repository';
 import { StaffAuthRepository } from './staff-auth.repository';
 import { generateOwnerToken, ownerTokenHash } from './test-db.guard';
 import {
+  RequestSubmissionConflictError,
+  RequestSubmissionReplayError,
+  type ServiceRequestSubmissionContext,
+} from './request-image-create.contracts';
+import type { StoredRequestImage } from './request-image.types';
+import {
   createOwnedSchema,
   dropOwnedSchemaAtomically,
   quoteIdent,
@@ -2440,6 +2446,360 @@ describe('ServiceRequestRepository', () => {
         );
         expect(leftover.rows[0].n).toBe(0);
       });
+    });
+  });
+  describe('service request image submission idempotency (Slice 2B)', () => {
+    function storedImageFor(sortOrder: number): StoredRequestImage {
+      return {
+        id: randomUUID(),
+        storageKey: `request-images/test/2026/08/${randomUUID()}.jpg`,
+        mimeType: 'image/jpeg',
+        byteSize: 100 + sortOrder,
+        contentSha256: createHash('sha256')
+          .update(`image-${sortOrder}-${randomUUID()}`)
+          .digest('hex'),
+        sortOrder,
+      };
+    }
+
+    function databaseCustomerId(customerId: string): number {
+      return Number(customerId.replace('CUS-', '')) - 1000;
+    }
+
+    const submissionFor = (
+      key: string,
+      fingerprint = 'f'.repeat(64),
+    ): ServiceRequestSubmissionContext => ({
+      clientSubmissionId: key,
+      submissionFingerprint: fingerprint,
+    });
+
+    it('commits submission columns and image metadata atomically with the request', async () => {
+      const customer = await repository.upsertCustomer('+966****0701');
+      const key = randomUUID();
+      const images = [storedImageFor(0), storedImageFor(1)];
+
+      const created = await repository.create(
+        {
+          serviceId: 'ac-cleaning',
+          address: 'حي الصفراء، بريدة',
+          details: 'تنظيف مكيفات',
+          timing: 'as-soon-as-possible',
+        },
+        customer.id,
+        submissionFor(key),
+        images,
+      );
+      expect(created.status).toBe('pending_dispatch');
+
+      const probe = new Pool({
+        connectionString: resolveDatabaseConnectionString(),
+      });
+      try {
+        const row = (
+          await probe.query<{
+            client_submission_id: string;
+            submission_fingerprint: string;
+          }>(
+            `SELECT client_submission_id, submission_fingerprint
+               FROM service_requests
+              WHERE customer_id = $1 AND client_submission_id = $2`,
+            [databaseCustomerId(customer.id), key],
+          )
+        ).rows[0];
+        expect(row).toMatchObject({
+          client_submission_id: key,
+          submission_fingerprint: 'f'.repeat(64),
+        });
+        const imageRows = (
+          await probe.query<{ storage_key: string; sort_order: number }>(
+            `SELECT storage_key, sort_order
+               FROM service_request_images
+              WHERE service_request_id = $1
+              ORDER BY sort_order`,
+            [Number(created.id.replace('MOE-', '')) - 1000],
+          )
+        ).rows;
+        expect(imageRows).toHaveLength(2);
+        expect(imageRows.map((image) => image.storage_key)).toEqual(
+          images.map((image) => image.storageKey),
+        );
+        const events = await probe.query<{ n: number }>(
+          `SELECT count(*)::int AS n
+             FROM service_request_events
+            WHERE service_request_id = $1 AND type = 'request_created'`,
+          [Number(created.id.replace('MOE-', '')) - 1000],
+        );
+        expect(events.rows[0].n).toBe(1);
+      } finally {
+        await probe.end();
+      }
+    });
+
+    it('leaves submission columns NULL for the legacy JSON creation path', async () => {
+      const customer = await repository.upsertCustomer('+966****0702');
+      const created = await repository.create(
+        {
+          serviceId: 'plumbing',
+          address: 'حي الصفراء، بريدة',
+          timing: 'as-soon-as-possible',
+        },
+        customer.id,
+      );
+      expect(created.id).toMatch(/^MOE-\d+$/);
+
+      const probe = new Pool({
+        connectionString: resolveDatabaseConnectionString(),
+      });
+      try {
+        const row = (
+          await probe.query<{
+            client_submission_id: string | null;
+            submission_fingerprint: string | null;
+          }>(
+            `SELECT client_submission_id, submission_fingerprint
+               FROM service_requests
+              WHERE id = $1`,
+            [Number(created.id.replace('MOE-', '')) - 1000],
+          )
+        ).rows[0];
+        expect(row).toEqual({
+          client_submission_id: null,
+          submission_fingerprint: null,
+        });
+      } finally {
+        await probe.end();
+      }
+    });
+
+    it('replays a committed submission and inserts nothing new', async () => {
+      const customer = await repository.upsertCustomer('+966****0703');
+      const key = randomUUID();
+      const first = await repository.create(
+        {
+          serviceId: 'upholstery',
+          address: 'حي الصفراء، بريدة',
+          timing: 'scheduled',
+        },
+        customer.id,
+        submissionFor(key),
+        [storedImageFor(0)],
+      );
+      expect(first.id).toMatch(/^MOE-\d+$/);
+
+      await expect(
+        repository.create(
+          {
+            serviceId: 'upholstery',
+            address: 'حي الصفراء، بريدة',
+            timing: 'scheduled',
+          },
+          customer.id,
+          submissionFor(key),
+          [storedImageFor(0)],
+        ),
+      ).rejects.toBeInstanceOf(RequestSubmissionReplayError);
+
+      const probe = new Pool({
+        connectionString: resolveDatabaseConnectionString(),
+      });
+      try {
+        const count = (
+          await probe.query<{ n: number }>(
+            `SELECT count(*)::int AS n
+               FROM service_requests
+              WHERE customer_id = $1 AND client_submission_id = $2`,
+            [databaseCustomerId(customer.id), key],
+          )
+        ).rows[0].n;
+        expect(count).toBe(1);
+        const imageCount = (
+          await probe.query<{ n: number }>(
+            `SELECT count(*)::int AS n
+               FROM service_request_images
+              WHERE service_request_id = $1`,
+            [databaseCustomerId(customer.id)],
+          )
+        ).rows[0].n;
+        expect(imageCount).toBe(1);
+      } finally {
+        await probe.end();
+      }
+    });
+
+    it('conflicts when the same key arrives with different content', async () => {
+      const customer = await repository.upsertCustomer('+966****0704');
+      const key = randomUUID();
+      await repository.create(
+        {
+          serviceId: 'tank-cleaning',
+          address: 'حي الصفراء، بريدة',
+          timing: 'as-soon-as-possible',
+        },
+        customer.id,
+        submissionFor(key, 'a'.repeat(64)),
+      );
+
+      await expect(
+        repository.create(
+          {
+            serviceId: 'tank-cleaning',
+            address: 'عنوان مختلف تماماً',
+            timing: 'scheduled',
+          },
+          customer.id,
+          submissionFor(key, 'b'.repeat(64)),
+        ),
+      ).rejects.toBeInstanceOf(RequestSubmissionConflictError);
+    });
+
+    it('commits exactly one of two concurrent identical submissions', async () => {
+      const customer = await repository.upsertCustomer('+966****0705');
+      const key = randomUUID();
+      const outcomes = await Promise.allSettled([
+        repository.create(
+          {
+            serviceId: 'home-cleaning',
+            address: 'حي الصفراء، بريدة',
+            timing: 'as-soon-as-possible',
+          },
+          customer.id,
+          submissionFor(key),
+          [storedImageFor(0)],
+        ),
+        repository.create(
+          {
+            serviceId: 'home-cleaning',
+            address: 'حي الصفراء، بريدة',
+            timing: 'as-soon-as-possible',
+          },
+          customer.id,
+          submissionFor(key),
+          [storedImageFor(0)],
+        ),
+      ]);
+
+      const fulfilled = outcomes.filter(
+        (outcome) => outcome.status === 'fulfilled',
+      );
+      const rejected = outcomes.filter(
+        (outcome) => outcome.status === 'rejected',
+      );
+      expect(fulfilled).toHaveLength(1);
+      expect(rejected).toHaveLength(1);
+      expect(
+        rejected[0].status === 'rejected' && rejected[0].reason,
+      ).toBeInstanceOf(RequestSubmissionReplayError);
+
+      const probe = new Pool({
+        connectionString: resolveDatabaseConnectionString(),
+      });
+      try {
+        const count = (
+          await probe.query<{ n: number }>(
+            `SELECT count(*)::int AS n
+               FROM service_requests
+              WHERE customer_id = $1 AND client_submission_id = $2`,
+            [databaseCustomerId(customer.id), key],
+          )
+        ).rows[0].n;
+        expect(count).toBe(1);
+        const winner = fulfilled[0] as PromiseFulfilledResult<{
+          id: string;
+        }>;
+        const imageCount = (
+          await probe.query<{ n: number }>(
+            `SELECT count(*)::int AS n
+               FROM service_request_images
+              WHERE service_request_id = $1`,
+            [Number(winner.value.id.replace('MOE-', '')) - 1000],
+          )
+        ).rows[0].n;
+        expect(imageCount).toBe(1);
+      } finally {
+        await probe.end();
+      }
+    });
+
+    it('rolls the whole transaction back when image metadata insertion fails', async () => {
+      const customer = await repository.upsertCustomer('+966****0706');
+      const key = randomUUID();
+      const duplicateOrder = [
+        storedImageFor(0),
+        {
+          ...storedImageFor(0),
+          id: randomUUID(),
+          storageKey: `request-images/test/2026/08/${randomUUID()}.jpg`,
+          contentSha256: createHash('sha256')
+            .update(`other-${randomUUID()}`)
+            .digest('hex'),
+        },
+      ];
+
+      await expect(
+        repository.create(
+          {
+            serviceId: 'ac-cleaning',
+            address: 'حي الصفراء، بريدة',
+            timing: 'as-soon-as-possible',
+          },
+          customer.id,
+          submissionFor(key),
+          duplicateOrder,
+        ),
+      ).rejects.toThrow();
+
+      const probe = new Pool({
+        connectionString: resolveDatabaseConnectionString(),
+      });
+      try {
+        const requests = (
+          await probe.query<{ n: number }>(
+            `SELECT count(*)::int AS n
+               FROM service_requests
+              WHERE customer_id = $1 AND client_submission_id = $2`,
+            [databaseCustomerId(customer.id), key],
+          )
+        ).rows[0].n;
+        expect(requests).toBe(0);
+        const images = (
+          await probe.query<{ n: number }>(
+            `SELECT count(*)::int AS n
+               FROM service_request_images i
+               JOIN service_requests r ON r.id = i.service_request_id
+              WHERE r.customer_id = $1 AND r.client_submission_id = $2`,
+            [databaseCustomerId(customer.id), key],
+          )
+        ).rows[0].n;
+        expect(images).toBe(0);
+        const events = (
+          await probe.query<{ n: number }>(
+            `SELECT count(*)::int AS n
+               FROM service_request_events e
+               JOIN service_requests r ON r.id = e.service_request_id
+              WHERE r.customer_id = $1 AND r.client_submission_id = $2`,
+            [databaseCustomerId(customer.id), key],
+          )
+        ).rows[0].n;
+        expect(events).toBe(0);
+      } finally {
+        await probe.end();
+      }
+    });
+
+    it('rejects a malformed client submission id before any SQL runs', async () => {
+      const customer = await repository.upsertCustomer('+966****0707');
+      await expect(
+        repository.create(
+          {
+            serviceId: 'ac-cleaning',
+            address: 'حي الصفراء، بريدة',
+            timing: 'as-soon-as-possible',
+          },
+          customer.id,
+          submissionFor('not-a-uuid'),
+        ),
+      ).rejects.toThrow('Invalid client submission id');
     });
   });
 });

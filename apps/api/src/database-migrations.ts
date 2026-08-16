@@ -482,6 +482,99 @@ const CURRENT_SCHEMA_CONSTRAINT_TOKENS: Readonly<
   staff_users_role_check: ['admin', 'dispatcher', 'support_agent'],
 };
 
+type SchemaContract = {
+  columnTypes: Readonly<Record<string, Readonly<Record<string, string>>>>;
+  columnDefaults: Readonly<Record<string, string>>;
+  serialColumns: Readonly<Record<string, SequenceContract>>;
+  indexTokens: Readonly<Record<string, readonly string[]>>;
+  keyConstraints: readonly string[];
+  foreignKeys: readonly ForeignKeyContract[];
+  constraintTokens: Readonly<Record<string, readonly string[]>>;
+};
+
+// Migration 0001 is immutable. Keep its exact contract independent from the
+// latest release so a legacy v1 schema can still be safely classified and
+// baselined before 0002 is applied.
+const V1_SCHEMA_CONTRACT: SchemaContract = {
+  columnTypes: CURRENT_SCHEMA_COLUMN_TYPES,
+  columnDefaults: CURRENT_SCHEMA_COLUMN_DEFAULTS,
+  serialColumns: CURRENT_SCHEMA_SERIAL_COLUMNS,
+  indexTokens: CURRENT_SCHEMA_INDEX_TOKENS,
+  keyConstraints: CURRENT_SCHEMA_KEY_CONSTRAINTS,
+  foreignKeys: CURRENT_SCHEMA_FOREIGN_KEYS,
+  constraintTokens: CURRENT_SCHEMA_CONSTRAINT_TOKENS,
+};
+
+const V2_SCHEMA_CONTRACT: SchemaContract = {
+  columnTypes: {
+    ...CURRENT_SCHEMA_COLUMN_TYPES,
+    service_requests: {
+      ...CURRENT_SCHEMA_COLUMN_TYPES.service_requests,
+      client_submission_id: 'uuid',
+      submission_fingerprint: 'character(64)',
+    },
+    service_request_images: {
+      id: 'uuid!',
+      service_request_id: 'bigint!',
+      storage_key: 'text!',
+      mime_type: 'text!',
+      byte_size: 'integer!',
+      content_sha256: 'character(64)!',
+      sort_order: 'smallint!',
+      created_at: 'timestamp with time zone!',
+    },
+  },
+  columnDefaults: {
+    ...CURRENT_SCHEMA_COLUMN_DEFAULTS,
+    'service_request_images.created_at': 'now()',
+  },
+  serialColumns: CURRENT_SCHEMA_SERIAL_COLUMNS,
+  indexTokens: {
+    ...CURRENT_SCHEMA_INDEX_TOKENS,
+    service_requests_customer_submission_unique: [
+      'CREATE UNIQUE INDEX',
+      'service_requests',
+      '(customer_id, client_submission_id)',
+      'client_submission_id IS NOT NULL',
+    ],
+  },
+  keyConstraints: [
+    ...CURRENT_SCHEMA_KEY_CONSTRAINTS,
+    'service_request_images:p:id',
+    'service_request_images:u:storage_key',
+    'service_request_images:u:service_request_id,sort_order',
+    'service_request_images:u:service_request_id,content_sha256',
+  ],
+  foreignKeys: [
+    ...CURRENT_SCHEMA_FOREIGN_KEYS,
+    currentSchemaForeignKey(
+      'service_request_images',
+      ['service_request_id'],
+      'service_requests',
+      ['id'],
+    ),
+  ],
+  constraintTokens: {
+    ...CURRENT_SCHEMA_CONSTRAINT_TOKENS,
+    service_requests_submission_pair_check: [
+      'client_submission_id',
+      'submission_fingerprint',
+      'IS NULL',
+    ],
+    service_requests_submission_fingerprint_check: [
+      'submission_fingerprint',
+      '^[0-9a-f]{64}$',
+    ],
+    service_request_images_mime_type_check: ['mime_type', 'image/jpeg'],
+    service_request_images_byte_size_check: ['byte_size', '> 0', '<= 5242880'],
+    service_request_images_content_sha256_check: [
+      'content_sha256',
+      '^[0-9a-f]{64}$',
+    ],
+    service_request_images_sort_order_check: ['sort_order', '>= 0', '<= 4'],
+  },
+};
+
 export type DatabaseMigration = {
   version: string;
   name: string;
@@ -599,7 +692,10 @@ async function migrationHistoryExists(client: PoolClient): Promise<boolean> {
   return result.rows[0]?.exists === true;
 }
 
-async function isCurrentSchemaBaseline(client: PoolClient): Promise<boolean> {
+async function schemaMatchesContract(
+  client: PoolClient,
+  contract: SchemaContract,
+): Promise<boolean> {
   const tables = await client.query<{ table_name: string }>(
     `SELECT table_name
        FROM information_schema.tables
@@ -609,7 +705,7 @@ async function isCurrentSchemaBaseline(client: PoolClient): Promise<boolean> {
       ORDER BY table_name`,
     [SCHEMA_INFRASTRUCTURE_TABLES],
   );
-  const expectedTables = Object.keys(CURRENT_SCHEMA_COLUMN_TYPES).sort();
+  const expectedTables = Object.keys(contract.columnTypes).sort();
   if (
     tables.rows.length !== expectedTables.length ||
     tables.rows.some((row, index) => row.table_name !== expectedTables[index])
@@ -653,12 +749,12 @@ async function isCurrentSchemaBaseline(client: PoolClient): Promise<boolean> {
         AND relation_record.relkind IN ('r', 'p')
         AND attribute_record.attnum > 0
         AND NOT attribute_record.attisdropped`,
-    [Object.keys(CURRENT_SCHEMA_COLUMN_TYPES)],
+    [Object.keys(contract.columnTypes)],
   );
   const actualColumns = new Map(
     columns.rows.map((row) => [`${row.table_name}.${row.column_name}`, row]),
   );
-  const expectedColumns = Object.entries(CURRENT_SCHEMA_COLUMN_TYPES).flatMap(
+  const expectedColumns = Object.entries(contract.columnTypes).flatMap(
     ([table, tableColumns]) =>
       Object.entries(tableColumns).map(
         ([column, type]) => [`${table}.${column}`, type] as const,
@@ -670,8 +766,7 @@ async function isCurrentSchemaBaseline(client: PoolClient): Promise<boolean> {
     if (
       !actual ||
       `${actual.data_type}${actual.not_null ? '!' : ''}` !== type ||
-      actual.default_expression !==
-        (CURRENT_SCHEMA_COLUMN_DEFAULTS[column] ?? null) ||
+      actual.default_expression !== (contract.columnDefaults[column] ?? null) ||
       actual.identity_kind !== '' ||
       actual.generated_kind !== ''
     ) {
@@ -753,11 +848,9 @@ async function isCurrentSchemaBaseline(client: PoolClient): Promise<boolean> {
         AND source_attribute.attnum > 0
         AND NOT source_attribute.attisdropped
         AND source.relname || '.' || source_attribute.attname = ANY($1::text[])`,
-    [Object.keys(CURRENT_SCHEMA_SERIAL_COLUMNS)],
+    [Object.keys(contract.serialColumns)],
   );
-  if (
-    sequences.rows.length !== Object.keys(CURRENT_SCHEMA_SERIAL_COLUMNS).length
-  ) {
+  if (sequences.rows.length !== Object.keys(contract.serialColumns).length) {
     return false;
   }
   const actualSequences = new Map(
@@ -768,7 +861,7 @@ async function isCurrentSchemaBaseline(client: PoolClient): Promise<boolean> {
   );
   if (actualSequences.size !== sequences.rows.length) return false;
   for (const [serialColumn, expected] of Object.entries(
-    CURRENT_SCHEMA_SERIAL_COLUMNS,
+    contract.serialColumns,
   )) {
     const [sourceTable, sourceColumn] = serialColumn.split('.');
     const actual = actualSequences.get(serialColumn);
@@ -854,7 +947,7 @@ async function isCurrentSchemaBaseline(client: PoolClient): Promise<boolean> {
                constraint_record.condeferrable,
                constraint_record.condeferred,
                constraint_record.convalidated`,
-    [Object.keys(CURRENT_SCHEMA_COLUMN_TYPES)],
+    [Object.keys(contract.columnTypes)],
   );
   const foreignKeyKey = (foreignKey: {
     sourceSchema: string;
@@ -888,22 +981,24 @@ async function isCurrentSchemaBaseline(client: PoolClient): Promise<boolean> {
       }),
     )
     .sort();
-  const expectedForeignKeys = CURRENT_SCHEMA_FOREIGN_KEYS.map((foreignKey) =>
-    foreignKeyKey({
-      sourceSchema: expectedSchema,
-      sourceTable: foreignKey.sourceTable,
-      sourceColumns: foreignKey.sourceColumns,
-      targetSchema: expectedSchema,
-      targetTable: foreignKey.targetTable,
-      targetColumns: foreignKey.targetColumns,
-      updateAction: foreignKey.updateAction,
-      deleteAction: foreignKey.deleteAction,
-      matchType: foreignKey.matchType,
-      deferrable: foreignKey.deferrable,
-      initiallyDeferred: foreignKey.initiallyDeferred,
-      validated: foreignKey.validated,
-    }),
-  ).sort();
+  const expectedForeignKeys = contract.foreignKeys
+    .map((foreignKey) =>
+      foreignKeyKey({
+        sourceSchema: expectedSchema,
+        sourceTable: foreignKey.sourceTable,
+        sourceColumns: foreignKey.sourceColumns,
+        targetSchema: expectedSchema,
+        targetTable: foreignKey.targetTable,
+        targetColumns: foreignKey.targetColumns,
+        updateAction: foreignKey.updateAction,
+        deleteAction: foreignKey.deleteAction,
+        matchType: foreignKey.matchType,
+        deferrable: foreignKey.deferrable,
+        initiallyDeferred: foreignKey.initiallyDeferred,
+        validated: foreignKey.validated,
+      }),
+    )
+    .sort();
   if (
     actualForeignKeys.length !== expectedForeignKeys.length ||
     actualForeignKeys.some(
@@ -939,14 +1034,14 @@ async function isCurrentSchemaBaseline(client: PoolClient): Promise<boolean> {
         AND source.relname = ANY($1::text[])
         AND source.relkind IN ('r', 'p')
       GROUP BY source.relname, constraint_record.contype, constraint_record.conkey`,
-    [Object.keys(CURRENT_SCHEMA_COLUMN_TYPES)],
+    [Object.keys(contract.columnTypes)],
   );
   const actualKeyConstraints = new Set(
     keyConstraints.rows.map(
       (row) => `${row.table_name}:${row.constraint_type}:${row.columns}`,
     ),
   );
-  for (const requiredKey of CURRENT_SCHEMA_KEY_CONSTRAINTS) {
+  for (const requiredKey of contract.keyConstraints) {
     if (!actualKeyConstraints.has(requiredKey)) {
       return false;
     }
@@ -960,14 +1055,12 @@ async function isCurrentSchemaBaseline(client: PoolClient): Promise<boolean> {
        FROM pg_indexes
       WHERE schemaname = current_schema()
         AND indexname = ANY($1::text[])`,
-    [Object.keys(CURRENT_SCHEMA_INDEX_TOKENS)],
+    [Object.keys(contract.indexTokens)],
   );
   const indexDefinitions = new Map(
     indexes.rows.map((row) => [row.indexname, row.indexdef]),
   );
-  for (const [indexName, tokens] of Object.entries(
-    CURRENT_SCHEMA_INDEX_TOKENS,
-  )) {
+  for (const [indexName, tokens] of Object.entries(contract.indexTokens)) {
     const definition = indexDefinitions.get(indexName);
     if (!definition || tokens.some((token) => !definition.includes(token))) {
       return false;
@@ -984,13 +1077,13 @@ async function isCurrentSchemaBaseline(client: PoolClient): Promise<boolean> {
        JOIN pg_namespace n ON n.oid = c.connamespace
       WHERE n.nspname = current_schema()
         AND c.conname = ANY($1::text[])`,
-    [Object.keys(CURRENT_SCHEMA_CONSTRAINT_TOKENS)],
+    [Object.keys(contract.constraintTokens)],
   );
   const definitions = new Map(
     constraints.rows.map((row) => [row.constraint_name, row.definition]),
   );
   for (const [constraint, tokens] of Object.entries(
-    CURRENT_SCHEMA_CONSTRAINT_TOKENS,
+    contract.constraintTokens,
   )) {
     const definition = definitions.get(constraint);
     if (!definition || tokens.some((token) => !definition.includes(token))) {
@@ -1037,13 +1130,26 @@ type InitialSchemaState = 'empty' | 'current';
 async function classifyInitialSchema(
   client: PoolClient,
 ): Promise<InitialSchemaState> {
-  if (await isCurrentSchemaBaseline(client)) return 'current';
+  if (await schemaMatchesContract(client, V1_SCHEMA_CONTRACT)) return 'current';
   if (await initialSchemaHasUserObjects(client)) {
     throw new Error(
       "Refusing to apply initial database migration '0001': the active schema is non-empty but does not match the supported current Moeen schema. Restore a compatible schema or resolve the partial/unknown objects before retrying.",
     );
   }
   return 'empty';
+}
+
+function contractForMigration(
+  migration: DatabaseMigration | undefined,
+): SchemaContract | undefined {
+  if (migration?.version === '0001') return V1_SCHEMA_CONTRACT;
+  if (
+    migration?.version === '0002' &&
+    migration.name === 'service_request_images'
+  ) {
+    return V2_SCHEMA_CONTRACT;
+  }
+  return undefined;
 }
 
 function validateAppliedMigrations(
@@ -1126,6 +1232,19 @@ export async function runDatabaseMigrations(
     );
     const applied = validateAppliedMigrations(migrations, history.rows);
 
+    if (history.rows.length > 0) {
+      const lastApplied = migrations[history.rows.length - 1];
+      const appliedContract = contractForMigration(lastApplied);
+      if (
+        appliedContract &&
+        !(await schemaMatchesContract(client, appliedContract))
+      ) {
+        throw new Error(
+          `Database schema does not satisfy applied migration '${lastApplied.version}'`,
+        );
+      }
+    }
+
     for (const migration of migrations) {
       if (applied.has(migration.version)) continue;
       await client.query('BEGIN');
@@ -1141,12 +1260,13 @@ export async function runDatabaseMigrations(
         if (!baseline) {
           await client.query(migration.sql);
         }
+        const expectedContract = contractForMigration(migration);
         if (
-          migration.version === '0001' &&
-          !(await isCurrentSchemaBaseline(client))
+          expectedContract &&
+          !(await schemaMatchesContract(client, expectedContract))
         ) {
           throw new Error(
-            "Database schema does not satisfy migration '0001' after execution",
+            `Database schema does not satisfy migration '${migration.version}' after execution`,
           );
         }
         await client.query(
@@ -1168,7 +1288,11 @@ export async function runDatabaseMigrations(
         });
       }
     }
-    if (!(await isCurrentSchemaBaseline(client))) {
+    const latestContract = contractForMigration(migrations.at(-1));
+    if (
+      latestContract &&
+      !(await schemaMatchesContract(client, latestContract))
+    ) {
       throw new Error(
         'Database schema does not satisfy the current migration release',
       );
