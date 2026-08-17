@@ -258,3 +258,122 @@ test('labels marketplace opportunity events in Arabic', () => {
     'سحب مقدم الخدمة عرضه',
   );
 });
+
+test('toDashboardRequest carries request images ordered by server sortOrder', () => {
+  const request = toDashboardRequest({
+    id: 'MOE-1020',
+    serviceId: 'ac-cleaning',
+    address: 'حي الصفراء، بريدة',
+    timing: 'as-soon-as-possible',
+    status: 'pending_dispatch',
+    images: [
+      {
+        id: 'img-2',
+        mimeType: 'image/jpeg',
+        byteSize: 2048,
+        sortOrder: 1,
+        url: 'https://signed.example.test/img-2?sig=b',
+        urlExpiresAt: '2026-08-17T12:00:00.000Z',
+      },
+      {
+        id: 'img-1',
+        mimeType: 'image/jpeg',
+        byteSize: 1024,
+        sortOrder: 0,
+        url: 'https://signed.example.test/img-1?sig=a',
+      },
+    ],
+    createdAt: '2026-08-06T04:00:00.000Z',
+  });
+
+  assert.deepEqual(
+    request.images?.map((image) => image.sortOrder),
+    [0, 1],
+  );
+  assert.deepEqual(
+    request.images?.map((image) => image.id),
+    ['img-1', 'img-2'],
+  );
+});
+
+test('toDashboardRequest omits images for a zero-image request', () => {
+  const request = toDashboardRequest({
+    id: 'MOE-1021',
+    serviceId: 'plumbing',
+    address: 'حي الريان، بريدة',
+    timing: 'as-soon-as-possible',
+    status: 'pending_dispatch',
+    createdAt: '2026-08-06T05:00:00.000Z',
+  });
+
+  assert.equal('images' in request, false);
+});
+
+test('accepts a request with valid signed image entries', () => {
+  assert.equal(
+    requests.isApiServiceRequest({
+      id: 'MOE-1022',
+      serviceId: 'ac-cleaning',
+      address: 'حي الصفراء، بريدة',
+      timing: 'scheduled',
+      status: 'pending_dispatch',
+      images: [
+        {
+          id: 'img-1',
+          mimeType: 'image/jpeg',
+          byteSize: 1024,
+          sortOrder: 0,
+          url: 'https://signed.example.test/img-1?sig=a',
+        },
+      ],
+      createdAt: '2026-08-06T06:00:00.000Z',
+    }),
+    true,
+  );
+});
+
+test('rejects a request with a non-http(s) image URL', () => {
+  assert.equal(
+    requests.isApiServiceRequest({
+      id: 'MOE-1023',
+      serviceId: 'ac-cleaning',
+      address: 'حي الصفراء، بريدة',
+      timing: 'scheduled',
+      status: 'pending_dispatch',
+      images: [
+        {
+          id: 'img-1',
+          mimeType: 'image/jpeg',
+          byteSize: 1024,
+          sortOrder: 0,
+          url: 'javascript:alert(1)',
+        },
+      ],
+      createdAt: '2026-08-06T07:00:00.000Z',
+    }),
+    false,
+  );
+});
+
+test('rejects a request with malformed image entries', () => {
+  assert.equal(
+    requests.isApiServiceRequest({
+      id: 'MOE-1024',
+      serviceId: 'ac-cleaning',
+      address: 'حي الصفراء، بريدة',
+      timing: 'scheduled',
+      status: 'pending_dispatch',
+      images: [
+        {
+          id: 'img-1',
+          mimeType: 'image/jpeg',
+          byteSize: '1024',
+          sortOrder: 0,
+          url: 'https://signed.example.test/img-1',
+        },
+      ],
+      createdAt: '2026-08-06T08:00:00.000Z',
+    }),
+    false,
+  );
+});
