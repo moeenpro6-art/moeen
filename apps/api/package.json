@@ -10,6 +10,7 @@
     "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
     "migrate": "node dist/database-migrate.js",
     "migrate:dev": "node -r ts-node/register src/database-migrate.ts",
+    "reconcile:request-images": "node -r ts-node/register scripts/reconcile-request-images.ts",
     "start": "nest start",
     "start:dev": "nest start --watch",
     "start:debug": "nest start --debug --watch",

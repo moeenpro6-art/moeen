@@ -201,10 +201,13 @@ describe('AppService', () => {
   });
 
   it('returns only the authenticated customer’s requests', async () => {
-    const customer = { id: 'CUS-1001', phone: '+966500000001' };
+    const customer = { id: 'CUS-1001', phone: '+966****0001' };
     const store = {
       findCustomerBySession: jest.fn().mockResolvedValue(customer),
       findByCustomerId: jest.fn().mockResolvedValue([persistedRequest]),
+      findRequestImagesByRequestIds: jest
+        .fn()
+        .mockResolvedValue(new Map<string, never[]>()),
     };
     const service = new AppService(store as unknown as ServiceRequestStore);
 
@@ -215,6 +218,9 @@ describe('AppService', () => {
       'customer-session-token',
     );
     expect(store.findByCustomerId).toHaveBeenCalledWith(customer.id);
+    expect(store.findRequestImagesByRequestIds).toHaveBeenCalledWith([
+      persistedRequest.id,
+    ]);
   });
 
   it('normalizes an operations quote before it is proposed', async () => {

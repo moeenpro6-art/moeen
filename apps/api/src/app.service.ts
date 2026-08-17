@@ -16,7 +16,10 @@ import {
   type ServiceRequestSubmissionContext,
 } from './request-image-create.contracts';
 import { RequestImageService } from './request-image.service';
-import type { StoredRequestImage } from './request-image.types';
+import type {
+  RequestImageDto,
+  StoredRequestImage,
+} from './request-image.types';
 
 export type LaunchService = {
   id: string;
@@ -128,14 +131,35 @@ export type ServiceOpportunitySummary = {
 };
 
 export type ProviderOpportunityStatus =
-  'invited' | 'quoted' | 'withdrawn' | 'closed';
+  'invited' | 'quoted' | 'withdrawn' | 'closed' | 'rejected';
 
+/**
+ * Public, pre-assignment-safe provider opportunity projection. `address`,
+ * `details` and `images` are present ONLY when the authenticated provider
+ * owns the opportunity and it is in an actually eligible/current state
+ * (`invited`/`quoted` while the request is still `pending_dispatch`);
+ * terminal opportunities (withdrawn/closed/rejected) and non-pending
+ * requests never carry them. Customer identity/contact fields are never
+ * part of this shape.
+ */
 export type ProviderOpportunity = {
   requestId: string;
   serviceId: string;
   timing: ServiceRequest['timing'];
   opportunityStatus: ProviderOpportunityStatus;
   myQuote?: ServiceQuote;
+  address?: string;
+  details?: string;
+  images?: RequestImageDto[];
+};
+
+/**
+ * Store-level opportunity read: the server-side projection used to decide
+ * pre-quote eligibility. `requestStatus` is an authorization input, never a
+ * client value, and is stripped before anything reaches a client.
+ */
+export type ProviderOpportunityAccess = ProviderOpportunity & {
+  requestStatus?: ServiceRequestStatus;
 };
 
 export type CustomerQuoteProviderSummary = {
@@ -185,6 +209,7 @@ export type ServiceRequest = CreateServiceRequest & {
   payment?: ServicePayment;
   rating?: number;
   ratingComment?: string;
+  images?: RequestImageDto[];
   createdAt: string;
 };
 
@@ -243,6 +268,9 @@ export interface ServiceRequestStore {
     clientSubmissionId: string,
   ): Promise<ServiceRequest | undefined>;
   findRequestImages(requestId: string): Promise<StoredRequestImage[]>;
+  findRequestImagesByRequestIds(
+    requestIds: string[],
+  ): Promise<Map<string, StoredRequestImage[]>>;
   findAll(): Promise<ServiceRequest[]>;
   findByCustomerId(customerId: string): Promise<ServiceRequest[]>;
   findByProviderId(providerId: string): Promise<ServiceRequest[]>;
@@ -311,7 +339,9 @@ export interface ServiceRequestStore {
     providerIds: string[],
     audit?: StaffAuditSpec,
   ): Promise<ProviderOpportunity[]>;
-  listProviderOpportunities(providerId: string): Promise<ProviderOpportunity[]>;
+  listProviderOpportunities(
+    providerId: string,
+  ): Promise<ProviderOpportunityAccess[]>;
   submitProviderQuote(
     requestId: string,
     providerId: string,
@@ -532,15 +562,19 @@ export class AppService {
     }
   }
 
-  getServiceRequests(): Promise<ServiceRequest[]> {
-    return this.serviceRequestStore.findAll();
+  async getServiceRequests(): Promise<ServiceRequest[]> {
+    const requests = await this.serviceRequestStore.findAll();
+    return this.attachImagesToRequests(requests);
   }
 
   async getMyServiceRequests(token: string): Promise<ServiceRequest[]> {
     const customer =
       await this.serviceRequestStore.findCustomerBySession(token);
     if (!customer) throw new UnauthorizedException('Unauthorized');
-    return this.serviceRequestStore.findByCustomerId(customer.id);
+    const requests = await this.serviceRequestStore.findByCustomerId(
+      customer.id,
+    );
+    return this.attachImagesToRequests(requests);
   }
 
   async getMyServiceRequestEvents(
@@ -717,8 +751,12 @@ export class AppService {
     );
   }
 
-  getProviderServiceRequests(providerId: string): Promise<ServiceRequest[]> {
-    return this.serviceRequestStore.findByProviderId(providerId);
+  async getProviderServiceRequests(
+    providerId: string,
+  ): Promise<ServiceRequest[]> {
+    const requests =
+      await this.serviceRequestStore.findByProviderId(providerId);
+    return this.attachImagesToRequests(requests);
   }
 
   updateProviderServiceRequestStatus(
@@ -809,8 +847,24 @@ export class AppService {
     return uniqueProviderIds;
   }
 
-  getProviderOpportunities(providerId: string): Promise<ProviderOpportunity[]> {
-    return this.serviceRequestStore.listProviderOpportunities(providerId);
+  async getProviderOpportunities(
+    providerId: string,
+  ): Promise<ProviderOpportunity[]> {
+    const opportunities =
+      await this.serviceRequestStore.listProviderOpportunities(providerId);
+    // Authorization derives exclusively from the server-side listing: the
+    // store only returns opportunities owned by `providerId` (which itself
+    // comes from the authenticated principal, never from the client). The
+    // signed image lookup below is restricted to opportunities that are in
+    // an actually eligible/current state.
+    const eligibleRequestIds = opportunities
+      .filter((opportunity) => this.isEligiblePreQuoteOpportunity(opportunity))
+      .map((opportunity) => opportunity.requestId);
+    const signedImagesByRequest =
+      await this.signRequestImagesForIds(eligibleRequestIds);
+    return opportunities.map((opportunity) =>
+      this.toProviderOpportunityDto(opportunity, signedImagesByRequest),
+    );
   }
 
   async submitProviderQuote(
@@ -900,6 +954,101 @@ export class AppService {
       proposedAt: quote.proposedAt,
       decidedAt: quote.decidedAt,
     };
+  }
+
+  /**
+   * Pre-quote eligibility uses ONLY the real opportunity state machine:
+   * `invited`/`quoted` opportunities are current while the request is still
+   * `pending_dispatch`; withdrawn/closed/rejected opportunities and requests
+   * that left `pending_dispatch` never retain pre-assignment visibility.
+   */
+  private isEligiblePreQuoteOpportunity(
+    opportunity: ProviderOpportunityAccess,
+  ): boolean {
+    return (
+      ['invited', 'quoted'].includes(opportunity.opportunityStatus) &&
+      opportunity.requestStatus === 'pending_dispatch'
+    );
+  }
+
+  /**
+   * Whitelist projection for provider opportunities. Ineligible
+   * opportunities keep ONLY the pre-existing base fields; the protected
+   * pre-assignment fields (address/details/images) are attached exclusively
+   * to eligible opportunities. Customer identity/contact fields are never
+   * present because this shape never carries them.
+   */
+  private toProviderOpportunityDto(
+    opportunity: ProviderOpportunityAccess,
+    signedImagesByRequest: Map<string, RequestImageDto[]>,
+  ): ProviderOpportunity {
+    const base: ProviderOpportunity = {
+      requestId: opportunity.requestId,
+      serviceId: opportunity.serviceId,
+      timing: opportunity.timing,
+      opportunityStatus: opportunity.opportunityStatus,
+      // Rebuilt field-by-field: the store projection is trusted, but the
+      // public shape must stay a fixed whitelist even if that ever changes.
+      ...(opportunity.myQuote
+        ? {
+            myQuote: {
+              id: opportunity.myQuote.id,
+              providerId: opportunity.myQuote.providerId,
+              amountHalalas: opportunity.myQuote.amountHalalas,
+              scope: opportunity.myQuote.scope,
+              status: opportunity.myQuote.status,
+              proposedAt: opportunity.myQuote.proposedAt,
+              decidedAt: opportunity.myQuote.decidedAt,
+            },
+          }
+        : {}),
+    };
+    if (!this.isEligiblePreQuoteOpportunity(opportunity)) {
+      return base;
+    }
+    return {
+      ...base,
+      address: opportunity.address,
+      details: opportunity.details,
+      images: signedImagesByRequest.get(opportunity.requestId) ?? [],
+    };
+  }
+
+  /**
+   * Attaches signed image DTOs to authorized request reads using ONE batch
+   * image-metadata query for the whole list (no per-request N+1). Requests
+   * without committed images keep the previous shape (no `images` field).
+   * Signed URLs are generated on demand and never persisted.
+   */
+  private async attachImagesToRequests(
+    requests: ServiceRequest[],
+  ): Promise<ServiceRequest[]> {
+    if (requests.length === 0) return requests;
+    const signedImagesByRequest = await this.signRequestImagesForIds(
+      requests.map((request) => request.id),
+    );
+    if (signedImagesByRequest.size === 0) return requests;
+    return requests.map((request) => {
+      const images = signedImagesByRequest.get(request.id);
+      return images ? { ...request, images } : request;
+    });
+  }
+
+  private async signRequestImagesForIds(
+    requestIds: string[],
+  ): Promise<Map<string, RequestImageDto[]>> {
+    const uniqueRequestIds = [...new Set(requestIds)];
+    const signed = new Map<string, RequestImageDto[]>();
+    if (uniqueRequestIds.length === 0) return signed;
+    const storedByRequest =
+      await this.serviceRequestStore.findRequestImagesByRequestIds(
+        uniqueRequestIds,
+      );
+    for (const [requestId, images] of storedByRequest) {
+      if (images.length === 0) continue;
+      signed.set(requestId, await this.requestImageService.toDtos(images));
+    }
+    return signed;
   }
 
   private async getCustomerForToken(token: string): Promise<Customer> {

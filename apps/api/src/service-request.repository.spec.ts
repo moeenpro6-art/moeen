@@ -1978,7 +1978,7 @@ describe('ServiceRequestRepository', () => {
     expect(await readEventTypes(request.id)).toContain('quote_proposed');
   });
 
-  it('never exposes address, details, or customer data through provider opportunities', async () => {
+  it('carries job fields for the pre-quote projection but never any customer identity data', async () => {
     const provider = await createVerifiedProvider(['ac-cleaning']);
     const customer = await repository.upsertCustomer(
       `+9665${String(Math.floor(10_000_000 + Math.random() * 89_999_999))}`,
@@ -1999,16 +1999,21 @@ describe('ServiceRequestRepository', () => {
     );
     expect(opportunities).toHaveLength(1);
     const opportunity = opportunities[0];
-    expect(Object.keys(opportunity).sort()).toEqual([
-      'myQuote',
-      'opportunityStatus',
-      'requestId',
-      'serviceId',
-      'timing',
-    ]);
+    // Slice 3: the repository supplies the server-side inputs (address,
+    // details, request status) that AppService gates for eligible pre-quote
+    // providers. These fields are stripped again before any client DTO.
+    expect(opportunity).toMatchObject({
+      address: 'شارع الأمير سلطان، حي الصفراء، بريدة — منزل خاص',
+      details: 'معلومات حساسة جدًا مع رقم جوال في الملاحظات',
+      requestStatus: 'pending_dispatch',
+    });
+    // Customer identity never participates in this shape at any layer.
     const serialized = JSON.stringify(opportunity);
-    expect(serialized).not.toContain('شارع الأمير سلطان');
-    expect(serialized).not.toContain('معلومات حساسة');
+    expect(serialized).not.toContain('CUS-');
+    expect(serialized).not.toContain(customer.id);
+    for (const key of Object.keys(opportunity)) {
+      expect(key).not.toMatch(/customer|phone|email/i);
+    }
   });
 
   describe('migration CHECK scoping across all four constraints (Q0-SEC regression)', () => {
@@ -2800,6 +2805,159 @@ describe('ServiceRequestRepository', () => {
           submissionFor('not-a-uuid'),
         ),
       ).rejects.toThrow('Invalid client submission id');
+    });
+  });
+  describe('service request image reads (Slice 3)', () => {
+    function storedImageFor(
+      sortOrder: number,
+      storageKey = `request-images/test/2026/08/${randomUUID()}.jpg`,
+    ): StoredRequestImage {
+      return {
+        id: randomUUID(),
+        storageKey,
+        mimeType: 'image/jpeg',
+        byteSize: 100 + sortOrder,
+        contentSha256: createHash('sha256')
+          .update(`slice3-${randomUUID()}-${sortOrder}`)
+          .digest('hex'),
+        sortOrder,
+      };
+    }
+
+    async function createRequestWithImages(images: StoredRequestImage[]) {
+      const uniqueServiceId = `slice3-reads-${randomUUID()}`;
+      const customer = await repository.upsertCustomer(
+        `+9665${String(Math.floor(10_000_000 + Math.random() * 89_999_999))}`,
+      );
+      const request = await repository.create(
+        {
+          serviceId: uniqueServiceId,
+          address: 'حي الصفراء، بريدة',
+          details: 'تفاصيل الصور',
+          timing: 'as-soon-as-possible',
+        },
+        customer.id,
+        undefined,
+        images,
+      );
+      return { request, customerId: customer.id };
+    }
+
+    it('reads committed image metadata for many requests in one batch, ordered by sort_order', async () => {
+      const firstImages = [storedImageFor(1), storedImageFor(0)];
+      const secondImages = [storedImageFor(2), storedImageFor(0)];
+      const first = await createRequestWithImages(firstImages);
+      const second = await createRequestWithImages(secondImages);
+
+      const byRequest = await repository.findRequestImagesByRequestIds([
+        first.request.id,
+        second.request.id,
+      ]);
+
+      expect(
+        byRequest.get(first.request.id)?.map((image) => image.sortOrder),
+      ).toEqual([0, 1]);
+      expect(
+        byRequest.get(second.request.id)?.map((image) => image.sortOrder),
+      ).toEqual([0, 2]);
+      expect(
+        byRequest.get(first.request.id)?.map((image) => image.storageKey),
+      ).toEqual(
+        firstImages
+          .slice()
+          .sort((a, b) => a.sortOrder - b.sortOrder)
+          .map((image) => image.storageKey),
+      );
+    });
+
+    it('returns an empty map for an empty id list without querying', async () => {
+      await expect(
+        repository.findRequestImagesByRequestIds([]),
+      ).resolves.toEqual(new Map());
+    });
+
+    it('exposes address/details/request status only for opportunities the provider owns', async () => {
+      const uniqueServiceId = `slice3-opp-${randomUUID()}`;
+      const { request } = await createPendingRequest(uniqueServiceId);
+      const provider = await createVerifiedProvider([uniqueServiceId]);
+      const otherProvider = await createVerifiedProvider([uniqueServiceId]);
+      await repository.inviteProvidersToRequest(request.id, [provider.id]);
+
+      await expect(
+        repository.listProviderOpportunities(provider.id),
+      ).resolves.toEqual([
+        expect.objectContaining({
+          requestId: request.id,
+          serviceId: uniqueServiceId,
+          opportunityStatus: 'invited',
+          address: 'حي الصفراء، بريدة',
+          details: 'تفاصيل حساسة للخصوصية',
+          requestStatus: 'pending_dispatch',
+        }),
+      ]);
+      await expect(
+        repository.listProviderOpportunities(otherProvider.id),
+      ).resolves.toEqual([]);
+    });
+
+    it('pages committed storage keys under an exact validated prefix only', async () => {
+      const outsideKey = `request-images/other/2026/08/${randomUUID()}.jpg`;
+      const myKeys = [
+        `request-images/test/2026/08/${randomUUID()}-a.jpg`,
+        `request-images/test/2026/08/${randomUUID()}-b.jpg`,
+        `request-images/test/2026/08/${randomUUID()}-c.jpg`,
+      ];
+      await createRequestWithImages([
+        storedImageFor(0, myKeys[0]),
+        storedImageFor(1, myKeys[1]),
+      ]);
+      await createRequestWithImages([
+        storedImageFor(0, myKeys[2]),
+        storedImageFor(1, outsideKey),
+      ]);
+
+      // Pagination mechanics: walk every page until the keyset cursor ends
+      // (other tests in this worker schema leave additional image rows, so
+      // only relative invariants are asserted).
+      const collected: string[] = [];
+      let after: string | undefined;
+      let pages = 0;
+      for (;;) {
+        const page = await repository.listImageStorageKeys(
+          'request-images/test/',
+          after,
+          2,
+        );
+        expect(page.keys.length).toBeLessThanOrEqual(2);
+        expect([...page.keys].sort()).toEqual(page.keys);
+        for (const key of page.keys) {
+          expect(key.startsWith('request-images/test/')).toBe(true);
+          expect(after === undefined || key > after).toBe(true);
+        }
+        collected.push(...page.keys);
+        pages += 1;
+        expect(pages).toBeLessThanOrEqual(50);
+        if (!page.nextAfter) break;
+        after = page.nextAfter;
+      }
+
+      for (const key of myKeys) {
+        expect(collected).toContain(key);
+      }
+      expect(collected).not.toContain(outsideKey);
+
+      await expect(
+        repository.listImageStorageKeys('request-images/../prod/'),
+      ).rejects.toThrow('Invalid request image storage prefix');
+      await expect(
+        repository.listImageStorageKeys('avatars/prod/'),
+      ).rejects.toThrow('Invalid request image storage prefix');
+      await expect(
+        repository.listImageStorageKeys(
+          'request-images/test/',
+          'request-images/test/../../etc/passwd',
+        ),
+      ).rejects.toThrow('Invalid request image storage key');
     });
   });
 });

@@ -27,6 +27,7 @@ import type {
   CustomerQuoteProviderSummary,
   CustomerQuoteView,
   ProviderOpportunity,
+  ProviderOpportunityAccess,
   ProviderOpportunityStatus,
   ServiceRequestStore,
   SupportCategory,
@@ -943,6 +944,87 @@ export class ServiceRequestRepository
       contentSha256: row.content_sha256,
       sortOrder: row.sort_order,
     }));
+  }
+
+  /**
+   * ONE set-based batch read of committed image metadata for many request
+   * ids, keyed by the public request id and ordered by sort_order inside
+   * every request. Used by the authorized read projections so a list of N
+   * requests costs a single bounded query instead of N per-request reads.
+   */
+  async findRequestImagesByRequestIds(
+    requestIds: string[],
+  ): Promise<Map<string, StoredRequestImage[]>> {
+    const byRequest = new Map<string, StoredRequestImage[]>();
+    if (requestIds.length === 0) return byRequest;
+    const databaseIds = requestIds.map((requestId) =>
+      this.toRequestDatabaseId(requestId),
+    );
+    const result = await this.pool.query<
+      ServiceRequestImageRow & { request_id: number }
+    >(
+      `SELECT id, service_request_id AS request_id, storage_key, mime_type,
+              byte_size, content_sha256, sort_order
+         FROM service_request_images
+        WHERE service_request_id = ANY($1::bigint[])
+        ORDER BY service_request_id, sort_order`,
+      [databaseIds],
+    );
+    for (const row of result.rows) {
+      const requestId = `MOE-${1000 + Number(row.request_id)}`;
+      const entry = byRequest.get(requestId) ?? [];
+      entry.push({
+        id: row.id,
+        storageKey: row.storage_key,
+        mimeType: row.mime_type as 'image/jpeg',
+        byteSize: row.byte_size,
+        contentSha256: row.content_sha256,
+        sortOrder: row.sort_order,
+      });
+      byRequest.set(requestId, entry);
+    }
+    return byRequest;
+  }
+
+  /**
+   * Bounded, keyset-paginated listing of committed `service_request_images`
+   * storage keys under an exact, caller-validated namespace prefix. Used by
+   * the orphan-object reconciler to build the authoritative reference set;
+   * the prefix is parameterized (never concatenated from untrusted input)
+   * and every page is capped.
+   */
+  async listImageStorageKeys(
+    prefix: string,
+    after?: string,
+    limit = 500,
+  ): Promise<{ keys: string[]; nextAfter?: string }> {
+    if (!/^request-images\/[a-z0-9][a-z0-9_-]{0,31}\/$/.test(prefix)) {
+      throw new Error('Invalid request image storage prefix');
+    }
+    if (
+      after !== undefined &&
+      (!after.startsWith(prefix) ||
+        after.includes('..') ||
+        !/^request-images\/[a-z0-9][a-z0-9_-]{0,31}\/[a-z0-9/.-]{0,180}$/.test(
+          after,
+        ))
+    ) {
+      throw new Error('Invalid request image storage key');
+    }
+    const bounded = Math.min(Math.max(Math.trunc(limit) || 500, 1), 1000);
+    const result = await this.pool.query<{ storage_key: string }>(
+      `SELECT storage_key
+         FROM service_request_images
+        WHERE storage_key LIKE $1 || '%'
+          AND ($2::text IS NULL OR storage_key > $2)
+        ORDER BY storage_key ASC
+        LIMIT $3`,
+      [prefix, after ?? null, bounded],
+    );
+    const keys = result.rows.map((row) => row.storage_key);
+    return keys.length > 0
+      ? { keys, nextAfter: keys[keys.length - 1] }
+      : { keys };
   }
 
   /**
@@ -2115,11 +2197,14 @@ export class ServiceRequestRepository
 
   async listProviderOpportunities(
     providerId: string,
-  ): Promise<ProviderOpportunity[]> {
+  ): Promise<ProviderOpportunityAccess[]> {
     const result = await this.pool.query<{
       request_id: string;
       service_id: string;
       timing: ServiceRequest['timing'];
+      address: string;
+      details: string | null;
+      request_status: ServiceRequest['status'];
       opportunity_status: ProviderOpportunityStatus;
       quote_id: string | null;
       quote_provider_id: string | null;
@@ -2130,6 +2215,7 @@ export class ServiceRequestRepository
       quote_decided_at: Date | null;
     }>(
       `SELECT r.id AS request_id, r.service_id, r.timing,
+              r.address, r.details, r.status AS request_status,
               o.status AS opportunity_status,
               q.id AS quote_id, q.provider_id AS quote_provider_id,
               q.amount_halalas AS quote_amount_halalas, q.scope AS quote_scope,
@@ -2153,6 +2239,11 @@ export class ServiceRequestRepository
       serviceId: row.service_id,
       timing: row.timing,
       opportunityStatus: row.opportunity_status,
+      // Server-side authorization inputs for the pre-quote projection. These
+      // are stripped by AppService before anything reaches a client.
+      address: row.address,
+      details: row.details ?? undefined,
+      requestStatus: row.request_status,
       myQuote: row.quote_id
         ? {
             id: `QTE-${row.quote_id}`,

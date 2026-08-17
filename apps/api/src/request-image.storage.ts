@@ -1,9 +1,11 @@
 import {
   DeleteObjectsCommand,
   GetObjectCommand,
+  ListObjectsV2Command,
   PutObjectCommand,
   S3Client,
   type DeleteObjectsCommandOutput,
+  type ListObjectsV2CommandOutput,
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import type { EnabledRequestImageConfig } from './request-image.config';
@@ -21,10 +23,25 @@ export type SignedRequestImage = {
   expiresAt: Date;
 };
 
+export type RequestImageStorageList = {
+  items: { key: string; lastModified: Date }[];
+  isTruncated: boolean;
+  nextContinuationToken?: string;
+};
+
+export type RequestImageStorageListInput = {
+  /** Key prefix the caller has already validated (never user input). */
+  prefix: string;
+  /** Page size; the storage implementation clamps it to [1, 1000]. */
+  maxKeys: number;
+  continuationToken?: string;
+};
+
 export interface RequestImageStorage {
   put(input: RequestImagePut): Promise<void>;
   deleteMany(keys: string[]): Promise<void>;
   signGet(key: string): Promise<SignedRequestImage>;
+  list(input: RequestImageStorageListInput): Promise<RequestImageStorageList>;
 }
 
 type S3Sender = {
@@ -109,6 +126,35 @@ export class S3RequestImageStorage implements RequestImageStorage {
       expiresAt: new Date(this.now() + this.config.signedUrlTtlSeconds * 1000),
     };
   }
+
+  async list(
+    input: RequestImageStorageListInput,
+  ): Promise<RequestImageStorageList> {
+    const maxKeys = Math.min(Math.max(Math.trunc(input.maxKeys) || 1, 1), 1000);
+    const response = (await this.client.send(
+      new ListObjectsV2Command({
+        Bucket: this.config.bucket,
+        Prefix: input.prefix,
+        MaxKeys: maxKeys,
+        ...(input.continuationToken
+          ? { ContinuationToken: input.continuationToken }
+          : {}),
+      }),
+    )) as ListObjectsV2CommandOutput;
+    return {
+      items: (response.Contents ?? [])
+        .filter(
+          (item) =>
+            typeof item.Key === 'string' && item.LastModified instanceof Date,
+        )
+        .map((item) => ({
+          key: item.Key as string,
+          lastModified: item.LastModified as Date,
+        })),
+      isTruncated: response.IsTruncated ?? false,
+      nextContinuationToken: response.NextContinuationToken,
+    };
+  }
 }
 
 export class DisabledRequestImageStorage implements RequestImageStorage {
@@ -121,6 +167,10 @@ export class DisabledRequestImageStorage implements RequestImageStorage {
   }
 
   signGet(): Promise<SignedRequestImage> {
+    return Promise.reject(new Error('Request image storage is disabled'));
+  }
+
+  list(): Promise<RequestImageStorageList> {
     return Promise.reject(new Error('Request image storage is disabled'));
   }
 }

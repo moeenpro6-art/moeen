@@ -20,6 +20,7 @@ const storage: RequestImageStorage = {
   put: jest.fn(),
   deleteMany: jest.fn(),
   signGet: jest.fn(),
+  list: jest.fn(),
 };
 
 function file(
