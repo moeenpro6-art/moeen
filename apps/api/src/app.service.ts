@@ -210,6 +210,15 @@ export type ServiceRequest = CreateServiceRequest & {
   rating?: number;
   ratingComment?: string;
   images?: RequestImageDto[];
+  /**
+   * Post-assignment customer contact disclosure. Present ONLY on the
+   * assigned-provider read path while the request is in an active lifecycle
+   * state (`assigned` / `on_the_way` / `in_progress`) and the authenticated
+   * provider is the assigned provider (`service_requests.assigned_provider_id`).
+   * Never present in opportunity, customer, staff, or terminal-state reads,
+   * and never set from any client-supplied value.
+   */
+  customerPhone?: string;
   createdAt: string;
 };
 

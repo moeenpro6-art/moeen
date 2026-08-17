@@ -322,6 +322,32 @@ describe('customer / staff / assigned provider image reads (Slice 3)', () => {
     ]);
   });
 
+  it('carries the customer phone through the assigned-provider read exactly as the store authorized it', async () => {
+    // The store is the authorization boundary: it may disclose the phone
+    // only for the authenticated assigned provider in an active lifecycle
+    // state. The service layer must pass that through without adding or
+    // stripping it.
+    const { toDtos } = imageService([]);
+    const assignedRequest = {
+      ...REQUEST,
+      status: 'assigned' as const,
+      customerPhone: '+966****0012',
+    };
+    const store = {
+      findByProviderId: jest.fn().mockResolvedValue([assignedRequest]),
+      findRequestImagesByRequestIds: jest.fn().mockResolvedValue(new Map()),
+    };
+    const appService = new AppService(
+      store as unknown as ServiceRequestStore,
+      { toDtos } as unknown as RequestImageService,
+    );
+
+    const [result] = await appService.getProviderServiceRequests('provider-1');
+
+    expect(result.customerPhone).toBe('+966****0012');
+    expect(store.findByProviderId).toHaveBeenCalledWith('provider-1');
+  });
+
   it('returns nothing for a provider with no assigned requests (no image reads)', async () => {
     const { toDtos } = imageService([]);
     const store = {

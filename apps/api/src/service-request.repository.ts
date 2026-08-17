@@ -64,6 +64,10 @@ type ServiceRequestRow = {
   details: string | null;
   timing: CreateServiceRequest['timing'];
   status: ServiceRequest['status'];
+  // Present only when the reading query joins the customer (the assigned-
+  // provider read path). Other read paths leave it undefined, so the mapper
+  // can never populate it from rows that were not authorized to carry it.
+  customer_phone: string | null;
   assigned_provider_id: string | null;
   assigned_provider_name: string | null;
   assigned_provider_specialties: string[] | null;
@@ -1280,6 +1284,7 @@ export class ServiceRequestRepository
   async findByProviderId(providerId: string): Promise<ServiceRequest[]> {
     const result = await this.pool.query<ServiceRequestRow>(
       `SELECT r.id, r.service_id, r.address, r.details, r.timing, r.status, r.created_at,
+              c.phone AS customer_phone,
               p.id AS assigned_provider_id, p.name AS assigned_provider_name,
               p.specialties AS assigned_provider_specialties, p.available AS assigned_provider_available,
               r.rating, r.rating_comment,
@@ -1293,6 +1298,7 @@ export class ServiceRequestRepository
               sp.refunded_at AS payment_refunded_at
        FROM service_requests r
        JOIN providers p ON p.id = r.assigned_provider_id
+       LEFT JOIN customers c ON c.id = r.customer_id
        LEFT JOIN LATERAL (
          SELECT id, amount_halalas, scope, status, proposed_at, decided_at
          FROM (
@@ -1719,6 +1725,36 @@ export class ServiceRequestRepository
     }
   }
 
+  /**
+   * Quote gating for entering in_progress. A request with no quotes may
+   * start, and a request with at least one approved quote may start. Any
+   * other combination (only proposed / rejected / withdrawn quotes) is
+   * refused with the existing 'Quote approval required' error. The verdict
+   * aggregates across ALL quotes: a newer rejected or withdrawn quote must
+   * never invalidate an earlier approval, so the rule deliberately does not
+   * inspect only the newest quote.
+   */
+  private async assertServiceMayStart(
+    client: PoolClient,
+    databaseId: number,
+  ): Promise<void> {
+    const summary = await client.query<{
+      approved_count: number;
+      total_count: number;
+    }>(
+      `SELECT
+         COUNT(*) FILTER (WHERE status = 'approved')::int AS approved_count,
+         COUNT(*)::int AS total_count
+       FROM service_quotes
+       WHERE service_request_id = $1`,
+      [databaseId],
+    );
+    const row = summary.rows[0];
+    if (row && row.total_count > 0 && row.approved_count === 0) {
+      throw new Error('Quote approval required');
+    }
+  }
+
   async updateStatus(
     requestId: string,
     status: ServiceRequest['status'],
@@ -1747,16 +1783,7 @@ export class ServiceRequestRepository
         throw new Error('Invalid status transition');
       }
       if (status === 'in_progress') {
-        const latestQuote = await client.query<{ status: ServiceQuoteStatus }>(
-          `SELECT status FROM service_quotes
-           WHERE service_request_id = $1
-           ORDER BY id DESC
-           LIMIT 1`,
-          [databaseId],
-        );
-        if (latestQuote.rows[0] && latestQuote.rows[0].status !== 'approved') {
-          throw new Error('Quote approval required');
-        }
+        await this.assertServiceMayStart(client, databaseId);
       }
       await client.query(
         `UPDATE service_requests SET status = $1 WHERE id = $2`,
@@ -1825,16 +1852,7 @@ export class ServiceRequestRepository
         throw new Error('Invalid status transition');
       }
       if (status === 'in_progress') {
-        const latestQuote = await client.query<{ status: ServiceQuoteStatus }>(
-          `SELECT status FROM service_quotes
-           WHERE service_request_id = $1
-           ORDER BY id DESC
-           LIMIT 1`,
-          [databaseId],
-        );
-        if (latestQuote.rows[0] && latestQuote.rows[0].status !== 'approved') {
-          throw new Error('Quote approval required');
-        }
+        await this.assertServiceMayStart(client, databaseId);
       }
       await client.query(
         'UPDATE service_requests SET status = $1 WHERE id = $2',
@@ -2978,9 +2996,36 @@ export class ServiceRequestRepository
             refunded_at: row.payment_refunded_at,
           })
         : undefined,
+      customerPhone:
+        row.customer_phone != null &&
+        this.mayDiscloseCustomerPhoneToProvider(row.status)
+          ? row.customer_phone
+          : undefined,
       rating: row.rating ?? undefined,
       ratingComment: row.rating_comment ?? undefined,
       createdAt: row.created_at.toISOString(),
     };
+  }
+
+  /**
+   * Authorization gate for post-assignment customer phone disclosure.
+   *
+   * The customer phone may reach a provider response ONLY while the request
+   * is in an active assigned lifecycle state. `findByProviderId` (the one
+   * read path that selects `customer_phone`) already restricts rows to the
+   * authenticated assigned provider via `WHERE r.assigned_provider_id = $1`,
+   * so this status check is the remaining boundary: terminal states
+   * (completed/cancelled) never carry the phone. Every other read path never
+   * selects `customer_phone`, so the mapped field stays absent for customer,
+   * staff, and pre-quote opportunity views regardless of this gate.
+   */
+  private mayDiscloseCustomerPhoneToProvider(
+    status: ServiceRequest['status'],
+  ): boolean {
+    return (
+      status === 'assigned' ||
+      status === 'on_the_way' ||
+      status === 'in_progress'
+    );
   }
 }

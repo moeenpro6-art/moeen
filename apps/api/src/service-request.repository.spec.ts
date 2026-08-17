@@ -549,6 +549,190 @@ describe('ServiceRequestRepository', () => {
     await providerStore.updateProviderAvailability('provider-1', true);
   });
 
+  describe('post-assignment customer phone disclosure (t_ade90f25)', () => {
+    const CUSTOMER_PHONE = '+966****0012';
+
+    async function createAssignedRequest(providerId: string) {
+      const customer = await repository.upsertCustomer(CUSTOMER_PHONE);
+      const request = await repository.create(
+        {
+          serviceId: 'ac-cleaning',
+          address: 'حي الصفراء، بريدة',
+          timing: 'as-soon-as-possible',
+        },
+        customer.id,
+      );
+      await repository.assignProvider(request.id, providerId);
+      return { customer, request };
+    }
+
+    it('returns the customer phone to the assigned provider while the job is assigned', async () => {
+      const { request } = await createAssignedRequest('provider-1');
+
+      const [job] = await repository.findByProviderId('provider-1');
+
+      expect(job).toMatchObject({
+        id: request.id,
+        status: 'assigned',
+        customerPhone: CUSTOMER_PHONE,
+      });
+    });
+
+    it('returns the customer phone to the assigned provider while the job is on_the_way', async () => {
+      const { request } = await createAssignedRequest('provider-1');
+      await repository.updateStatusForProvider(
+        request.id,
+        'provider-1',
+        'on_the_way',
+      );
+
+      const [job] = await repository.findByProviderId('provider-1');
+
+      expect(job).toMatchObject({
+        id: request.id,
+        status: 'on_the_way',
+        customerPhone: CUSTOMER_PHONE,
+      });
+    });
+
+    it('returns the customer phone to the assigned provider while the job is in_progress', async () => {
+      const { request } = await createAssignedRequest('provider-1');
+      await repository.updateStatusForProvider(
+        request.id,
+        'provider-1',
+        'on_the_way',
+      );
+      await repository.updateStatusForProvider(
+        request.id,
+        'provider-1',
+        'in_progress',
+      );
+
+      const [job] = await repository.findByProviderId('provider-1');
+
+      expect(job).toMatchObject({
+        id: request.id,
+        status: 'in_progress',
+        customerPhone: CUSTOMER_PHONE,
+      });
+    });
+
+    it('never returns the customer phone to a provider who is not the assigned provider', async () => {
+      const { request } = await createAssignedRequest('provider-1');
+
+      const wrongProviderJobs = await repository.findByProviderId('provider-3');
+
+      // The request is not even visible to the wrong provider, so the
+      // customer phone cannot reach them through any assigned-job read.
+      expect(wrongProviderJobs.some((job) => job.id === request.id)).toBe(
+        false,
+      );
+    });
+
+    it('withholds the customer phone once the job is completed', async () => {
+      const { request } = await createAssignedRequest('provider-1');
+      await repository.updateStatusForProvider(
+        request.id,
+        'provider-1',
+        'on_the_way',
+      );
+      await repository.updateStatusForProvider(
+        request.id,
+        'provider-1',
+        'in_progress',
+      );
+      await repository.updateStatusForProvider(
+        request.id,
+        'provider-1',
+        'completed',
+      );
+
+      const [job] = await repository.findByProviderId('provider-1');
+
+      expect(job).toMatchObject({ id: request.id, status: 'completed' });
+      expect(job.customerPhone).toBeUndefined();
+    });
+
+    it('withholds the customer phone once the job is cancelled', async () => {
+      const { request } = await createAssignedRequest('provider-1');
+      await repository.updateStatus(request.id, 'cancelled');
+
+      const [job] = await repository.findByProviderId('provider-1');
+
+      expect(job).toMatchObject({ id: request.id, status: 'cancelled' });
+      expect(job.customerPhone).toBeUndefined();
+    });
+
+    it('keeps the invited pre-quote opportunity free of customer identity and contact fields', async () => {
+      const customer = await repository.upsertCustomer(CUSTOMER_PHONE);
+      const request = await repository.create(
+        {
+          serviceId: 'ac-cleaning',
+          address: 'حي الصفراء، بريدة',
+          timing: 'as-soon-as-possible',
+        },
+        customer.id,
+      );
+      await repository.inviteProvidersToRequest(request.id, ['provider-1']);
+
+      const opportunities =
+        await repository.listProviderOpportunities('provider-1');
+
+      const myOpportunity = opportunities.find(
+        (opportunity) => opportunity.requestId === request.id,
+      );
+      expect(myOpportunity).toBeDefined();
+      expect(myOpportunity).toMatchObject({
+        opportunityStatus: 'invited',
+      });
+
+      // The store-level projection is the server's own shape; assert it
+      // never carries customer identity or contact fields at all.
+      const serialized = JSON.stringify(myOpportunity);
+      expect(serialized).not.toContain(CUSTOMER_PHONE);
+      expect(serialized).not.toContain('customerPhone');
+      expect(serialized).not.toContain('customerId');
+      expect(serialized).not.toContain('customerName');
+      expect(serialized).not.toContain('email');
+    });
+
+    it('keeps a quoted-but-not-assigned provider free of the customer phone and job visibility', async () => {
+      const customer = await repository.upsertCustomer(CUSTOMER_PHONE);
+      const request = await repository.create(
+        {
+          serviceId: 'ac-cleaning',
+          address: 'حي الصفراء، بريدة',
+          timing: 'as-soon-as-possible',
+        },
+        customer.id,
+      );
+      await repository.inviteProvidersToRequest(request.id, ['provider-1']);
+      await repository.submitProviderQuote(
+        request.id,
+        'provider-1',
+        15_000,
+        'عرض',
+      );
+
+      const opportunities =
+        await repository.listProviderOpportunities('provider-1');
+      const myOpportunity = opportunities.find(
+        (opportunity) => opportunity.requestId === request.id,
+      );
+      expect(myOpportunity).toBeDefined();
+      expect(myOpportunity).toMatchObject({
+        requestId: request.id,
+        opportunityStatus: 'quoted',
+      });
+      expect(JSON.stringify(myOpportunity)).not.toContain(CUSTOMER_PHONE);
+
+      // Quoting does not assign the provider: the request is not visible as
+      // a job at all, so the phone cannot leak through the job read.
+      const jobs = await repository.findByProviderId('provider-1');
+      expect(jobs.some((job) => job.id === request.id)).toBe(false);
+    });
+  });
+
   it('upgrades a legacy provider access-code hash after a successful login', async () => {
     const accessCode = `provider-access-${randomUUID()}`;
     const provider = await repository.createPilotProvider({
@@ -778,6 +962,276 @@ describe('ServiceRequestRepository', () => {
       repository.updateStatus(request.id, 'in_progress'),
     ).resolves.toMatchObject({
       status: 'in_progress',
+    });
+  });
+
+  describe('service start quote gating (regression: an approved quote must not be invalidated by newer rejected/withdrawn quotes)', () => {
+    // A unique serviceId guarantees no auto-invite side effects: the request
+    // is created first and the two verified providers are then invited
+    // manually through the marketplace path.
+    async function createMarketplaceRequest() {
+      const uniqueServiceId = `start-gate-${randomUUID()}`;
+      const { request, customerId } =
+        await createPendingRequest(uniqueServiceId);
+      const providerA = await createVerifiedProvider([uniqueServiceId]);
+      const providerB = await createVerifiedProvider([uniqueServiceId]);
+      await repository.inviteProvidersToRequest(request.id, [
+        providerA.id,
+        providerB.id,
+      ]);
+      return { request, customerId, providerA, providerB };
+    }
+
+    it('allows a request with no quotes to enter in_progress (staff path)', async () => {
+      const uniqueServiceId = `start-gate-nq-${randomUUID()}`;
+      const { request } = await createPendingRequest(uniqueServiceId);
+      const provider = await createVerifiedProvider([uniqueServiceId]);
+      await repository.assignProvider(request.id, provider.id);
+      await repository.updateStatus(request.id, 'on_the_way');
+      await expect(
+        repository.updateStatus(request.id, 'in_progress'),
+      ).resolves.toMatchObject({ status: 'in_progress' });
+    });
+
+    it('allows a request with no quotes to enter in_progress (provider path)', async () => {
+      const uniqueServiceId = `start-gate-nqp-${randomUUID()}`;
+      const { request } = await createPendingRequest(uniqueServiceId);
+      const provider = await createVerifiedProvider([uniqueServiceId]);
+      await repository.assignProvider(request.id, provider.id);
+      await repository.updateStatusForProvider(
+        request.id,
+        provider.id,
+        'on_the_way',
+      );
+      await expect(
+        repository.updateStatusForProvider(
+          request.id,
+          provider.id,
+          'in_progress',
+        ),
+      ).resolves.toMatchObject({ status: 'in_progress' });
+    });
+
+    it('refuses in_progress while the only quote is still proposed', async () => {
+      const uniqueServiceId = `start-gate-proposed-${randomUUID()}`;
+      const { request } = await createPendingRequest(uniqueServiceId);
+      const provider = await createVerifiedProvider([uniqueServiceId]);
+      await repository.assignProvider(request.id, provider.id);
+      await repository.updateStatus(request.id, 'on_the_way');
+      await repository.proposeQuote(request.id, 15_000, 'عرض مقترح');
+      await expect(
+        repository.updateStatus(request.id, 'in_progress'),
+      ).rejects.toThrow('Quote approval required');
+    });
+
+    it('refuses in_progress while the only quote is rejected', async () => {
+      const uniqueServiceId = `start-gate-rejected-${randomUUID()}`;
+      const { request, customerId } =
+        await createPendingRequest(uniqueServiceId);
+      const quoted = await createVerifiedProvider([uniqueServiceId]);
+      const manual = await createVerifiedProvider([uniqueServiceId]);
+      await repository.inviteProvidersToRequest(request.id, [quoted.id]);
+      const quote = await repository.submitProviderQuote(
+        request.id,
+        quoted.id,
+        15_000,
+        'عرض مرفوض',
+      );
+      await repository.decideQuote(
+        request.id,
+        customerId,
+        quote.id,
+        'rejected',
+      );
+      await repository.assignProvider(request.id, manual.id);
+      await repository.updateStatus(request.id, 'on_the_way');
+      await expect(
+        repository.updateStatus(request.id, 'in_progress'),
+      ).rejects.toThrow('Quote approval required');
+    });
+
+    it('refuses in_progress while the only quote is withdrawn', async () => {
+      const uniqueServiceId = `start-gate-withdrawn-${randomUUID()}`;
+      const { request } = await createPendingRequest(uniqueServiceId);
+      const quoted = await createVerifiedProvider([uniqueServiceId]);
+      const manual = await createVerifiedProvider([uniqueServiceId]);
+      await repository.inviteProvidersToRequest(request.id, [quoted.id]);
+      const quote = await repository.submitProviderQuote(
+        request.id,
+        quoted.id,
+        15_000,
+        'عرض منسحب',
+      );
+      await repository.withdrawProviderQuote(quote.id, quoted.id);
+      await repository.assignProvider(request.id, manual.id);
+      await repository.updateStatus(request.id, 'on_the_way');
+      await expect(
+        repository.updateStatus(request.id, 'in_progress'),
+      ).rejects.toThrow('Quote approval required');
+    });
+
+    it('allows in_progress when the only quote is approved', async () => {
+      const uniqueServiceId = `start-gate-approved-${randomUUID()}`;
+      const { request, customerId } =
+        await createPendingRequest(uniqueServiceId);
+      const provider = await createVerifiedProvider([uniqueServiceId]);
+      await repository.inviteProvidersToRequest(request.id, [provider.id]);
+      const quote = await repository.submitProviderQuote(
+        request.id,
+        provider.id,
+        15_000,
+        'عرض معتمد',
+      );
+      await repository.decideQuote(
+        request.id,
+        customerId,
+        quote.id,
+        'approved',
+      );
+      // Approval assigns the winner and moves the request to 'assigned'.
+      await repository.updateStatus(request.id, 'on_the_way');
+      await expect(
+        repository.updateStatus(request.id, 'in_progress'),
+      ).resolves.toMatchObject({ status: 'in_progress' });
+    });
+
+    it('allows in_progress when an older quote is approved and a newer quote is rejected (staff path)', async () => {
+      const { request, customerId, providerA, providerB } =
+        await createMarketplaceRequest();
+      const olderQuote = await repository.submitProviderQuote(
+        request.id,
+        providerA.id,
+        15_000,
+        'عرض أقدم',
+      );
+      await repository.submitProviderQuote(
+        request.id,
+        providerB.id,
+        12_000,
+        'عرض أحدث',
+      );
+      await repository.decideQuote(
+        request.id,
+        customerId,
+        olderQuote.id,
+        'approved',
+      );
+      // The atomic approval auto-rejects the newer competitor quote, so the
+      // newest quote is rejected while the older one is approved.
+      expect(
+        (await repository.listProviderOpportunities(providerB.id))[0].myQuote
+          ?.status,
+      ).toBe('rejected');
+      await repository.updateStatus(request.id, 'on_the_way');
+      await expect(
+        repository.updateStatus(request.id, 'in_progress'),
+      ).resolves.toMatchObject({ status: 'in_progress' });
+    });
+
+    it('allows the assigned provider to start when an older quote is approved and a newer quote is rejected (provider path)', async () => {
+      const { request, customerId, providerA, providerB } =
+        await createMarketplaceRequest();
+      const olderQuote = await repository.submitProviderQuote(
+        request.id,
+        providerA.id,
+        15_000,
+        'عرض أقدم',
+      );
+      await repository.submitProviderQuote(
+        request.id,
+        providerB.id,
+        12_000,
+        'عرض أحدث',
+      );
+      await repository.decideQuote(
+        request.id,
+        customerId,
+        olderQuote.id,
+        'approved',
+      );
+      await repository.updateStatusForProvider(
+        request.id,
+        providerA.id,
+        'on_the_way',
+      );
+      await expect(
+        repository.updateStatusForProvider(
+          request.id,
+          providerA.id,
+          'in_progress',
+        ),
+      ).resolves.toMatchObject({ status: 'in_progress' });
+    });
+
+    it('allows in_progress when an older quote is approved and a newer quote is withdrawn (provider path)', async () => {
+      const { request, customerId, providerA, providerB } =
+        await createMarketplaceRequest();
+      const olderQuote = await repository.submitProviderQuote(
+        request.id,
+        providerA.id,
+        15_000,
+        'عرض أقدم',
+      );
+      const newerQuote = await repository.submitProviderQuote(
+        request.id,
+        providerB.id,
+        12_000,
+        'عرض أحدث',
+      );
+      await repository.withdrawProviderQuote(newerQuote.id, providerB.id);
+      await repository.decideQuote(
+        request.id,
+        customerId,
+        olderQuote.id,
+        'approved',
+      );
+      await repository.updateStatusForProvider(
+        request.id,
+        providerA.id,
+        'on_the_way',
+      );
+      await expect(
+        repository.updateStatusForProvider(
+          request.id,
+          providerA.id,
+          'in_progress',
+        ),
+      ).resolves.toMatchObject({ status: 'in_progress' });
+    });
+
+    it('keeps rejecting an invalid status transition', async () => {
+      const uniqueServiceId = `start-gate-transition-${randomUUID()}`;
+      const { request } = await createPendingRequest(uniqueServiceId);
+      const provider = await createVerifiedProvider([uniqueServiceId]);
+      await repository.assignProvider(request.id, provider.id);
+      // 'assigned' -> 'in_progress' must still pass through 'on_the_way'.
+      await expect(
+        repository.updateStatusForProvider(
+          request.id,
+          provider.id,
+          'in_progress',
+        ),
+      ).rejects.toThrow('Invalid status transition');
+    });
+
+    it('keeps rejecting updates from a provider who is not assigned', async () => {
+      const uniqueServiceId = `start-gate-owner-${randomUUID()}`;
+      const { request } = await createPendingRequest(uniqueServiceId);
+      const assigned = await createVerifiedProvider([uniqueServiceId]);
+      const stranger = await createVerifiedProvider([uniqueServiceId]);
+      await repository.assignProvider(request.id, assigned.id);
+      await repository.updateStatusForProvider(
+        request.id,
+        assigned.id,
+        'on_the_way',
+      );
+      await expect(
+        repository.updateStatusForProvider(
+          request.id,
+          stranger.id,
+          'in_progress',
+        ),
+      ).rejects.toThrow('Assigned provider request not found');
     });
   });
 
