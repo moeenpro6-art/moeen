@@ -4,6 +4,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
 
+import 'request_images.dart';
+import 'moeen_ui.dart';
+
 const _providerTokenStorageKey = 'moeen_provider_session_token';
 const _serviceNames = {
   'ac-cleaning': 'تنظيف المكيفات',
@@ -41,7 +44,8 @@ String opportunityMessage(ProviderOpportunity opp) {
       opp.myQuote!.status != 'approved') {
     return 'تم إغلاق الفرصة بعد اختيار عرض آخر';
   }
-  return _opportunityStatusLabels[opp.opportunityStatus] ?? opp.opportunityStatus;
+  return _opportunityStatusLabels[opp.opportunityStatus] ??
+      opp.opportunityStatus;
 }
 
 void main() {
@@ -110,6 +114,7 @@ class ProviderJob {
     required this.timing,
     required this.status,
     this.quote,
+    this.customerPhone,
   });
 
   final String id;
@@ -119,6 +124,11 @@ class ProviderJob {
   final String timing;
   final String status;
   final ProviderQuote? quote;
+
+  /// Post-assignment customer contact number. Present ONLY when the API
+  /// returns it for the authenticated assigned provider in an active
+  /// lifecycle state; never synthesized or defaulted on the client.
+  final String? customerPhone;
 
   factory ProviderJob.fromJson(Map<String, dynamic> json) {
     final quote = json['quote'];
@@ -132,6 +142,7 @@ class ProviderJob {
       quote: quote is Map<String, dynamic>
           ? ProviderQuote.fromJson(quote)
           : null,
+      customerPhone: json['customerPhone'] as String?,
     );
   }
 }
@@ -143,6 +154,9 @@ class ProviderOpportunity {
     required this.timing,
     required this.opportunityStatus,
     this.myQuote,
+    this.address,
+    this.details,
+    this.images = const [],
   });
 
   final String requestId;
@@ -150,6 +164,15 @@ class ProviderOpportunity {
   final String timing;
   final String opportunityStatus;
   final ProviderQuote? myQuote;
+
+  /// Pre-quote fields the API includes ONLY while this provider owns the
+  /// opportunity and it is eligible/current (`invited`/`quoted` with the
+  /// request still pending dispatch). Terminal or ineligible opportunities
+  /// never carry them, and customer identity/contact data is never part of
+  /// the opportunity shape at all.
+  final String? address;
+  final String? details;
+  final List<ProviderRequestImage> images;
 
   factory ProviderOpportunity.fromJson(Map<String, dynamic> json) {
     final quote = json['myQuote'];
@@ -161,6 +184,9 @@ class ProviderOpportunity {
       myQuote: quote is Map<String, dynamic>
           ? ProviderQuote.fromJson(quote)
           : null,
+      address: json['address'] as String?,
+      details: json['details'] as String?,
+      images: ProviderRequestImage.listFromJson(json['images']),
     );
   }
 }
@@ -223,8 +249,8 @@ String providerActionLabel(ProviderJob job) {
 
 class ProviderApi {
   ProviderApi({http.Client? client, String? baseUrl})
-      : _client = client ?? http.Client(),
-        _config = ProviderApiConfig(baseUrl ?? _defaultBaseUrl);
+    : _client = client ?? http.Client(),
+      _config = ProviderApiConfig(baseUrl ?? _defaultBaseUrl);
 
   static const _defaultBaseUrl = String.fromEnvironment('MOEEN_API_BASE_URL');
 
@@ -288,8 +314,10 @@ class ProviderApi {
     if (body is! List<dynamic>) throw const ProviderApiException();
     return body
         .whereType<Map<dynamic, dynamic>>()
-        .map((item) =>
-            ProviderOpportunity.fromJson(Map<String, dynamic>.from(item)))
+        .map(
+          (item) =>
+              ProviderOpportunity.fromJson(Map<String, dynamic>.from(item)),
+        )
         .toList();
   }
 
@@ -626,10 +654,7 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
     if (token == null) return;
     setState(() => _submitting = true);
     try {
-      await Future.wait([
-        _loadDashboard(token),
-        _loadOpportunities(),
-      ]);
+      await Future.wait([_loadDashboard(token), _loadOpportunities()]);
     } on ProviderUnauthorizedException {
       await _expireSession();
     } catch (_) {
@@ -653,6 +678,72 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
     } finally {
       if (mounted) setState(() => _submitting = false);
     }
+  }
+
+  Future<void> _confirmAndAdvance(
+    ProviderJob job,
+    BuildContext sheetContext,
+  ) async {
+    final nextStatus = nextProviderStatus(job);
+    if (nextStatus == null) return;
+    final action = providerActionLabel(job);
+    final explanation = switch (nextStatus) {
+      'on_the_way' =>
+        'سيتم إبلاغ العميل بأنك في الطريق. تأكد من استعدادك للمغادرة.',
+      'in_progress' =>
+        'سيتم تحديث حالة الطلب إلى قيد التنفيذ. ابدأ الخدمة بعد وصولك للموقع.',
+      'completed' =>
+        'سيتم إبلاغ العميل باكتمال الخدمة. تأكد من إنهاء العمل المتفق عليه قبل المتابعة.',
+      _ => 'سيتم تحديث حالة المهمة.',
+    };
+
+    // The sheet must be shown from a context inside the MaterialApp /
+    // Navigator subtree. `this.context` is the MoeenProviderApp element,
+    // which sits ABOVE the MaterialApp returned by build(), so it has no
+    // MaterialLocalizations. The caller therefore passes the transition
+    // button's Builder context (same pattern as _openQuoteSheet).
+    final confirmed = await showModalBottomSheet<bool>(
+      context: sheetContext,
+      isScrollControlled: true,
+      showDragHandle: true,
+      builder: (bottomSheetContext) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(24, 8, 24, 24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                action,
+                style: Theme.of(bottomSheetContext).textTheme.titleLarge?.copyWith(
+                  color: MoeenColors.primaryDark,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+              const SizedBox(height: MoeenSpacing.sm),
+              Text(
+                explanation,
+                style: Theme.of(bottomSheetContext).textTheme.bodyLarge?.copyWith(
+                  color: MoeenColors.mutedText,
+                  height: 1.45,
+                ),
+              ),
+              const SizedBox(height: MoeenSpacing.lg),
+              FilledButton(
+                onPressed: () => Navigator.of(bottomSheetContext).pop(true),
+                child: Text('تأكيد: $action'),
+              ),
+              const SizedBox(height: MoeenSpacing.sm),
+              OutlinedButton(
+                onPressed: () => Navigator.of(bottomSheetContext).pop(false),
+                child: const Text('رجوع'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+    if (confirmed == true && mounted) await _advance(job);
   }
 
   Future<void> _advance(ProviderJob job) async {
@@ -702,11 +793,7 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       title: 'معين للمحترفين',
-      theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF0B6E69)),
-        useMaterial3: true,
-        scaffoldBackgroundColor: const Color(0xFFF7FAF9),
-      ),
+      theme: MoeenTheme.light(),
       home: Directionality(
         textDirection: TextDirection.rtl,
         child: _loading
@@ -934,8 +1021,7 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
   Widget _buildOpportunityCard(ProviderOpportunity opportunity) {
     final serviceLabel =
         _serviceNames[opportunity.serviceId] ?? opportunity.serviceId;
-    final timingLabel =
-        _timingLabels[opportunity.timing] ?? opportunity.timing;
+    final timingLabel = _timingLabels[opportunity.timing] ?? opportunity.timing;
     final statusLabel = opportunityMessage(opportunity);
     final quote = opportunity.myQuote;
     return Card(
@@ -951,6 +1037,74 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
             ),
             const SizedBox(height: 4),
             Text('$timingLabel · $statusLabel'),
+            if (opportunity.address == null ||
+                (opportunity.details?.trim().isEmpty ?? true)) ...[
+              const SizedBox(height: 10),
+              Semantics(
+                liveRegion: true,
+                child: Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFFFF4D6),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: const Color(0xFFE7C56C)),
+                  ),
+                  child: const Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Icon(
+                        Icons.info_outline_rounded,
+                        color: MoeenColors.warning,
+                      ),
+                      SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          'بعض تفاصيل الموقع أو وصف الطلب غير متاحة بعد. قدّم عرضاً بعد تقديرك المهني فقط، ولا نفترض معلومات غير ظاهرة.',
+                          style: TextStyle(
+                            color: MoeenColors.primaryDark,
+                            height: 1.4,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+            if (opportunity.address != null) ...[
+              const SizedBox(height: 8),
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Icon(
+                    Icons.location_on_outlined,
+                    size: 18,
+                    color: Color(0xFF0B6E69),
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(child: Text(opportunity.address!)),
+                ],
+              ),
+            ],
+            if (opportunity.details?.isNotEmpty ?? false) ...[
+              const SizedBox(height: 6),
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Icon(
+                    Icons.notes_rounded,
+                    size: 18,
+                    color: Color(0xFF0B6E69),
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(child: Text(opportunity.details!)),
+                ],
+              ),
+            ],
+            if (opportunity.images.isNotEmpty) ...[
+              const SizedBox(height: 10),
+              ProviderRequestImageThumbnails(images: opportunity.images),
+            ],
             if (quote != null && opportunity.opportunityStatus == 'quoted') ...[
               const SizedBox(height: 8),
               Text(
@@ -1033,10 +1187,21 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
               ),
             ],
             const SizedBox(height: 12),
+            if (job.customerPhone != null && job.customerPhone!.isNotEmpty) ...[
+              Text(
+                'رقم العميل: ${job.customerPhone}',
+                style: const TextStyle(fontWeight: FontWeight.w700),
+              ),
+            ],
+            const SizedBox(height: 12),
             if (nextStatus != null)
-              FilledButton(
-                onPressed: _submitting ? null : () => _advance(job),
-                child: Text(providerActionLabel(job)),
+              Builder(
+                builder: (buttonContext) => FilledButton(
+                  onPressed: _submitting
+                      ? null
+                      : () => _confirmAndAdvance(job, buttonContext),
+                  child: Text(providerActionLabel(job)),
+                ),
               )
             else
               Text(
