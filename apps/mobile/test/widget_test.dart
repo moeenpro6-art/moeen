@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:moeen_mobile/customer_notifications.dart';
 import 'package:moeen_mobile/main.dart';
 
 void main() {
@@ -7,6 +8,11 @@ void main() {
     await tester.pumpWidget(const MoeenApp());
     expect(find.text('تسجيل الدخول'), findsOneWidget);
     expect(find.text('رقم الجوال'), findsOneWidget);
+  });
+
+  test('FCM is disabled by default for local/unconfigured builds', () {
+    // The flag is baked at compile time; without --dart-define it is false.
+    expect(CustomerFcmConfig.enabled, isFalse);
   });
 
   test('uses Arabic labels for customer support categories', () {
@@ -241,51 +247,55 @@ void main() {
     },
   );
 
-  test('CustomerRequest.fromJson parses the quotes array with mixed statuses', () {
-    final request = CustomerRequest.fromJson({
-      'id': 'MOE-2001',
-      'serviceId': 'ac-cleaning',
-      'status': 'pending_dispatch',
-      'quotes': [
-        {
-          'id': 'QTE-10',
-          'amountHalalas': 15000,
-          'scope': 'عرض أ',
-          'status': 'proposed',
-        },
-        {
-          'id': 'QTE-11',
-          'amountHalalas': 12000,
-          'scope': 'عرض ب',
-          'status': 'rejected',
-        },
-      ],
-    });
+  test(
+    'CustomerRequest.fromJson parses the quotes array with mixed statuses',
+    () {
+      final request = CustomerRequest.fromJson({
+        'id': 'MOE-2001',
+        'serviceId': 'ac-cleaning',
+        'status': 'pending_dispatch',
+        'quotes': [
+          {
+            'id': 'QTE-10',
+            'amountHalalas': 15000,
+            'scope': 'عرض أ',
+            'status': 'proposed',
+          },
+          {
+            'id': 'QTE-11',
+            'amountHalalas': 12000,
+            'scope': 'عرض ب',
+            'status': 'rejected',
+          },
+        ],
+      });
 
-    expect(request.quotes, hasLength(2));
-    expect(request.quotes[0].status, 'proposed');
-    expect(request.quotes[1].status, 'rejected');
-  });
+      expect(request.quotes, hasLength(2));
+      expect(request.quotes[0].status, 'proposed');
+      expect(request.quotes[1].status, 'rejected');
+    },
+  );
 
   test(
-      'CustomerRequest.fromJson falls back to empty quotes when array is absent',
-      () {
-    final request = CustomerRequest.fromJson({
-      'id': 'MOE-2002',
-      'serviceId': 'plumbing',
-      'status': 'pending_dispatch',
-      'quote': {
-        'id': 'QTE-9',
-        'amountHalalas': 10000,
-        'scope': 'عرض فردي',
-        'status': 'proposed',
-      },
-    });
+    'CustomerRequest.fromJson falls back to empty quotes when array is absent',
+    () {
+      final request = CustomerRequest.fromJson({
+        'id': 'MOE-2002',
+        'serviceId': 'plumbing',
+        'status': 'pending_dispatch',
+        'quote': {
+          'id': 'QTE-9',
+          'amountHalalas': 10000,
+          'scope': 'عرض فردي',
+          'status': 'proposed',
+        },
+      });
 
-    expect(request.quotes, isEmpty);
-    expect(request.quote, isNotNull);
-    expect(request.quote!.status, 'proposed');
-  });
+      expect(request.quotes, isEmpty);
+      expect(request.quote, isNotNull);
+      expect(request.quote!.status, 'proposed');
+    },
+  );
 
   test('legacy singular quote field is preserved alongside quotes', () {
     final request = CustomerRequest.fromJson({
