@@ -16,6 +16,8 @@ import { LoginAttemptLimiter } from './login-attempt-limiter.service';
 import { PublicAuthRateLimiter } from './public-auth-rate-limiter.service';
 import { ProviderAuthService } from './provider-auth.service';
 import { RequestImageService } from './request-image.service';
+import { FcmDeviceRepository } from './fcm-device.repository';
+import { FcmDeviceService } from './fcm-device.service';
 import {
   DisabledRequestImageStorage,
   REQUEST_IMAGE_STORAGE,
@@ -51,6 +53,8 @@ import type { RequestImageConfig } from './request-image.config';
       useFactory: () => otpProviderFromEnvironment(process.env),
     },
     ServiceRequestRepository,
+    FcmDeviceRepository,
+    FcmDeviceService,
     StaffAuthRepository,
     LoginAttemptLimiter,
     PublicAuthRateLimiter,

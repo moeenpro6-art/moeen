@@ -12,6 +12,7 @@ import { StaffAuditService } from './staff-audit.service';
 import { CustomerAuthService } from './customer-auth.service';
 import { ProviderAuthService } from './provider-auth.service';
 import { PublicAuthRateLimiter } from './public-auth-rate-limiter.service';
+import { FcmDeviceService } from './fcm-device.service';
 
 const VALID_IDEMPOTENCY_KEY = '11111111-1111-4111-8111-111111111111';
 const CUSTOMER = { id: 'CUS-1001', phone: '+966500000001' };
@@ -71,6 +72,7 @@ describe('POST /service-requests multipart entry', () => {
         { provide: CustomerAuthService, useValue: {} },
         { provide: ProviderAuthService, useValue: {} },
         { provide: PublicAuthRateLimiter, useValue: {} },
+        { provide: FcmDeviceService, useValue: {} },
       ],
     }).compile();
     app = moduleFixture.createNestApplication<NestExpressApplication>();
