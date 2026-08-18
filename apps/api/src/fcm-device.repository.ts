@@ -1,7 +1,14 @@
 import { randomUUID } from 'node:crypto';
-import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import {
+  Inject,
+  Injectable,
+  OnModuleDestroy,
+  OnModuleInit,
+  Optional,
+} from '@nestjs/common';
 import { Pool, type PoolClient } from 'pg';
 import { resolveDatabaseConnectionString } from './database.config';
+import { ServiceRequestRepository } from './service-request.repository';
 import {
   FcmDeviceLimitExceededError,
   FcmTokenConflictError,
@@ -59,7 +66,35 @@ export class FcmDeviceRepository
     connectionString: resolveDatabaseConnectionString(),
   });
 
+  private readonly dependency: ServiceRequestRepository | undefined;
+
+  /**
+   * The FCM tables carry foreign keys to `customers`, `providers` and
+   * `service_requests`, all of which are created by
+   * `ServiceRequestRepository.initialize()`. Because Nest runs every
+   * `onModuleInit` hook through `Promise.all`, repository initialization
+   * order is non-deterministic, so this repository could win the shared
+   * schema advisory lock first and issue `CREATE TABLE ... REFERENCES
+   * customers(id)` before `customers` exists — `IF NOT EXISTS` does NOT
+   * protect against a foreign key referencing a missing table.
+   *
+   * Declaring the dependency explicitly makes Nest instantiate and
+   * `onModuleInit` the owning repository BEFORE this one, so the referenced
+   * tables are guaranteed to exist by the time the FCM tables are created.
+   * In direct constructions (focused repository tests) the dependency is
+   * absent and callers must still initialize `ServiceRequestRepository`
+   * first — exactly the ordering they already use.
+   */
+  constructor(
+    @Optional()
+    @Inject(ServiceRequestRepository)
+    dependency?: ServiceRequestRepository,
+  ) {
+    this.dependency = dependency;
+  }
+
   async onModuleInit(): Promise<void> {
+    await this.dependency?.initialize();
     await this.initialize();
   }
 
@@ -129,10 +164,15 @@ export class FcmDeviceRepository
               CONSTRAINT notification_outbox_notification_type_check
               CHECK (notification_type IN (
                 'request_created',
-                'provider_assigned',
+                'quote_received',
+                'assignment_confirmed',
                 'provider_on_the_way',
+                'service_in_progress',
                 'request_completed',
+                'request_cancelled',
                 'opportunity_invited',
+                'provider_assigned',
+                'opportunity_closed',
                 'quote_approved'
               )),
             service_request_id BIGINT REFERENCES service_requests(id),
@@ -157,6 +197,7 @@ export class FcmDeviceRepository
                 'unregistered_token',
                 'network_error',
                 'throttled',
+                'config_error',
                 'unknown'
               )),
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),

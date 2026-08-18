@@ -730,6 +730,42 @@ const V3_SCHEMA_CONTRACT: SchemaContract = {
   },
 };
 
+/**
+ * Migration 0004 is an additive CHECK-constraint widening required by the
+ * approved FCM-2 Pilot event matrix. The table/column/index shape is unchanged;
+ * only the accepted notification types and safe error classifications grow.
+ */
+const V4_SCHEMA_CONTRACT: SchemaContract = {
+  ...V3_SCHEMA_CONTRACT,
+  constraintTokens: {
+    ...V3_SCHEMA_CONTRACT.constraintTokens,
+    notification_outbox_notification_type_check: [
+      'notification_type',
+      'request_created',
+      'quote_received',
+      'assignment_confirmed',
+      'provider_on_the_way',
+      'service_in_progress',
+      'request_completed',
+      'request_cancelled',
+      'opportunity_invited',
+      'provider_assigned',
+      'opportunity_closed',
+      'quote_approved',
+    ],
+    notification_outbox_last_error_kind_check: [
+      'last_error_kind',
+      'no_active_device',
+      'invalid_token',
+      'unregistered_token',
+      'network_error',
+      'throttled',
+      'config_error',
+      'unknown',
+    ],
+  },
+};
+
 export type DatabaseMigration = {
   version: string;
   name: string;
@@ -1306,6 +1342,12 @@ function contractForMigration(
   }
   if (migration?.version === '0003' && migration.name === 'fcm_notifications') {
     return V3_SCHEMA_CONTRACT;
+  }
+  if (
+    migration?.version === '0004' &&
+    migration.name === 'fcm_notification_types'
+  ) {
+    return V4_SCHEMA_CONTRACT;
   }
   return undefined;
 }

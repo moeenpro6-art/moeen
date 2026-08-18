@@ -16,6 +16,10 @@ Local secrets belong in ignored `.env` files only. Never commit them, paste them
 | `TWILIO_API_KEY` | Standard Twilio API Key SID used only by the API process. |
 | `TWILIO_API_SECRET` | Secret paired with `TWILIO_API_KEY`; never commit or expose it. |
 | `TWILIO_VERIFY_SERVICE_SID` | Verify Service SID for `Moeen Customer OTP`. |
+| `FCM_NOTIFICATIONS_ENABLED` | FCM notification outbox/dispatcher switch. Unset/`false` disables all enqueueing, Firebase initialization, and external sends. |
+| `FIREBASE_PROJECT_ID` | Firebase project id. Required and validated only when FCM notifications are enabled. |
+| `FIREBASE_CLIENT_EMAIL` | Firebase service-account client email. Required only when FCM is enabled. |
+| `FIREBASE_PRIVATE_KEY` | Firebase service-account PKCS#8 PEM private key. Store only as a deployment secret; raw multiline and Railway-style literal `\\n` separators are accepted. Never commit service-account JSON. |
 
 The initial-admin values are read during API startup. Bootstrap is idempotent and does not overwrite an existing account.
 
