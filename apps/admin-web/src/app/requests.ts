@@ -22,6 +22,20 @@ export type ApiServiceOpportunitySummary = {
   total: number;
 };
 
+/**
+ * Public projection of a committed request image (`RequestImageDto`).
+ * Only safe public fields are kept: no storage keys, bucket details,
+ * credentials, or internal URLs ever reach the dashboard.
+ */
+export type ApiRequestImage = {
+  id: string;
+  mimeType: string;
+  byteSize: number;
+  sortOrder: number;
+  url: string;
+  urlExpiresAt?: string;
+};
+
 export type ApiServicePayment = {
   id: string;
   amountHalalas: number;
@@ -53,6 +67,7 @@ export type ApiServiceRequest = {
   payment?: ApiServicePayment;
   rating?: number;
   ratingComment?: string;
+  images?: ApiRequestImage[];
   createdAt: string;
 };
 
@@ -70,6 +85,7 @@ export type DashboardRequest = {
   payment?: ApiServicePayment;
   rating?: number;
   ratingComment?: string;
+  images?: ApiRequestImage[];
 };
 
 const serviceNames: Record<string, string> = {
@@ -130,6 +146,14 @@ export function toDashboardRequest(request: ApiServiceRequest): DashboardRequest
       ? { opportunities: request.opportunities }
       : {}),
     ...(request.payment ? { payment: request.payment } : {}),
+    ...(request.images && request.images.length > 0
+      ? {
+          // Preserve the server sort order deterministically.
+          images: [...request.images].sort(
+            (left, right) => left.sortOrder - right.sortOrder,
+          ),
+        }
+      : {}),
     rating: request.rating,
     ratingComment: request.ratingComment,
   };
@@ -188,6 +212,32 @@ function isApiServicePayment(value: unknown): value is ApiServicePayment {
   );
 }
 
+export function isApiRequestImage(value: unknown): value is ApiRequestImage {
+  if (typeof value !== 'object' || value === null) return false;
+  const image = value as Record<string, unknown>;
+  if (typeof image.id !== 'string' || image.id.length === 0) return false;
+  if (typeof image.mimeType !== 'string') return false;
+  if (!Number.isInteger(image.byteSize) || Number(image.byteSize) < 0) {
+    return false;
+  }
+  if (!Number.isInteger(image.sortOrder)) return false;
+  if (typeof image.url !== 'string') return false;
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(image.url);
+  } catch {
+    return false;
+  }
+  // Only http(s) URLs are accepted: javascript:/data:/file: schemes and
+  // malformed URLs never reach an <img> src on the dashboard.
+  if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
+    return false;
+  }
+  return (
+    image.urlExpiresAt === undefined || typeof image.urlExpiresAt === 'string'
+  );
+}
+
 export function isApiServiceRequest(value: unknown): value is ApiServiceRequest {
   if (typeof value !== 'object' || value === null) return false;
 
@@ -204,6 +254,9 @@ export function isApiServiceRequest(value: unknown): value is ApiServiceRequest 
     (request.quote === undefined || isApiServiceQuote(request.quote)) &&
     (request.opportunities === undefined ||
       isApiServiceOpportunitySummary(request.opportunities)) &&
-    (request.payment === undefined || isApiServicePayment(request.payment))
+    (request.payment === undefined || isApiServicePayment(request.payment)) &&
+    (request.images === undefined ||
+      (Array.isArray(request.images) &&
+        request.images.every(isApiRequestImage)))
   );
 }

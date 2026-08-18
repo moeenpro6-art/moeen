@@ -27,6 +27,7 @@ import type {
   CustomerQuoteProviderSummary,
   CustomerQuoteView,
   ProviderOpportunity,
+  ProviderOpportunityAccess,
   ProviderOpportunityStatus,
   ServiceRequestStore,
   SupportCategory,
@@ -37,6 +38,24 @@ import {
   toStaffDatabaseId,
   type StaffAuditSpec,
 } from './staff-auth.repository';
+import {
+  RequestSubmissionConflictError,
+  RequestSubmissionReplayError,
+  type ServiceRequestSubmissionContext,
+} from './request-image-create.contracts';
+import type { StoredRequestImage } from './request-image.types';
+
+type ServiceRequestImageRow = {
+  id: string;
+  storage_key: string;
+  mime_type: string;
+  byte_size: number;
+  content_sha256: string;
+  sort_order: number;
+};
+
+const CLIENT_SUBMISSION_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 type ServiceRequestRow = {
   id: string;
@@ -45,6 +64,10 @@ type ServiceRequestRow = {
   details: string | null;
   timing: CreateServiceRequest['timing'];
   status: ServiceRequest['status'];
+  // Present only when the reading query joins the customer (the assigned-
+  // provider read path). Other read paths leave it undefined, so the mapper
+  // can never populate it from rows that were not authorized to carry it.
+  customer_phone: string | null;
   assigned_provider_id: string | null;
   assigned_provider_name: string | null;
   assigned_provider_specialties: string[] | null;
@@ -370,6 +393,77 @@ export class ServiceRequestRepository
         await client.query(
           'ALTER TABLE service_requests ADD COLUMN IF NOT EXISTS rating_comment TEXT',
         );
+        // Migration 0002 objects (idempotent): the versioned migration runner
+        // applies these in deployed environments before the app boots; here
+        // they are replayed additively so repository-level tests and legacy
+        // bootstraps converge on the same schema. Every statement is a no-op
+        // when the objects already exist, and the whole block runs inside the
+        // schema-keyed advisory-lock transaction that serializes initialize().
+        await client.query(
+          'ALTER TABLE service_requests ADD COLUMN IF NOT EXISTS client_submission_id UUID',
+        );
+        await client.query(
+          'ALTER TABLE service_requests ADD COLUMN IF NOT EXISTS submission_fingerprint CHAR(64)',
+        );
+        await client.query(`
+          DO $$
+          BEGIN
+            IF NOT EXISTS (
+              SELECT 1 FROM pg_constraint
+              WHERE conname = 'service_requests_submission_pair_check'
+                AND conrelid = to_regclass('service_requests')
+            ) THEN
+              ALTER TABLE service_requests
+                ADD CONSTRAINT service_requests_submission_pair_check
+                CHECK (
+                  (client_submission_id IS NULL) =
+                  (submission_fingerprint IS NULL)
+                );
+            END IF;
+            IF NOT EXISTS (
+              SELECT 1 FROM pg_constraint
+              WHERE conname = 'service_requests_submission_fingerprint_check'
+                AND conrelid = to_regclass('service_requests')
+            ) THEN
+              ALTER TABLE service_requests
+                ADD CONSTRAINT service_requests_submission_fingerprint_check
+                CHECK (
+                  submission_fingerprint IS NULL
+                  OR submission_fingerprint ~ '^[0-9a-f]{64}$'
+                );
+            END IF;
+          END $$;
+        `);
+        await client.query(
+          `CREATE UNIQUE INDEX IF NOT EXISTS service_requests_customer_submission_unique
+           ON service_requests (customer_id, client_submission_id)
+           WHERE client_submission_id IS NOT NULL`,
+        );
+        await client.query(`
+          CREATE TABLE IF NOT EXISTS service_request_images (
+            id UUID PRIMARY KEY,
+            service_request_id BIGINT NOT NULL
+              REFERENCES service_requests(id) ON DELETE NO ACTION,
+            storage_key TEXT NOT NULL UNIQUE,
+            mime_type TEXT NOT NULL
+              CONSTRAINT service_request_images_mime_type_check
+              CHECK (mime_type = 'image/jpeg'),
+            byte_size INTEGER NOT NULL
+              CONSTRAINT service_request_images_byte_size_check
+              CHECK (byte_size > 0 AND byte_size <= 5242880),
+            content_sha256 CHAR(64) NOT NULL
+              CONSTRAINT service_request_images_content_sha256_check
+              CHECK (content_sha256 ~ '^[0-9a-f]{64}$'),
+            sort_order SMALLINT NOT NULL
+              CONSTRAINT service_request_images_sort_order_check
+              CHECK (sort_order BETWEEN 0 AND 4),
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CONSTRAINT service_request_images_request_sort_unique
+              UNIQUE (service_request_id, sort_order),
+            CONSTRAINT service_request_images_request_content_unique
+              UNIQUE (service_request_id, content_sha256)
+          )
+        `);
         await client.query(`
           CREATE TABLE IF NOT EXISTS service_request_events (
             id BIGSERIAL PRIMARY KEY,
@@ -640,24 +734,101 @@ export class ServiceRequestRepository
   async create(
     input: CreateServiceRequest,
     customerId: string,
+    submission?: ServiceRequestSubmissionContext,
+    images?: StoredRequestImage[],
   ): Promise<ServiceRequest> {
+    // Last-resort integrity guard: the HTTP layer validates the UUID v4
+    // Idempotency-Key, but the repository never trusts callers and rejects
+    // malformed keys with a deterministic error before any SQL runs.
+    if (
+      submission &&
+      !CLIENT_SUBMISSION_ID_PATTERN.test(submission.clientSubmissionId)
+    ) {
+      throw new Error('Invalid client submission id');
+    }
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
-      const result = await client.query<ServiceRequestRow>(
-        `INSERT INTO service_requests (service_id, address, details, timing, customer_id)
-         VALUES ($1, $2, $3, $4, $5)
-         RETURNING id, service_id, address, details, timing, status, created_at`,
-        [
-          input.serviceId,
-          input.address,
-          input.details ?? null,
-          input.timing,
-          this.toCustomerDatabaseId(customerId),
-        ],
-      );
-      const row = result.rows[0];
+      const databaseCustomerId = this.toCustomerDatabaseId(customerId);
+      let row: ServiceRequestRow | undefined;
+      if (submission) {
+        // Atomic same-key arbitration: the partial unique index
+        // service_requests_customer_submission_unique makes the first
+        // committer win; a concurrent (or repeated) submission with the same
+        // (customer, client_submission_id) blocks until the winner's outcome
+        // is decided, then inserts nothing. The existing committed row is
+        // then re-read inside the same transaction and compared by content
+        // fingerprint: identical content replays, different content
+        // conflicts. Either error rolls this transaction back — nothing is
+        // inserted, and the caller compensates uploaded objects.
+        const inserted = await client.query<ServiceRequestRow>(
+          `INSERT INTO service_requests
+             (service_id, address, details, timing, customer_id,
+              client_submission_id, submission_fingerprint)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)
+           ON CONFLICT (customer_id, client_submission_id)
+             WHERE client_submission_id IS NOT NULL
+           DO NOTHING
+           RETURNING id, service_id, address, details, timing, status, created_at`,
+          [
+            input.serviceId,
+            input.address,
+            input.details ?? null,
+            input.timing,
+            databaseCustomerId,
+            submission.clientSubmissionId,
+            submission.submissionFingerprint,
+          ],
+        );
+        row = inserted.rows[0];
+        if (!row) {
+          const existing = await client.query<{
+            id: string;
+            submission_fingerprint: string;
+          }>(
+            `SELECT id, submission_fingerprint
+               FROM service_requests
+              WHERE customer_id = $1 AND client_submission_id = $2`,
+            [databaseCustomerId, submission.clientSubmissionId],
+          );
+          const existingRow = existing.rows[0];
+          if (!existingRow) {
+            throw new Error('Service request could not be created');
+          }
+          if (
+            existingRow.submission_fingerprint ===
+            submission.submissionFingerprint
+          ) {
+            throw new RequestSubmissionReplayError();
+          }
+          throw new RequestSubmissionConflictError();
+        }
+      } else {
+        const result = await client.query<ServiceRequestRow>(
+          `INSERT INTO service_requests (service_id, address, details, timing, customer_id)
+           VALUES ($1, $2, $3, $4, $5)
+           RETURNING id, service_id, address, details, timing, status, created_at`,
+          [
+            input.serviceId,
+            input.address,
+            input.details ?? null,
+            input.timing,
+            databaseCustomerId,
+          ],
+        );
+        row = result.rows[0];
+      }
       if (!row) throw new Error('Service request could not be created');
+      // Image metadata commits atomically with the request row: any image
+      // insert failure aborts the transaction, so a request can never commit
+      // without (or partially with) its image metadata, and vice versa.
+      if (images && images.length > 0) {
+        await this.insertRequestImages(
+          client,
+          Number.parseInt(row.id, 10),
+          images,
+        );
+      }
       await client.query(
         `INSERT INTO service_request_events (service_request_id, type, status)
          VALUES ($1, 'request_created', $2)`,
@@ -676,6 +847,188 @@ export class ServiceRequestRepository
       await this.rollbackAndRelease(client);
       throw error;
     }
+  }
+
+  /**
+   * Inserts canonical image metadata rows on the caller's transaction client.
+   * Values are the server-canonicalized projections produced by
+   * {@link RequestImageService}; any constraint failure (duplicate sort
+   * order, duplicate content hash, invalid checks) aborts the enclosing
+   * transaction, which is what makes image metadata and the request row
+   * commit or fail together.
+   */
+  private async insertRequestImages(
+    client: PoolClient,
+    serviceRequestDatabaseId: number,
+    images: StoredRequestImage[],
+  ): Promise<void> {
+    for (const image of images) {
+      await client.query(
+        `INSERT INTO service_request_images
+           (id, service_request_id, storage_key, mime_type, byte_size,
+            content_sha256, sort_order)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [
+          image.id,
+          serviceRequestDatabaseId,
+          image.storageKey,
+          image.mimeType,
+          image.byteSize,
+          image.contentSha256,
+          image.sortOrder,
+        ],
+      );
+    }
+  }
+
+  /**
+   * Targeted lookup of the request committed for a customer submission key.
+   * Used by the replay path after {@link create} reports a replay; the
+   * original committed row is returned as the authoritative response.
+   */
+  async findRequestByCustomerSubmission(
+    customerId: string,
+    clientSubmissionId: string,
+  ): Promise<ServiceRequest | undefined> {
+    const result = await this.pool.query<ServiceRequestRow>(
+      `SELECT r.id, r.service_id, r.address, r.details, r.timing, r.status, r.created_at,
+              p.id AS assigned_provider_id, p.name AS assigned_provider_name,
+              p.specialties AS assigned_provider_specialties, p.available AS assigned_provider_available,
+              r.rating, r.rating_comment,
+              q.id AS quote_id, q.amount_halalas AS quote_amount_halalas,
+              q.scope AS quote_scope, q.status AS quote_status,
+              q.proposed_at AS quote_proposed_at, q.decided_at AS quote_decided_at,
+              sp.id AS payment_id, sp.amount_halalas AS payment_amount_halalas,
+              sp.currency AS payment_currency, sp.method AS payment_method,
+              sp.status AS payment_status, sp.created_at AS payment_created_at,
+              sp.collected_at AS payment_collected_at,
+              sp.refunded_at AS payment_refunded_at
+       FROM service_requests r
+       LEFT JOIN providers p ON p.id = r.assigned_provider_id
+       LEFT JOIN LATERAL (
+         SELECT id, amount_halalas, scope, status, proposed_at, decided_at
+         FROM service_quotes
+         WHERE service_request_id = r.id
+         ORDER BY id DESC
+         LIMIT 1
+       ) q ON TRUE
+       LEFT JOIN LATERAL (
+         SELECT id, amount_halalas, currency, method, status, created_at, collected_at, refunded_at
+         FROM service_payments
+         WHERE service_request_id = r.id
+         ORDER BY id DESC
+         LIMIT 1
+       ) sp ON TRUE
+       WHERE r.customer_id = $1 AND r.client_submission_id = $2
+       LIMIT 1`,
+      [this.toCustomerDatabaseId(customerId), clientSubmissionId],
+    );
+    const row = result.rows[0];
+    return row ? this.toServiceRequest(row) : undefined;
+  }
+
+  /**
+   * Committed canonical image metadata for a request, ordered by sort order.
+   * Used to project image DTOs for replays; the checks in the schema
+   * guarantee the stored shape.
+   */
+  async findRequestImages(requestId: string): Promise<StoredRequestImage[]> {
+    const result = await this.pool.query<ServiceRequestImageRow>(
+      `SELECT id, storage_key, mime_type, byte_size, content_sha256, sort_order
+         FROM service_request_images
+        WHERE service_request_id = $1
+        ORDER BY sort_order`,
+      [this.toRequestDatabaseId(requestId)],
+    );
+    return result.rows.map((row) => ({
+      id: row.id,
+      storageKey: row.storage_key,
+      mimeType: row.mime_type as 'image/jpeg',
+      byteSize: row.byte_size,
+      contentSha256: row.content_sha256,
+      sortOrder: row.sort_order,
+    }));
+  }
+
+  /**
+   * ONE set-based batch read of committed image metadata for many request
+   * ids, keyed by the public request id and ordered by sort_order inside
+   * every request. Used by the authorized read projections so a list of N
+   * requests costs a single bounded query instead of N per-request reads.
+   */
+  async findRequestImagesByRequestIds(
+    requestIds: string[],
+  ): Promise<Map<string, StoredRequestImage[]>> {
+    const byRequest = new Map<string, StoredRequestImage[]>();
+    if (requestIds.length === 0) return byRequest;
+    const databaseIds = requestIds.map((requestId) =>
+      this.toRequestDatabaseId(requestId),
+    );
+    const result = await this.pool.query<
+      ServiceRequestImageRow & { request_id: number }
+    >(
+      `SELECT id, service_request_id AS request_id, storage_key, mime_type,
+              byte_size, content_sha256, sort_order
+         FROM service_request_images
+        WHERE service_request_id = ANY($1::bigint[])
+        ORDER BY service_request_id, sort_order`,
+      [databaseIds],
+    );
+    for (const row of result.rows) {
+      const requestId = `MOE-${1000 + Number(row.request_id)}`;
+      const entry = byRequest.get(requestId) ?? [];
+      entry.push({
+        id: row.id,
+        storageKey: row.storage_key,
+        mimeType: row.mime_type as 'image/jpeg',
+        byteSize: row.byte_size,
+        contentSha256: row.content_sha256,
+        sortOrder: row.sort_order,
+      });
+      byRequest.set(requestId, entry);
+    }
+    return byRequest;
+  }
+
+  /**
+   * Bounded, keyset-paginated listing of committed `service_request_images`
+   * storage keys under an exact, caller-validated namespace prefix. Used by
+   * the orphan-object reconciler to build the authoritative reference set;
+   * the prefix is parameterized (never concatenated from untrusted input)
+   * and every page is capped.
+   */
+  async listImageStorageKeys(
+    prefix: string,
+    after?: string,
+    limit = 500,
+  ): Promise<{ keys: string[]; nextAfter?: string }> {
+    if (!/^request-images\/[a-z0-9][a-z0-9_-]{0,31}\/$/.test(prefix)) {
+      throw new Error('Invalid request image storage prefix');
+    }
+    if (
+      after !== undefined &&
+      (!after.startsWith(prefix) ||
+        after.includes('..') ||
+        !/^request-images\/[a-z0-9][a-z0-9_-]{0,31}\/[a-z0-9/.-]{0,180}$/.test(
+          after,
+        ))
+    ) {
+      throw new Error('Invalid request image storage key');
+    }
+    const bounded = Math.min(Math.max(Math.trunc(limit) || 500, 1), 1000);
+    const result = await this.pool.query<{ storage_key: string }>(
+      `SELECT storage_key
+         FROM service_request_images
+        WHERE storage_key LIKE $1 || '%'
+          AND ($2::text IS NULL OR storage_key > $2)
+        ORDER BY storage_key ASC
+        LIMIT $3`,
+      [prefix, after ?? null, bounded],
+    );
+    const keys = result.rows.map((row) => row.storage_key);
+    return keys.length > 0
+      ? { keys, nextAfter: keys[keys.length - 1] }
+      : { keys };
   }
 
   /**
@@ -931,6 +1284,7 @@ export class ServiceRequestRepository
   async findByProviderId(providerId: string): Promise<ServiceRequest[]> {
     const result = await this.pool.query<ServiceRequestRow>(
       `SELECT r.id, r.service_id, r.address, r.details, r.timing, r.status, r.created_at,
+              c.phone AS customer_phone,
               p.id AS assigned_provider_id, p.name AS assigned_provider_name,
               p.specialties AS assigned_provider_specialties, p.available AS assigned_provider_available,
               r.rating, r.rating_comment,
@@ -944,6 +1298,7 @@ export class ServiceRequestRepository
               sp.refunded_at AS payment_refunded_at
        FROM service_requests r
        JOIN providers p ON p.id = r.assigned_provider_id
+       LEFT JOIN customers c ON c.id = r.customer_id
        LEFT JOIN LATERAL (
          SELECT id, amount_halalas, scope, status, proposed_at, decided_at
          FROM (
@@ -1370,6 +1725,36 @@ export class ServiceRequestRepository
     }
   }
 
+  /**
+   * Quote gating for entering in_progress. A request with no quotes may
+   * start, and a request with at least one approved quote may start. Any
+   * other combination (only proposed / rejected / withdrawn quotes) is
+   * refused with the existing 'Quote approval required' error. The verdict
+   * aggregates across ALL quotes: a newer rejected or withdrawn quote must
+   * never invalidate an earlier approval, so the rule deliberately does not
+   * inspect only the newest quote.
+   */
+  private async assertServiceMayStart(
+    client: PoolClient,
+    databaseId: number,
+  ): Promise<void> {
+    const summary = await client.query<{
+      approved_count: number;
+      total_count: number;
+    }>(
+      `SELECT
+         COUNT(*) FILTER (WHERE status = 'approved')::int AS approved_count,
+         COUNT(*)::int AS total_count
+       FROM service_quotes
+       WHERE service_request_id = $1`,
+      [databaseId],
+    );
+    const row = summary.rows[0];
+    if (row && row.total_count > 0 && row.approved_count === 0) {
+      throw new Error('Quote approval required');
+    }
+  }
+
   async updateStatus(
     requestId: string,
     status: ServiceRequest['status'],
@@ -1398,16 +1783,7 @@ export class ServiceRequestRepository
         throw new Error('Invalid status transition');
       }
       if (status === 'in_progress') {
-        const latestQuote = await client.query<{ status: ServiceQuoteStatus }>(
-          `SELECT status FROM service_quotes
-           WHERE service_request_id = $1
-           ORDER BY id DESC
-           LIMIT 1`,
-          [databaseId],
-        );
-        if (latestQuote.rows[0] && latestQuote.rows[0].status !== 'approved') {
-          throw new Error('Quote approval required');
-        }
+        await this.assertServiceMayStart(client, databaseId);
       }
       await client.query(
         `UPDATE service_requests SET status = $1 WHERE id = $2`,
@@ -1476,16 +1852,7 @@ export class ServiceRequestRepository
         throw new Error('Invalid status transition');
       }
       if (status === 'in_progress') {
-        const latestQuote = await client.query<{ status: ServiceQuoteStatus }>(
-          `SELECT status FROM service_quotes
-           WHERE service_request_id = $1
-           ORDER BY id DESC
-           LIMIT 1`,
-          [databaseId],
-        );
-        if (latestQuote.rows[0] && latestQuote.rows[0].status !== 'approved') {
-          throw new Error('Quote approval required');
-        }
+        await this.assertServiceMayStart(client, databaseId);
       }
       await client.query(
         'UPDATE service_requests SET status = $1 WHERE id = $2',
@@ -1848,11 +2215,14 @@ export class ServiceRequestRepository
 
   async listProviderOpportunities(
     providerId: string,
-  ): Promise<ProviderOpportunity[]> {
+  ): Promise<ProviderOpportunityAccess[]> {
     const result = await this.pool.query<{
       request_id: string;
       service_id: string;
       timing: ServiceRequest['timing'];
+      address: string;
+      details: string | null;
+      request_status: ServiceRequest['status'];
       opportunity_status: ProviderOpportunityStatus;
       quote_id: string | null;
       quote_provider_id: string | null;
@@ -1863,6 +2233,7 @@ export class ServiceRequestRepository
       quote_decided_at: Date | null;
     }>(
       `SELECT r.id AS request_id, r.service_id, r.timing,
+              r.address, r.details, r.status AS request_status,
               o.status AS opportunity_status,
               q.id AS quote_id, q.provider_id AS quote_provider_id,
               q.amount_halalas AS quote_amount_halalas, q.scope AS quote_scope,
@@ -1886,6 +2257,11 @@ export class ServiceRequestRepository
       serviceId: row.service_id,
       timing: row.timing,
       opportunityStatus: row.opportunity_status,
+      // Server-side authorization inputs for the pre-quote projection. These
+      // are stripped by AppService before anything reaches a client.
+      address: row.address,
+      details: row.details ?? undefined,
+      requestStatus: row.request_status,
       myQuote: row.quote_id
         ? {
             id: `QTE-${row.quote_id}`,
@@ -2620,9 +2996,36 @@ export class ServiceRequestRepository
             refunded_at: row.payment_refunded_at,
           })
         : undefined,
+      customerPhone:
+        row.customer_phone != null &&
+        this.mayDiscloseCustomerPhoneToProvider(row.status)
+          ? row.customer_phone
+          : undefined,
       rating: row.rating ?? undefined,
       ratingComment: row.rating_comment ?? undefined,
       createdAt: row.created_at.toISOString(),
     };
+  }
+
+  /**
+   * Authorization gate for post-assignment customer phone disclosure.
+   *
+   * The customer phone may reach a provider response ONLY while the request
+   * is in an active assigned lifecycle state. `findByProviderId` (the one
+   * read path that selects `customer_phone`) already restricts rows to the
+   * authenticated assigned provider via `WHERE r.assigned_provider_id = $1`,
+   * so this status check is the remaining boundary: terminal states
+   * (completed/cancelled) never carry the phone. Every other read path never
+   * selects `customer_phone`, so the mapped field stays absent for customer,
+   * staff, and pre-quote opportunity views regardless of this gate.
+   */
+  private mayDiscloseCustomerPhoneToProvider(
+    status: ServiceRequest['status'],
+  ): boolean {
+    return (
+      status === 'assigned' ||
+      status === 'on_the_way' ||
+      status === 'in_progress'
+    );
   }
 }

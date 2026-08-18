@@ -1100,15 +1100,23 @@ describe('AppController (e2e)', () => {
       .expect(200);
     const body = opportunities.body as Record<string, unknown>[];
     expect(body).toHaveLength(1);
+    // Pre-quote product contract (Slice 3): the eligible owner of an invited
+    // opportunity sees the job service/timing/address/details/images and the
+    // opportunity state — but never any customer identity or contact field.
     expect(Object.keys(body[0]).sort()).toEqual([
+      'address',
+      'details',
+      'images',
       'opportunityStatus',
       'requestId',
       'serviceId',
       'timing',
     ]);
     const serialized = JSON.stringify(body);
-    expect(serialized).not.toContain('حي الصفراء');
-    expect(serialized).not.toContain('معلومات حساسة');
+    expect(serialized).toContain('حي الصفراء');
+    expect(serialized).toContain('معلومات حساسة');
+    expect(serialized).not.toContain('CUS-');
+    expect(serialized).not.toContain('+966');
   });
 
   it('auto-invites eligible verified/available providers when a customer creates a request', async () => {
@@ -1131,10 +1139,14 @@ describe('AppController (e2e)', () => {
       serviceId: 'ac-cleaning',
       opportunityStatus: 'invited',
     });
-    // Privacy: no address, customer identity, phone, or details leaked.
+    // Pre-quote product contract (Slice 3): the eligible provider sees the
+    // job address and details to estimate cost/travel — but no customer
+    // identity, phone, or session data is exposed.
     const serialized = JSON.stringify(body);
-    expect(serialized).not.toContain('حي الصفراء');
-    expect(serialized).not.toContain('معلومات حساسة');
+    expect(serialized).toContain('حي الصفراء');
+    expect(serialized).toContain('معلومات حساسة');
+    expect(serialized).not.toContain('CUS-');
+    expect(serialized).not.toContain('+966');
   });
 
   it('excludes unverified, unavailable, and non-matching providers from automatic invitations', async () => {

@@ -6,6 +6,8 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
 import 'api_config.dart';
 import 'customer_session.dart';
+import 'request_images.dart';
+import 'moeen_ui.dart';
 
 void main() {
   runApp(const MoeenApp());
@@ -87,21 +89,10 @@ class _MoeenAppState extends State<MoeenApp> {
 
   @override
   Widget build(BuildContext context) {
-    const brand = Color(0xFF0B6E69);
     return MaterialApp(
       title: 'معين',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: brand),
-        scaffoldBackgroundColor: const Color(0xFFF6FAF9),
-        useMaterial3: true,
-        appBarTheme: const AppBarTheme(
-          backgroundColor: Color(0xFFF6FAF9),
-          foregroundColor: Color(0xFF163C39),
-          elevation: 0,
-          scrolledUnderElevation: 0,
-        ),
-      ),
+      theme: MoeenTheme.light(),
       builder: (context, child) => Directionality(
         textDirection: TextDirection.rtl,
         child: child ?? const SizedBox.shrink(),
@@ -299,9 +290,26 @@ class _ServiceCard extends StatelessWidget {
 }
 
 class BookingPage extends StatefulWidget {
-  const BookingPage({super.key, required this.service});
+  const BookingPage({
+    super.key,
+    required this.service,
+    this.imagePicker,
+    this.sessionManager,
+    this.httpClient,
+    this.apiConfig,
+  });
 
   final ServiceOption service;
+  final RequestImagePicker? imagePicker;
+
+  /// Test seam: overrides the global customer session manager.
+  final CustomerSessionManager? sessionManager;
+
+  /// Test seam: overrides the HTTP client used to create service requests.
+  final http.Client? httpClient;
+
+  /// Test seam: overrides the API origin configuration.
+  final MoeenApiConfig? apiConfig;
 
   @override
   State<BookingPage> createState() => _BookingPageState();
@@ -313,6 +321,25 @@ class _BookingPageState extends State<BookingPage> {
   final _detailsController = TextEditingController();
   String _timing = 'في أقرب وقت';
   bool _isSubmitting = false;
+  bool _pickingImages = false;
+  String? _imageError;
+  List<SelectedRequestImage> _selectedImages = [];
+
+  /// One Idempotency-Key per booking payload. Reused verbatim on every
+  /// retry of the unchanged payload and invalidated when the payload
+  /// changes, so a retry after a lost response replays the committed
+  /// request instead of creating a duplicate.
+  final _submissionIdentity = BookingSubmissionIdentity();
+
+  RequestImagePicker get _imagePicker =>
+      widget.imagePicker ?? ImagePickerRequestImagePicker();
+
+  CustomerSessionManager get _sessionManager =>
+      widget.sessionManager ?? customerSessionManager;
+
+  http.Client get _httpClient => widget.httpClient ?? http.Client();
+
+  MoeenApiConfig get _apiConfig => widget.apiConfig ?? moeenApi;
 
   @override
   void dispose() {
@@ -321,35 +348,173 @@ class _BookingPageState extends State<BookingPage> {
     super.dispose();
   }
 
+  Future<void> _pickImages() async {
+    if (_selectedImages.length >= maxRequestImages) {
+      setState(() => _imageError = 'الحد الأقصى $maxRequestImages صور لكل طلب');
+      return;
+    }
+    setState(() {
+      _pickingImages = true;
+      _imageError = null;
+    });
+    try {
+      final picked = await _imagePicker.pickImages();
+      if (!mounted) return;
+      final candidates = <SelectedRequestImage>[
+        ..._selectedImages,
+        ...picked.map(
+          (file) => SelectedRequestImage(
+            fileName: file.fileName,
+            mimeType: file.mimeType,
+            size: file.size,
+            bytes: file.bytes,
+          ),
+        ),
+      ];
+      final error =
+          validateRequestImageSelection(candidates) ??
+          duplicateRequestImageError(candidates);
+      setState(() {
+        if (error == null) {
+          _selectedImages = candidates;
+        } else {
+          _imageError = error;
+        }
+      });
+    } catch (_) {
+      if (mounted) {
+        setState(() => _imageError = 'تعذر اختيار الصور. حاول مرة أخرى.');
+      }
+    } finally {
+      if (mounted) setState(() => _pickingImages = false);
+    }
+  }
+
+  Future<void> _replaceImage(int index) async {
+    setState(() {
+      _pickingImages = true;
+      _imageError = null;
+    });
+    try {
+      final picked = await _imagePicker.pickImages();
+      if (!mounted) return;
+      if (picked.isEmpty) return;
+      final replacement = picked.first;
+      final candidates = [..._selectedImages];
+      candidates[index] = SelectedRequestImage(
+        fileName: replacement.fileName,
+        mimeType: replacement.mimeType,
+        size: replacement.size,
+        bytes: replacement.bytes,
+      );
+      final error =
+          validateRequestImageSelection(candidates) ??
+          duplicateRequestImageError(candidates);
+      setState(() {
+        if (error == null) {
+          _selectedImages = candidates;
+        } else {
+          _imageError = error;
+        }
+      });
+    } catch (_) {
+      if (mounted) {
+        setState(() => _imageError = 'تعذر اختيار الصورة. حاول مرة أخرى.');
+      }
+    } finally {
+      if (mounted) setState(() => _pickingImages = false);
+    }
+  }
+
+  void _removeImage(int index) {
+    setState(() {
+      _selectedImages = List.of(_selectedImages)..removeAt(index);
+      _imageError = null;
+    });
+  }
+
   Future<void> _continueBooking() async {
+    if (_timing == 'تحديد موعد') {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'المواعيد المحددة غير متاحة حالياً. اختر «في أقرب وقت» لإرسال الطلب.',
+          ),
+        ),
+      );
+      return;
+    }
     if (!_formKey.currentState!.validate()) return;
+    final imageError = validateRequestImageSelection(_selectedImages);
+    if (imageError != null) {
+      setState(() => _imageError = imageError);
+      return;
+    }
 
     setState(() => _isSubmitting = true);
+    http.Response? response;
     try {
-      final session = await customerSessionManager.restore();
+      final session = await _sessionManager.restore();
       if (session == null) throw Exception('Customer session required');
-      final response = await http.post(
-        moeenApi.endpoint('/service-requests'),
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': 'Bearer ${session.token}',
-        },
-        body: jsonEncode({
-          'serviceId': widget.service.id,
-          'address': _addressController.text.trim(),
-          'details': _detailsController.text.trim(),
-          'timing': _timing == 'في أقرب وقت'
-              ? 'as-soon-as-possible'
-              : 'scheduled',
-        }),
-      );
+      final address = _addressController.text.trim();
+      final details = _detailsController.text.trim();
+      final timing = _timing == 'في أقرب وقت'
+          ? 'as-soon-as-possible'
+          : 'scheduled';
+      if (_selectedImages.isEmpty) {
+        // Legacy zero-image flow: plain JSON body, no Idempotency-Key.
+        // The API's JSON create path has no idempotency contract, so no key
+        // is sent here (adding one would invent a backend contract).
+        response = await _httpClient.post(
+          _apiConfig.endpoint('/service-requests'),
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ${session.token}',
+          },
+          body: jsonEncode({
+            'serviceId': widget.service.id,
+            'address': address,
+            'details': details,
+            'timing': timing,
+          }),
+        );
+      } else {
+        // Multipart contract: `images` file parts plus a UUID v4
+        // Idempotency-Key. The key is minted once per payload snapshot and
+        // reused on every retry of the SAME payload, so a retry after a
+        // lost/failed response replays the committed request instead of
+        // creating a duplicate.
+        final idempotencyKey = _submissionIdentity.keyFor(
+          serviceId: widget.service.id,
+          address: address,
+          details: details.isEmpty ? null : details,
+          timing: timing,
+          orderedImageBytes: [
+            for (final image in _selectedImages) image.bytes,
+          ],
+        );
+        response = await submitServiceRequestWithImages(
+          client: _httpClient,
+          endpoint: _apiConfig.endpoint('/service-requests'),
+          token: session.token,
+          serviceId: widget.service.id,
+          address: address,
+          details: details.isEmpty ? null : details,
+          timing: timing,
+          images: _selectedImages,
+          idempotencyKey: idempotencyKey,
+        );
+      }
 
       if (!mounted) return;
       if (response.statusCode != 201) {
-        throw Exception('Request failed: ${response.statusCode}');
+        throw _ImageAwareRequestException(response);
       }
 
       final request = jsonDecode(response.body) as Map<String, dynamic>;
+      // The booking is committed: the submission identity is spent. Clearing
+      // it guarantees a later new booking starts with a fresh key.
+      _submissionIdentity.clear();
       await Navigator.of(context).pushReplacement(
         MaterialPageRoute<void>(
           builder: (_) => RequestConfirmedPage(
@@ -358,12 +523,26 @@ class _BookingPageState extends State<BookingPage> {
           ),
         ),
       );
+    } on _ImageAwareRequestException catch (error) {
+      if (!mounted) return;
+      if (error.response.statusCode == 409) {
+        // The server permanently bound this key to different content; it can
+        // never succeed again. Drop it so the next attempt mints a fresh key
+        // instead of being stuck in an endless conflict.
+        _submissionIdentity.clear();
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(_imageAwareFailureMessage(error.response)),
+          backgroundColor: const Color(0xFF9B2C2C),
+        ),
+      );
     } catch (_) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
           content: Text(
-            'تعذر إرسال الطلب. تأكد من تشغيل خادم معين ثم حاول مجدداً.',
+            'تعذر إرسال الطلب الآن. تحقق من اتصالك ثم أعد المحاولة. احتفظنا بما أدخلته.',
           ),
           backgroundColor: Color(0xFF9B2C2C),
         ),
@@ -371,6 +550,22 @@ class _BookingPageState extends State<BookingPage> {
     } finally {
       if (mounted) setState(() => _isSubmitting = false);
     }
+  }
+
+  String _imageAwareFailureMessage(http.Response response) {
+    if (response.statusCode == 413) {
+      return 'تعذر قبول الصور: إحدى الصور أكبر من الحد المسموح (5 م.ب).';
+    }
+    if (response.statusCode == 409) {
+      return 'حدث تعارض مع محاولة سابقة. أعد المحاولة لإرسال طلبك.';
+    }
+    if (response.statusCode == 400) {
+      final body = response.body.toLowerCase();
+      if (body.contains('image') || body.contains('idempotency')) {
+        return 'تعذر قبول الصور المرفقة. تحقق من صيغة الصور وحجمها ثم أعد المحاولة.';
+      }
+    }
+    return 'تعذر إرسال الطلب الآن. تحقق من اتصالك ثم أعد المحاولة. احتفظنا بما أدخلته.';
   }
 
   @override
@@ -432,6 +627,36 @@ class _BookingPageState extends State<BookingPage> {
                     onSelectionChanged: (value) =>
                         setState(() => _timing = value.first),
                   ),
+                  if (_timing == 'تحديد موعد') ...[
+                    const SizedBox(height: 12),
+                    Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFFFF4D6),
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(color: const Color(0xFFE7C56C)),
+                      ),
+                      child: const Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Icon(
+                            Icons.info_outline_rounded,
+                            color: MoeenColors.warning,
+                          ),
+                          SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              'سيصبح حجز الموعد متاحاً عند توفر مواعيد مؤكدة. لا يمكن إرسال طلب بموعد غير محدد.',
+                              style: TextStyle(
+                                color: MoeenColors.primaryDark,
+                                height: 1.45,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
                   const SizedBox(height: 24),
                   Text(
                     'تفاصيل الطلب',
@@ -449,18 +674,76 @@ class _BookingPageState extends State<BookingPage> {
                       Icons.notes_rounded,
                     ),
                   ),
-                  const SizedBox(height: 12),
+                  const SizedBox(height: 24),
+                  Text(
+                    'صور الطلب (اختياري)',
+                    style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  if (_selectedImages.isNotEmpty) ...[
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        for (
+                          var index = 0;
+                          index < _selectedImages.length;
+                          index++
+                        )
+                          _SelectedImageTile(
+                            image: _selectedImages[index],
+                            onRemove: () => _removeImage(index),
+                            onReplace: _pickingImages || _isSubmitting
+                                ? null
+                                : () => _replaceImage(index),
+                          ),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+                  ],
+                  if (_imageError != null) ...[
+                    Text(
+                      _imageError!,
+                      style: const TextStyle(
+                        color: Color(0xFF9B2C2C),
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                  ],
                   OutlinedButton.icon(
-                    onPressed: () {},
-                    icon: const Icon(Icons.add_a_photo_outlined),
-                    label: const Text('إضافة صور للخدمة'),
+                    onPressed: (_isSubmitting || _pickingImages)
+                        ? null
+                        : _pickImages,
+                    icon: _pickingImages
+                        ? const SizedBox(
+                            height: 18,
+                            width: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.add_a_photo_outlined),
+                    label: Text(
+                      _selectedImages.isEmpty
+                          ? 'إضافة صور للخدمة'
+                          : 'إضافة صورة أخرى (${_selectedImages.length}/$maxRequestImages)',
+                    ),
                     style: OutlinedButton.styleFrom(
                       minimumSize: const Size.fromHeight(52),
                     ),
                   ),
+                  const SizedBox(height: 6),
+                  const Text(
+                    'JPEG أو PNG أو WebP · حتى 5 صور · 5 م.ب كحد أقصى للصورة',
+                    style: TextStyle(color: Color(0xFF66807D), fontSize: 12),
+                  ),
                   const SizedBox(height: 28),
                   FilledButton(
-                    onPressed: _isSubmitting ? null : _continueBooking,
+                    onPressed: (_isSubmitting || _timing == 'تحديد موعد')
+                        ? null
+                        : _continueBooking,
                     style: FilledButton.styleFrom(
                       minimumSize: const Size.fromHeight(56),
                     ),
@@ -504,6 +787,81 @@ class _BookingPageState extends State<BookingPage> {
         borderRadius: BorderRadius.circular(16),
         borderSide: const BorderSide(color: Color(0xFFDCE8E5)),
       ),
+    );
+  }
+}
+
+class _ImageAwareRequestException implements Exception {
+  const _ImageAwareRequestException(this.response);
+
+  final http.Response response;
+}
+
+class _SelectedImageTile extends StatelessWidget {
+  const _SelectedImageTile({
+    required this.image,
+    required this.onRemove,
+    this.onReplace,
+  });
+
+  final SelectedRequestImage image;
+  final VoidCallback onRemove;
+  final VoidCallback? onReplace;
+
+  @override
+  Widget build(BuildContext context) {
+    return Stack(
+      clipBehavior: Clip.none,
+      children: [
+        ClipRRect(
+          borderRadius: BorderRadius.circular(12),
+          child: SizedBox(
+            width: 96,
+            height: 96,
+            child: Image.memory(
+              image.bytes,
+              fit: BoxFit.cover,
+              errorBuilder: (context, error, stackTrace) => const ColoredBox(
+                color: Color(0xFFF2F6F5),
+                child: Center(
+                  child: Icon(
+                    Icons.broken_image_outlined,
+                    color: Color(0xFF66807D),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+        PositionedDirectional(
+          top: -8,
+          start: -8,
+          child: IconButton.filled(
+            onPressed: onRemove,
+            icon: const Icon(Icons.close, size: 16),
+            tooltip: 'إزالة الصورة',
+            visualDensity: VisualDensity.compact,
+            style: IconButton.styleFrom(
+              backgroundColor: const Color(0xFF9B2C2C),
+              foregroundColor: Colors.white,
+            ),
+          ),
+        ),
+        PositionedDirectional(
+          bottom: -8,
+          end: -8,
+          child: IconButton.filled(
+            onPressed: onReplace,
+            icon: const Icon(Icons.swap_horiz, size: 16),
+            tooltip: 'استبدال الصورة',
+            visualDensity: VisualDensity.compact,
+            style: IconButton.styleFrom(
+              backgroundColor: const Color(0xFF0B6E69),
+              foregroundColor: Colors.white,
+            ),
+          ),
+        ),
+      ],
     );
   }
 }
@@ -722,6 +1080,7 @@ class CustomerRequest {
     this.payment,
     this.rating,
     this.ratingComment,
+    this.images = const [],
   });
 
   final String id;
@@ -733,6 +1092,7 @@ class CustomerRequest {
   final CustomerPayment? payment;
   final int? rating;
   final String? ratingComment;
+  final List<RequestImage> images;
 
   factory CustomerRequest.fromJson(Map<String, dynamic> json) =>
       CustomerRequest(
@@ -745,9 +1105,9 @@ class CustomerRequest {
         quote: (json['quote'] as Map<String, dynamic>?) == null
             ? null
             : CustomerQuote.fromJson(json['quote'] as Map<String, dynamic>),
-        quotes: (json['quotes'] as List<dynamic>?)
-                ?.map((q) =>
-                    CustomerQuote.fromJson(q as Map<String, dynamic>))
+        quotes:
+            (json['quotes'] as List<dynamic>?)
+                ?.map((q) => CustomerQuote.fromJson(q as Map<String, dynamic>))
                 .toList() ??
             const [],
         payment: (json['payment'] as Map<String, dynamic>?) == null
@@ -755,6 +1115,7 @@ class CustomerRequest {
             : CustomerPayment.fromJson(json['payment'] as Map<String, dynamic>),
         rating: json['rating'] as int?,
         ratingComment: json['ratingComment'] as String?,
+        images: RequestImage.listFromJson(json['images']),
       );
 }
 
@@ -808,6 +1169,240 @@ Future<bool> quoteDecisionWasPersistedAfterAmbiguousFailure({
 
 bool isSuccessfulHttpStatus(int statusCode) =>
     statusCode >= 200 && statusCode < 300;
+
+class CustomerRequestDetailsPage extends StatelessWidget {
+  const CustomerRequestDetailsPage({
+    super.key,
+    required this.request,
+    required this.statusLabel,
+    required this.onReviewQuote,
+    required this.onRate,
+    required this.onSupport,
+  });
+
+  final CustomerRequest request;
+  final String statusLabel;
+  final VoidCallback onReviewQuote;
+  final VoidCallback onRate;
+  final VoidCallback onSupport;
+
+  String get _serviceName {
+    for (final service in MoeenApp.launchServices) {
+      if (service.id == request.serviceId) return service.name;
+    }
+    return 'خدمة معين';
+  }
+
+  MoeenStatusTone get _statusTone => switch (request.status) {
+    'completed' => MoeenStatusTone.success,
+    'cancelled' || 'rejected' => MoeenStatusTone.danger,
+    'on_the_way' || 'in_progress' || 'assigned' => MoeenStatusTone.info,
+    'pending' || 'created' => MoeenStatusTone.warning,
+    _ => MoeenStatusTone.neutral,
+  };
+
+  @override
+  Widget build(BuildContext context) {
+    final quote = request.quote;
+    final payment = request.payment;
+    final showRating = request.status == 'completed' && request.rating == null;
+    return MoeenPageScaffold(
+      title: 'تفاصيل الطلب',
+      body: ListView(
+        children: [
+          Semantics(
+            liveRegion: true,
+            child: Align(
+              alignment: AlignmentDirectional.centerStart,
+              child: MoeenStatusChip(label: statusLabel, tone: _statusTone),
+            ),
+          ),
+          const SizedBox(height: MoeenSpacing.md),
+          MoeenSectionCard(
+            title: _serviceName,
+            subtitle: 'رقم الطلب: ${request.id}',
+            child: Column(
+              children: [
+                _CustomerDetailRow(
+                  icon: Icons.receipt_long_outlined,
+                  label: 'الحالة الحالية',
+                  value: statusLabel,
+                ),
+                if (request.providerName?.trim().isNotEmpty ?? false) ...[
+                  const Divider(height: MoeenSpacing.lg),
+                  _CustomerDetailRow(
+                    icon: Icons.verified_user_outlined,
+                    label: 'الفني المعيّن',
+                    value: request.providerName!,
+                  ),
+                ],
+              ],
+            ),
+          ),
+          if (quote != null) ...[
+            const SizedBox(height: MoeenSpacing.md),
+            MoeenSectionCard(
+              title: 'عرض السعر',
+              subtitle: quote.status == 'proposed'
+                  ? 'راجع العرض قبل اتخاذ القرار.'
+                  : 'حالة العرض: ${_quoteStatusLabel(quote.status)}',
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    _formatSaudiRiyals(quote.amountHalalas),
+                    style: Theme.of(context).textTheme.headlineSmall?.copyWith(
+                      color: MoeenColors.primaryDark,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                  const SizedBox(height: MoeenSpacing.xs),
+                  Text(quote.scope),
+                  if (quote.providerSummary != null) ...[
+                    const SizedBox(height: MoeenSpacing.sm),
+                    Text(
+                      quote.providerSummary!.averageRating == null
+                          ? quote.providerSummary!.name
+                          : ' ·  ★',
+                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                        color: MoeenColors.mutedText,
+                      ),
+                    ),
+                  ],
+                  if (quote.status == 'proposed') ...[
+                    const SizedBox(height: MoeenSpacing.md),
+                    SizedBox(
+                      width: double.infinity,
+                      child: OutlinedButton.icon(
+                        onPressed: onReviewQuote,
+                        icon: const Icon(Icons.visibility_outlined),
+                        label: const Text('مراجعة العرض واتخاذ قرار'),
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ],
+          if (payment != null) ...[
+            const SizedBox(height: MoeenSpacing.md),
+            MoeenSectionCard(
+              title: 'الدفع',
+              child: Column(
+                children: [
+                  _CustomerDetailRow(
+                    icon: Icons.payments_outlined,
+                    label: 'المبلغ',
+                    value: _formatSaudiRiyals(payment.amountHalalas),
+                  ),
+                  const Divider(height: MoeenSpacing.lg),
+                  _CustomerDetailRow(
+                    icon: Icons.credit_card_outlined,
+                    label: 'طريقة الدفع',
+                    value: payment.method,
+                  ),
+                  const Divider(height: MoeenSpacing.lg),
+                  _CustomerDetailRow(
+                    icon: Icons.info_outline_rounded,
+                    label: 'حالة الدفع',
+                    value: _paymentStatusLabel(payment.status),
+                  ),
+                ],
+              ),
+            ),
+          ],
+          if (request.images.isNotEmpty) ...[
+            const SizedBox(height: MoeenSpacing.md),
+            MoeenSectionCard(
+              title: 'صور الطلب',
+              subtitle: 'اضغط على أي صورة لمشاهدتها بالحجم الكامل.',
+              child: RequestImageThumbnails(images: request.images),
+            ),
+          ],
+          const SizedBox(height: MoeenSpacing.md),
+          MoeenSectionCard(
+            title: 'المساعدة وما بعد الخدمة',
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                if (showRating)
+                  FilledButton.icon(
+                    onPressed: onRate,
+                    icon: const Icon(Icons.star_outline_rounded),
+                    label: const Text('تقييم الخدمة'),
+                  ),
+                if (showRating) const SizedBox(height: MoeenSpacing.sm),
+                OutlinedButton.icon(
+                  onPressed: onSupport,
+                  icon: const Icon(Icons.support_agent_outlined),
+                  label: const Text('طلب المساعدة'),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: MoeenSpacing.xl),
+        ],
+      ),
+    );
+  }
+}
+
+class _CustomerDetailRow extends StatelessWidget {
+  const _CustomerDetailRow({
+    required this.icon,
+    required this.label,
+    required this.value,
+  });
+
+  final IconData icon;
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Icon(icon, size: 20, color: MoeenColors.mutedText),
+        const SizedBox(width: MoeenSpacing.sm),
+        Expanded(
+          child: Text(
+            label,
+            style: Theme.of(
+              context,
+            ).textTheme.bodyMedium?.copyWith(color: MoeenColors.mutedText),
+          ),
+        ),
+        const SizedBox(width: MoeenSpacing.sm),
+        Flexible(
+          child: Text(
+            value,
+            textAlign: TextAlign.end,
+            style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+              color: MoeenColors.primaryDark,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+String _quoteStatusLabel(String status) => switch (status) {
+  'approved' => 'تم قبول العرض',
+  'rejected' => 'تم رفض العرض',
+  'withdrawn' => 'تم سحب العرض',
+  'proposed' => 'بانتظار قرارك',
+  _ => status,
+};
+
+String _paymentStatusLabel(String status) => switch (status) {
+  'cash_collected' => 'تم التحصيل',
+  'refunded' => 'تم رد المبلغ',
+  'pending' => 'بانتظار الإجراء',
+  _ => status,
+};
 
 class CustomerRequestCard extends StatelessWidget {
   const CustomerRequestCard({
@@ -907,8 +1502,8 @@ class CustomerRequestCard extends StatelessWidget {
                           color: quote.status == 'proposed'
                               ? const Color(0xFF0B6E69)
                               : quote.status == 'rejected'
-                                  ? const Color(0xFFB33A3A)
-                                  : const Color(0xFF506764),
+                              ? const Color(0xFFB33A3A)
+                              : const Color(0xFF506764),
                           fontWeight: FontWeight.w600,
                         ),
                       ),
@@ -941,8 +1536,7 @@ class CustomerRequestCard extends StatelessWidget {
                             children: [
                               TextButton(
                                 onPressed: onReviewSpecificQuote != null
-                                    ? () =>
-                                        onReviewSpecificQuote!(quote)
+                                    ? () => onReviewSpecificQuote!(quote)
                                     : null,
                                 child: const Text('مراجعة العرض'),
                               ),
@@ -980,6 +1574,11 @@ class CustomerRequestCard extends StatelessWidget {
                     fontWeight: FontWeight.w600,
                   ),
                 ),
+              ),
+            if (request.images.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(top: 12),
+                child: RequestImageThumbnails(images: request.images),
               ),
             const SizedBox(height: 8),
             Wrap(
@@ -1045,7 +1644,9 @@ class _CustomerRequestsPageState extends State<CustomerRequestsPage> {
         if (snapshot.hasError) {
           return Center(
             child: FilledButton(
-              onPressed: () => setState(() => _requests = _load()),
+              onPressed: () => setState(() {
+                _requests = _load();
+              }),
               child: const Text('إعادة المحاولة'),
             ),
           );
@@ -1060,14 +1661,27 @@ class _CustomerRequestsPageState extends State<CustomerRequestsPage> {
               .map(
                 (item) => Padding(
                   padding: const EdgeInsets.only(bottom: 12),
-                  child: CustomerRequestCard(
-                    request: item,
-                    statusLabel: _status(item.status),
-                    onReviewQuote: () => _showQuoteDecisionDialog(item),
-                    onReviewSpecificQuote: (quote) =>
-                        _showQuoteDecisionDialogForQuote(item, quote),
-                    onRate: () => _showRatingDialog(item),
-                    onSupport: () => _showSupportDialog(item),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      CustomerRequestCard(
+                        request: item,
+                        statusLabel: _status(item.status),
+                        onReviewQuote: () => _showQuoteDecisionDialog(item),
+                        onReviewSpecificQuote: (quote) =>
+                            _showQuoteDecisionDialogForQuote(item, quote),
+                        onRate: () => _showRatingDialog(item),
+                        onSupport: () => _showSupportDialog(item),
+                      ),
+                      Align(
+                        alignment: AlignmentDirectional.centerStart,
+                        child: TextButton.icon(
+                          onPressed: () => _openRequestDetails(item),
+                          icon: const Icon(Icons.arrow_back_rounded),
+                          label: const Text('عرض تفاصيل الطلب'),
+                        ),
+                      ),
+                    ],
                   ),
                 ),
               )
@@ -1076,6 +1690,20 @@ class _CustomerRequestsPageState extends State<CustomerRequestsPage> {
       },
     ),
   );
+
+  void _openRequestDetails(CustomerRequest request) {
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => CustomerRequestDetailsPage(
+          request: request,
+          statusLabel: _status(request.status),
+          onReviewQuote: () => _showQuoteDecisionDialog(request),
+          onRate: () => _showRatingDialog(request),
+          onSupport: () => _showSupportDialog(request),
+        ),
+      ),
+    );
+  }
 
   Future<void> _showQuoteDecisionDialogForQuote(
     CustomerRequest request,
@@ -1180,7 +1808,9 @@ class _CustomerRequestsPageState extends State<CustomerRequestsPage> {
         throw Exception('Quote decision failed');
       }
       if (!mounted) return;
-      setState(() => _requests = _load());
+      setState(() {
+        _requests = _load();
+      });
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
@@ -1200,7 +1830,9 @@ class _CustomerRequestsPageState extends State<CustomerRequestsPage> {
           );
       if (!mounted) return;
       if (decisionWasPersisted) {
-        setState(() => _requests = _load());
+        setState(() {
+          _requests = _load();
+        });
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(
@@ -1374,7 +2006,9 @@ class _CustomerRequestsPageState extends State<CustomerRequestsPage> {
       );
       if (response.statusCode != 201) throw Exception('Rating failed');
       if (!mounted) return;
-      setState(() => _requests = _load());
+      setState(() {
+        _requests = _load();
+      });
       ScaffoldMessenger.of(
         context,
       ).showSnackBar(const SnackBar(content: Text('شكرًا لتقييمك')));
@@ -1385,7 +2019,9 @@ class _CustomerRequestsPageState extends State<CustomerRequestsPage> {
       );
       if (!mounted) return;
       if (ratingWasPersisted) {
-        setState(() => _requests = _load());
+        setState(() {
+          _requests = _load();
+        });
         ScaffoldMessenger.of(
           context,
         ).showSnackBar(const SnackBar(content: Text('شكرًا لتقييمك')));

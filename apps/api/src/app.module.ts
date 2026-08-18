@@ -15,7 +15,17 @@ import { StaffAuthService } from './staff-auth.service';
 import { LoginAttemptLimiter } from './login-attempt-limiter.service';
 import { PublicAuthRateLimiter } from './public-auth-rate-limiter.service';
 import { ProviderAuthService } from './provider-auth.service';
-
+import { RequestImageService } from './request-image.service';
+import {
+  DisabledRequestImageStorage,
+  REQUEST_IMAGE_STORAGE,
+  S3RequestImageStorage,
+} from './request-image.storage';
+import {
+  REQUEST_IMAGE_CONFIG,
+  requestImageConfigFromEnvironment,
+} from './request-image.config';
+import type { RequestImageConfig } from './request-image.config';
 @Module({
   imports: [],
   controllers: [AppController],
@@ -23,6 +33,19 @@ import { ProviderAuthService } from './provider-auth.service';
     AppService,
     CustomerAuthService,
     ProviderAuthService,
+    RequestImageService,
+    {
+      provide: REQUEST_IMAGE_CONFIG,
+      useFactory: () => requestImageConfigFromEnvironment(process.env),
+    },
+    {
+      provide: REQUEST_IMAGE_STORAGE,
+      useFactory: (config: RequestImageConfig) =>
+        config.enabled
+          ? new S3RequestImageStorage(config)
+          : new DisabledRequestImageStorage(),
+      inject: [REQUEST_IMAGE_CONFIG],
+    },
     {
       provide: OTP_PROVIDER,
       useFactory: () => otpProviderFromEnvironment(process.env),

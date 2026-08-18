@@ -8,6 +8,7 @@ import {
 } from './auth/api-client';
 import { staffCapabilities } from './auth/roles';
 import { logoutStaffAction } from './logout/action';
+import RequestImagesGallery from './request-images-gallery';
 import {
   isApiServiceRequest,
   isApiServiceRequestEvent,
@@ -697,6 +698,9 @@ export default async function Home({ searchParams }: HomeProps) {
                       <span className={styles.detailsHint}>عرض السعر، الدفع، السوق والسجل</span>
                     </summary>
                     <div className={styles.requestDetailsPanel}>
+                  {job.images && job.images.length > 0 && (
+                    <RequestImagesGallery images={job.images} />
+                  )}
                   {job.quote && (
                     <div className={styles.quote}>
                       <strong>

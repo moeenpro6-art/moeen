@@ -10,6 +10,12 @@ import { ServiceRequestRepository } from './service-request.repository';
 import { StaffAuthRepository } from './staff-auth.repository';
 import { generateOwnerToken, ownerTokenHash } from './test-db.guard';
 import {
+  RequestSubmissionConflictError,
+  RequestSubmissionReplayError,
+  type ServiceRequestSubmissionContext,
+} from './request-image-create.contracts';
+import type { StoredRequestImage } from './request-image.types';
+import {
   createOwnedSchema,
   dropOwnedSchemaAtomically,
   quoteIdent,
@@ -543,6 +549,190 @@ describe('ServiceRequestRepository', () => {
     await providerStore.updateProviderAvailability('provider-1', true);
   });
 
+  describe('post-assignment customer phone disclosure (t_ade90f25)', () => {
+    const CUSTOMER_PHONE = '+966****0012';
+
+    async function createAssignedRequest(providerId: string) {
+      const customer = await repository.upsertCustomer(CUSTOMER_PHONE);
+      const request = await repository.create(
+        {
+          serviceId: 'ac-cleaning',
+          address: 'حي الصفراء، بريدة',
+          timing: 'as-soon-as-possible',
+        },
+        customer.id,
+      );
+      await repository.assignProvider(request.id, providerId);
+      return { customer, request };
+    }
+
+    it('returns the customer phone to the assigned provider while the job is assigned', async () => {
+      const { request } = await createAssignedRequest('provider-1');
+
+      const [job] = await repository.findByProviderId('provider-1');
+
+      expect(job).toMatchObject({
+        id: request.id,
+        status: 'assigned',
+        customerPhone: CUSTOMER_PHONE,
+      });
+    });
+
+    it('returns the customer phone to the assigned provider while the job is on_the_way', async () => {
+      const { request } = await createAssignedRequest('provider-1');
+      await repository.updateStatusForProvider(
+        request.id,
+        'provider-1',
+        'on_the_way',
+      );
+
+      const [job] = await repository.findByProviderId('provider-1');
+
+      expect(job).toMatchObject({
+        id: request.id,
+        status: 'on_the_way',
+        customerPhone: CUSTOMER_PHONE,
+      });
+    });
+
+    it('returns the customer phone to the assigned provider while the job is in_progress', async () => {
+      const { request } = await createAssignedRequest('provider-1');
+      await repository.updateStatusForProvider(
+        request.id,
+        'provider-1',
+        'on_the_way',
+      );
+      await repository.updateStatusForProvider(
+        request.id,
+        'provider-1',
+        'in_progress',
+      );
+
+      const [job] = await repository.findByProviderId('provider-1');
+
+      expect(job).toMatchObject({
+        id: request.id,
+        status: 'in_progress',
+        customerPhone: CUSTOMER_PHONE,
+      });
+    });
+
+    it('never returns the customer phone to a provider who is not the assigned provider', async () => {
+      const { request } = await createAssignedRequest('provider-1');
+
+      const wrongProviderJobs = await repository.findByProviderId('provider-3');
+
+      // The request is not even visible to the wrong provider, so the
+      // customer phone cannot reach them through any assigned-job read.
+      expect(wrongProviderJobs.some((job) => job.id === request.id)).toBe(
+        false,
+      );
+    });
+
+    it('withholds the customer phone once the job is completed', async () => {
+      const { request } = await createAssignedRequest('provider-1');
+      await repository.updateStatusForProvider(
+        request.id,
+        'provider-1',
+        'on_the_way',
+      );
+      await repository.updateStatusForProvider(
+        request.id,
+        'provider-1',
+        'in_progress',
+      );
+      await repository.updateStatusForProvider(
+        request.id,
+        'provider-1',
+        'completed',
+      );
+
+      const [job] = await repository.findByProviderId('provider-1');
+
+      expect(job).toMatchObject({ id: request.id, status: 'completed' });
+      expect(job.customerPhone).toBeUndefined();
+    });
+
+    it('withholds the customer phone once the job is cancelled', async () => {
+      const { request } = await createAssignedRequest('provider-1');
+      await repository.updateStatus(request.id, 'cancelled');
+
+      const [job] = await repository.findByProviderId('provider-1');
+
+      expect(job).toMatchObject({ id: request.id, status: 'cancelled' });
+      expect(job.customerPhone).toBeUndefined();
+    });
+
+    it('keeps the invited pre-quote opportunity free of customer identity and contact fields', async () => {
+      const customer = await repository.upsertCustomer(CUSTOMER_PHONE);
+      const request = await repository.create(
+        {
+          serviceId: 'ac-cleaning',
+          address: 'حي الصفراء، بريدة',
+          timing: 'as-soon-as-possible',
+        },
+        customer.id,
+      );
+      await repository.inviteProvidersToRequest(request.id, ['provider-1']);
+
+      const opportunities =
+        await repository.listProviderOpportunities('provider-1');
+
+      const myOpportunity = opportunities.find(
+        (opportunity) => opportunity.requestId === request.id,
+      );
+      expect(myOpportunity).toBeDefined();
+      expect(myOpportunity).toMatchObject({
+        opportunityStatus: 'invited',
+      });
+
+      // The store-level projection is the server's own shape; assert it
+      // never carries customer identity or contact fields at all.
+      const serialized = JSON.stringify(myOpportunity);
+      expect(serialized).not.toContain(CUSTOMER_PHONE);
+      expect(serialized).not.toContain('customerPhone');
+      expect(serialized).not.toContain('customerId');
+      expect(serialized).not.toContain('customerName');
+      expect(serialized).not.toContain('email');
+    });
+
+    it('keeps a quoted-but-not-assigned provider free of the customer phone and job visibility', async () => {
+      const customer = await repository.upsertCustomer(CUSTOMER_PHONE);
+      const request = await repository.create(
+        {
+          serviceId: 'ac-cleaning',
+          address: 'حي الصفراء، بريدة',
+          timing: 'as-soon-as-possible',
+        },
+        customer.id,
+      );
+      await repository.inviteProvidersToRequest(request.id, ['provider-1']);
+      await repository.submitProviderQuote(
+        request.id,
+        'provider-1',
+        15_000,
+        'عرض',
+      );
+
+      const opportunities =
+        await repository.listProviderOpportunities('provider-1');
+      const myOpportunity = opportunities.find(
+        (opportunity) => opportunity.requestId === request.id,
+      );
+      expect(myOpportunity).toBeDefined();
+      expect(myOpportunity).toMatchObject({
+        requestId: request.id,
+        opportunityStatus: 'quoted',
+      });
+      expect(JSON.stringify(myOpportunity)).not.toContain(CUSTOMER_PHONE);
+
+      // Quoting does not assign the provider: the request is not visible as
+      // a job at all, so the phone cannot leak through the job read.
+      const jobs = await repository.findByProviderId('provider-1');
+      expect(jobs.some((job) => job.id === request.id)).toBe(false);
+    });
+  });
+
   it('upgrades a legacy provider access-code hash after a successful login', async () => {
     const accessCode = `provider-access-${randomUUID()}`;
     const provider = await repository.createPilotProvider({
@@ -772,6 +962,276 @@ describe('ServiceRequestRepository', () => {
       repository.updateStatus(request.id, 'in_progress'),
     ).resolves.toMatchObject({
       status: 'in_progress',
+    });
+  });
+
+  describe('service start quote gating (regression: an approved quote must not be invalidated by newer rejected/withdrawn quotes)', () => {
+    // A unique serviceId guarantees no auto-invite side effects: the request
+    // is created first and the two verified providers are then invited
+    // manually through the marketplace path.
+    async function createMarketplaceRequest() {
+      const uniqueServiceId = `start-gate-${randomUUID()}`;
+      const { request, customerId } =
+        await createPendingRequest(uniqueServiceId);
+      const providerA = await createVerifiedProvider([uniqueServiceId]);
+      const providerB = await createVerifiedProvider([uniqueServiceId]);
+      await repository.inviteProvidersToRequest(request.id, [
+        providerA.id,
+        providerB.id,
+      ]);
+      return { request, customerId, providerA, providerB };
+    }
+
+    it('allows a request with no quotes to enter in_progress (staff path)', async () => {
+      const uniqueServiceId = `start-gate-nq-${randomUUID()}`;
+      const { request } = await createPendingRequest(uniqueServiceId);
+      const provider = await createVerifiedProvider([uniqueServiceId]);
+      await repository.assignProvider(request.id, provider.id);
+      await repository.updateStatus(request.id, 'on_the_way');
+      await expect(
+        repository.updateStatus(request.id, 'in_progress'),
+      ).resolves.toMatchObject({ status: 'in_progress' });
+    });
+
+    it('allows a request with no quotes to enter in_progress (provider path)', async () => {
+      const uniqueServiceId = `start-gate-nqp-${randomUUID()}`;
+      const { request } = await createPendingRequest(uniqueServiceId);
+      const provider = await createVerifiedProvider([uniqueServiceId]);
+      await repository.assignProvider(request.id, provider.id);
+      await repository.updateStatusForProvider(
+        request.id,
+        provider.id,
+        'on_the_way',
+      );
+      await expect(
+        repository.updateStatusForProvider(
+          request.id,
+          provider.id,
+          'in_progress',
+        ),
+      ).resolves.toMatchObject({ status: 'in_progress' });
+    });
+
+    it('refuses in_progress while the only quote is still proposed', async () => {
+      const uniqueServiceId = `start-gate-proposed-${randomUUID()}`;
+      const { request } = await createPendingRequest(uniqueServiceId);
+      const provider = await createVerifiedProvider([uniqueServiceId]);
+      await repository.assignProvider(request.id, provider.id);
+      await repository.updateStatus(request.id, 'on_the_way');
+      await repository.proposeQuote(request.id, 15_000, 'عرض مقترح');
+      await expect(
+        repository.updateStatus(request.id, 'in_progress'),
+      ).rejects.toThrow('Quote approval required');
+    });
+
+    it('refuses in_progress while the only quote is rejected', async () => {
+      const uniqueServiceId = `start-gate-rejected-${randomUUID()}`;
+      const { request, customerId } =
+        await createPendingRequest(uniqueServiceId);
+      const quoted = await createVerifiedProvider([uniqueServiceId]);
+      const manual = await createVerifiedProvider([uniqueServiceId]);
+      await repository.inviteProvidersToRequest(request.id, [quoted.id]);
+      const quote = await repository.submitProviderQuote(
+        request.id,
+        quoted.id,
+        15_000,
+        'عرض مرفوض',
+      );
+      await repository.decideQuote(
+        request.id,
+        customerId,
+        quote.id,
+        'rejected',
+      );
+      await repository.assignProvider(request.id, manual.id);
+      await repository.updateStatus(request.id, 'on_the_way');
+      await expect(
+        repository.updateStatus(request.id, 'in_progress'),
+      ).rejects.toThrow('Quote approval required');
+    });
+
+    it('refuses in_progress while the only quote is withdrawn', async () => {
+      const uniqueServiceId = `start-gate-withdrawn-${randomUUID()}`;
+      const { request } = await createPendingRequest(uniqueServiceId);
+      const quoted = await createVerifiedProvider([uniqueServiceId]);
+      const manual = await createVerifiedProvider([uniqueServiceId]);
+      await repository.inviteProvidersToRequest(request.id, [quoted.id]);
+      const quote = await repository.submitProviderQuote(
+        request.id,
+        quoted.id,
+        15_000,
+        'عرض منسحب',
+      );
+      await repository.withdrawProviderQuote(quote.id, quoted.id);
+      await repository.assignProvider(request.id, manual.id);
+      await repository.updateStatus(request.id, 'on_the_way');
+      await expect(
+        repository.updateStatus(request.id, 'in_progress'),
+      ).rejects.toThrow('Quote approval required');
+    });
+
+    it('allows in_progress when the only quote is approved', async () => {
+      const uniqueServiceId = `start-gate-approved-${randomUUID()}`;
+      const { request, customerId } =
+        await createPendingRequest(uniqueServiceId);
+      const provider = await createVerifiedProvider([uniqueServiceId]);
+      await repository.inviteProvidersToRequest(request.id, [provider.id]);
+      const quote = await repository.submitProviderQuote(
+        request.id,
+        provider.id,
+        15_000,
+        'عرض معتمد',
+      );
+      await repository.decideQuote(
+        request.id,
+        customerId,
+        quote.id,
+        'approved',
+      );
+      // Approval assigns the winner and moves the request to 'assigned'.
+      await repository.updateStatus(request.id, 'on_the_way');
+      await expect(
+        repository.updateStatus(request.id, 'in_progress'),
+      ).resolves.toMatchObject({ status: 'in_progress' });
+    });
+
+    it('allows in_progress when an older quote is approved and a newer quote is rejected (staff path)', async () => {
+      const { request, customerId, providerA, providerB } =
+        await createMarketplaceRequest();
+      const olderQuote = await repository.submitProviderQuote(
+        request.id,
+        providerA.id,
+        15_000,
+        'عرض أقدم',
+      );
+      await repository.submitProviderQuote(
+        request.id,
+        providerB.id,
+        12_000,
+        'عرض أحدث',
+      );
+      await repository.decideQuote(
+        request.id,
+        customerId,
+        olderQuote.id,
+        'approved',
+      );
+      // The atomic approval auto-rejects the newer competitor quote, so the
+      // newest quote is rejected while the older one is approved.
+      expect(
+        (await repository.listProviderOpportunities(providerB.id))[0].myQuote
+          ?.status,
+      ).toBe('rejected');
+      await repository.updateStatus(request.id, 'on_the_way');
+      await expect(
+        repository.updateStatus(request.id, 'in_progress'),
+      ).resolves.toMatchObject({ status: 'in_progress' });
+    });
+
+    it('allows the assigned provider to start when an older quote is approved and a newer quote is rejected (provider path)', async () => {
+      const { request, customerId, providerA, providerB } =
+        await createMarketplaceRequest();
+      const olderQuote = await repository.submitProviderQuote(
+        request.id,
+        providerA.id,
+        15_000,
+        'عرض أقدم',
+      );
+      await repository.submitProviderQuote(
+        request.id,
+        providerB.id,
+        12_000,
+        'عرض أحدث',
+      );
+      await repository.decideQuote(
+        request.id,
+        customerId,
+        olderQuote.id,
+        'approved',
+      );
+      await repository.updateStatusForProvider(
+        request.id,
+        providerA.id,
+        'on_the_way',
+      );
+      await expect(
+        repository.updateStatusForProvider(
+          request.id,
+          providerA.id,
+          'in_progress',
+        ),
+      ).resolves.toMatchObject({ status: 'in_progress' });
+    });
+
+    it('allows in_progress when an older quote is approved and a newer quote is withdrawn (provider path)', async () => {
+      const { request, customerId, providerA, providerB } =
+        await createMarketplaceRequest();
+      const olderQuote = await repository.submitProviderQuote(
+        request.id,
+        providerA.id,
+        15_000,
+        'عرض أقدم',
+      );
+      const newerQuote = await repository.submitProviderQuote(
+        request.id,
+        providerB.id,
+        12_000,
+        'عرض أحدث',
+      );
+      await repository.withdrawProviderQuote(newerQuote.id, providerB.id);
+      await repository.decideQuote(
+        request.id,
+        customerId,
+        olderQuote.id,
+        'approved',
+      );
+      await repository.updateStatusForProvider(
+        request.id,
+        providerA.id,
+        'on_the_way',
+      );
+      await expect(
+        repository.updateStatusForProvider(
+          request.id,
+          providerA.id,
+          'in_progress',
+        ),
+      ).resolves.toMatchObject({ status: 'in_progress' });
+    });
+
+    it('keeps rejecting an invalid status transition', async () => {
+      const uniqueServiceId = `start-gate-transition-${randomUUID()}`;
+      const { request } = await createPendingRequest(uniqueServiceId);
+      const provider = await createVerifiedProvider([uniqueServiceId]);
+      await repository.assignProvider(request.id, provider.id);
+      // 'assigned' -> 'in_progress' must still pass through 'on_the_way'.
+      await expect(
+        repository.updateStatusForProvider(
+          request.id,
+          provider.id,
+          'in_progress',
+        ),
+      ).rejects.toThrow('Invalid status transition');
+    });
+
+    it('keeps rejecting updates from a provider who is not assigned', async () => {
+      const uniqueServiceId = `start-gate-owner-${randomUUID()}`;
+      const { request } = await createPendingRequest(uniqueServiceId);
+      const assigned = await createVerifiedProvider([uniqueServiceId]);
+      const stranger = await createVerifiedProvider([uniqueServiceId]);
+      await repository.assignProvider(request.id, assigned.id);
+      await repository.updateStatusForProvider(
+        request.id,
+        assigned.id,
+        'on_the_way',
+      );
+      await expect(
+        repository.updateStatusForProvider(
+          request.id,
+          stranger.id,
+          'in_progress',
+        ),
+      ).rejects.toThrow('Assigned provider request not found');
     });
   });
 
@@ -1972,7 +2432,7 @@ describe('ServiceRequestRepository', () => {
     expect(await readEventTypes(request.id)).toContain('quote_proposed');
   });
 
-  it('never exposes address, details, or customer data through provider opportunities', async () => {
+  it('carries job fields for the pre-quote projection but never any customer identity data', async () => {
     const provider = await createVerifiedProvider(['ac-cleaning']);
     const customer = await repository.upsertCustomer(
       `+9665${String(Math.floor(10_000_000 + Math.random() * 89_999_999))}`,
@@ -1993,16 +2453,21 @@ describe('ServiceRequestRepository', () => {
     );
     expect(opportunities).toHaveLength(1);
     const opportunity = opportunities[0];
-    expect(Object.keys(opportunity).sort()).toEqual([
-      'myQuote',
-      'opportunityStatus',
-      'requestId',
-      'serviceId',
-      'timing',
-    ]);
+    // Slice 3: the repository supplies the server-side inputs (address,
+    // details, request status) that AppService gates for eligible pre-quote
+    // providers. These fields are stripped again before any client DTO.
+    expect(opportunity).toMatchObject({
+      address: 'شارع الأمير سلطان، حي الصفراء، بريدة — منزل خاص',
+      details: 'معلومات حساسة جدًا مع رقم جوال في الملاحظات',
+      requestStatus: 'pending_dispatch',
+    });
+    // Customer identity never participates in this shape at any layer.
     const serialized = JSON.stringify(opportunity);
-    expect(serialized).not.toContain('شارع الأمير سلطان');
-    expect(serialized).not.toContain('معلومات حساسة');
+    expect(serialized).not.toContain('CUS-');
+    expect(serialized).not.toContain(customer.id);
+    for (const key of Object.keys(opportunity)) {
+      expect(key).not.toMatch(/customer|phone|email/i);
+    }
   });
 
   describe('migration CHECK scoping across all four constraints (Q0-SEC regression)', () => {
@@ -2440,6 +2905,513 @@ describe('ServiceRequestRepository', () => {
         );
         expect(leftover.rows[0].n).toBe(0);
       });
+    });
+  });
+  describe('service request image submission idempotency (Slice 2B)', () => {
+    function storedImageFor(sortOrder: number): StoredRequestImage {
+      return {
+        id: randomUUID(),
+        storageKey: `request-images/test/2026/08/${randomUUID()}.jpg`,
+        mimeType: 'image/jpeg',
+        byteSize: 100 + sortOrder,
+        contentSha256: createHash('sha256')
+          .update(`image-${sortOrder}-${randomUUID()}`)
+          .digest('hex'),
+        sortOrder,
+      };
+    }
+
+    function databaseCustomerId(customerId: string): number {
+      return Number(customerId.replace('CUS-', '')) - 1000;
+    }
+
+    const submissionFor = (
+      key: string,
+      fingerprint = 'f'.repeat(64),
+    ): ServiceRequestSubmissionContext => ({
+      clientSubmissionId: key,
+      submissionFingerprint: fingerprint,
+    });
+
+    it('commits submission columns and image metadata atomically with the request', async () => {
+      const customer = await repository.upsertCustomer('+966****0701');
+      const key = randomUUID();
+      const images = [storedImageFor(0), storedImageFor(1)];
+
+      const created = await repository.create(
+        {
+          serviceId: 'ac-cleaning',
+          address: 'حي الصفراء، بريدة',
+          details: 'تنظيف مكيفات',
+          timing: 'as-soon-as-possible',
+        },
+        customer.id,
+        submissionFor(key),
+        images,
+      );
+      expect(created.status).toBe('pending_dispatch');
+
+      const probe = new Pool({
+        connectionString: resolveDatabaseConnectionString(),
+      });
+      try {
+        const row = (
+          await probe.query<{
+            client_submission_id: string;
+            submission_fingerprint: string;
+          }>(
+            `SELECT client_submission_id, submission_fingerprint
+               FROM service_requests
+              WHERE customer_id = $1 AND client_submission_id = $2`,
+            [databaseCustomerId(customer.id), key],
+          )
+        ).rows[0];
+        expect(row).toMatchObject({
+          client_submission_id: key,
+          submission_fingerprint: 'f'.repeat(64),
+        });
+        const imageRows = (
+          await probe.query<{ storage_key: string; sort_order: number }>(
+            `SELECT storage_key, sort_order
+               FROM service_request_images
+              WHERE service_request_id = $1
+              ORDER BY sort_order`,
+            [Number(created.id.replace('MOE-', '')) - 1000],
+          )
+        ).rows;
+        expect(imageRows).toHaveLength(2);
+        expect(imageRows.map((image) => image.storage_key)).toEqual(
+          images.map((image) => image.storageKey),
+        );
+        const events = await probe.query<{ n: number }>(
+          `SELECT count(*)::int AS n
+             FROM service_request_events
+            WHERE service_request_id = $1 AND type = 'request_created'`,
+          [Number(created.id.replace('MOE-', '')) - 1000],
+        );
+        expect(events.rows[0].n).toBe(1);
+      } finally {
+        await probe.end();
+      }
+    });
+
+    it('leaves submission columns NULL for the legacy JSON creation path', async () => {
+      const customer = await repository.upsertCustomer('+966****0702');
+      const created = await repository.create(
+        {
+          serviceId: 'plumbing',
+          address: 'حي الصفراء، بريدة',
+          timing: 'as-soon-as-possible',
+        },
+        customer.id,
+      );
+      expect(created.id).toMatch(/^MOE-\d+$/);
+
+      const probe = new Pool({
+        connectionString: resolveDatabaseConnectionString(),
+      });
+      try {
+        const row = (
+          await probe.query<{
+            client_submission_id: string | null;
+            submission_fingerprint: string | null;
+          }>(
+            `SELECT client_submission_id, submission_fingerprint
+               FROM service_requests
+              WHERE id = $1`,
+            [Number(created.id.replace('MOE-', '')) - 1000],
+          )
+        ).rows[0];
+        expect(row).toEqual({
+          client_submission_id: null,
+          submission_fingerprint: null,
+        });
+      } finally {
+        await probe.end();
+      }
+    });
+
+    it('replays a committed submission and inserts nothing new', async () => {
+      const customer = await repository.upsertCustomer('+966****0703');
+      const key = randomUUID();
+      const first = await repository.create(
+        {
+          serviceId: 'upholstery',
+          address: 'حي الصفراء، بريدة',
+          timing: 'scheduled',
+        },
+        customer.id,
+        submissionFor(key),
+        [storedImageFor(0)],
+      );
+      expect(first.id).toMatch(/^MOE-\d+$/);
+
+      await expect(
+        repository.create(
+          {
+            serviceId: 'upholstery',
+            address: 'حي الصفراء، بريدة',
+            timing: 'scheduled',
+          },
+          customer.id,
+          submissionFor(key),
+          [storedImageFor(0)],
+        ),
+      ).rejects.toBeInstanceOf(RequestSubmissionReplayError);
+
+      const probe = new Pool({
+        connectionString: resolveDatabaseConnectionString(),
+      });
+      try {
+        const count = (
+          await probe.query<{ n: number }>(
+            `SELECT count(*)::int AS n
+               FROM service_requests
+              WHERE customer_id = $1 AND client_submission_id = $2`,
+            [databaseCustomerId(customer.id), key],
+          )
+        ).rows[0].n;
+        expect(count).toBe(1);
+        const imageCount = (
+          await probe.query<{ n: number }>(
+            `SELECT count(*)::int AS n
+               FROM service_request_images
+              WHERE service_request_id = $1`,
+            [databaseCustomerId(customer.id)],
+          )
+        ).rows[0].n;
+        expect(imageCount).toBe(1);
+      } finally {
+        await probe.end();
+      }
+    });
+
+    it('conflicts when the same key arrives with different content', async () => {
+      const customer = await repository.upsertCustomer('+966****0704');
+      const key = randomUUID();
+      await repository.create(
+        {
+          serviceId: 'tank-cleaning',
+          address: 'حي الصفراء، بريدة',
+          timing: 'as-soon-as-possible',
+        },
+        customer.id,
+        submissionFor(key, 'a'.repeat(64)),
+      );
+
+      await expect(
+        repository.create(
+          {
+            serviceId: 'tank-cleaning',
+            address: 'عنوان مختلف تماماً',
+            timing: 'scheduled',
+          },
+          customer.id,
+          submissionFor(key, 'b'.repeat(64)),
+        ),
+      ).rejects.toBeInstanceOf(RequestSubmissionConflictError);
+    });
+
+    it('commits exactly one of two concurrent identical submissions', async () => {
+      const customer = await repository.upsertCustomer('+966****0705');
+      const key = randomUUID();
+      const outcomes = await Promise.allSettled([
+        repository.create(
+          {
+            serviceId: 'home-cleaning',
+            address: 'حي الصفراء، بريدة',
+            timing: 'as-soon-as-possible',
+          },
+          customer.id,
+          submissionFor(key),
+          [storedImageFor(0)],
+        ),
+        repository.create(
+          {
+            serviceId: 'home-cleaning',
+            address: 'حي الصفراء، بريدة',
+            timing: 'as-soon-as-possible',
+          },
+          customer.id,
+          submissionFor(key),
+          [storedImageFor(0)],
+        ),
+      ]);
+
+      const fulfilled = outcomes.filter(
+        (outcome) => outcome.status === 'fulfilled',
+      );
+      const rejected = outcomes.filter(
+        (outcome) => outcome.status === 'rejected',
+      );
+      expect(fulfilled).toHaveLength(1);
+      expect(rejected).toHaveLength(1);
+      expect(
+        rejected[0].status === 'rejected' && rejected[0].reason,
+      ).toBeInstanceOf(RequestSubmissionReplayError);
+
+      const probe = new Pool({
+        connectionString: resolveDatabaseConnectionString(),
+      });
+      try {
+        const count = (
+          await probe.query<{ n: number }>(
+            `SELECT count(*)::int AS n
+               FROM service_requests
+              WHERE customer_id = $1 AND client_submission_id = $2`,
+            [databaseCustomerId(customer.id), key],
+          )
+        ).rows[0].n;
+        expect(count).toBe(1);
+        const winner = fulfilled[0] as PromiseFulfilledResult<{
+          id: string;
+        }>;
+        const imageCount = (
+          await probe.query<{ n: number }>(
+            `SELECT count(*)::int AS n
+               FROM service_request_images
+              WHERE service_request_id = $1`,
+            [Number(winner.value.id.replace('MOE-', '')) - 1000],
+          )
+        ).rows[0].n;
+        expect(imageCount).toBe(1);
+      } finally {
+        await probe.end();
+      }
+    });
+
+    it('rolls the whole transaction back when image metadata insertion fails', async () => {
+      const customer = await repository.upsertCustomer('+966****0706');
+      const key = randomUUID();
+      const duplicateOrder = [
+        storedImageFor(0),
+        {
+          ...storedImageFor(0),
+          id: randomUUID(),
+          storageKey: `request-images/test/2026/08/${randomUUID()}.jpg`,
+          contentSha256: createHash('sha256')
+            .update(`other-${randomUUID()}`)
+            .digest('hex'),
+        },
+      ];
+
+      await expect(
+        repository.create(
+          {
+            serviceId: 'ac-cleaning',
+            address: 'حي الصفراء، بريدة',
+            timing: 'as-soon-as-possible',
+          },
+          customer.id,
+          submissionFor(key),
+          duplicateOrder,
+        ),
+      ).rejects.toThrow();
+
+      const probe = new Pool({
+        connectionString: resolveDatabaseConnectionString(),
+      });
+      try {
+        const requests = (
+          await probe.query<{ n: number }>(
+            `SELECT count(*)::int AS n
+               FROM service_requests
+              WHERE customer_id = $1 AND client_submission_id = $2`,
+            [databaseCustomerId(customer.id), key],
+          )
+        ).rows[0].n;
+        expect(requests).toBe(0);
+        const images = (
+          await probe.query<{ n: number }>(
+            `SELECT count(*)::int AS n
+               FROM service_request_images i
+               JOIN service_requests r ON r.id = i.service_request_id
+              WHERE r.customer_id = $1 AND r.client_submission_id = $2`,
+            [databaseCustomerId(customer.id), key],
+          )
+        ).rows[0].n;
+        expect(images).toBe(0);
+        const events = (
+          await probe.query<{ n: number }>(
+            `SELECT count(*)::int AS n
+               FROM service_request_events e
+               JOIN service_requests r ON r.id = e.service_request_id
+              WHERE r.customer_id = $1 AND r.client_submission_id = $2`,
+            [databaseCustomerId(customer.id), key],
+          )
+        ).rows[0].n;
+        expect(events).toBe(0);
+      } finally {
+        await probe.end();
+      }
+    });
+
+    it('rejects a malformed client submission id before any SQL runs', async () => {
+      const customer = await repository.upsertCustomer('+966****0707');
+      await expect(
+        repository.create(
+          {
+            serviceId: 'ac-cleaning',
+            address: 'حي الصفراء، بريدة',
+            timing: 'as-soon-as-possible',
+          },
+          customer.id,
+          submissionFor('not-a-uuid'),
+        ),
+      ).rejects.toThrow('Invalid client submission id');
+    });
+  });
+  describe('service request image reads (Slice 3)', () => {
+    function storedImageFor(
+      sortOrder: number,
+      storageKey = `request-images/test/2026/08/${randomUUID()}.jpg`,
+    ): StoredRequestImage {
+      return {
+        id: randomUUID(),
+        storageKey,
+        mimeType: 'image/jpeg',
+        byteSize: 100 + sortOrder,
+        contentSha256: createHash('sha256')
+          .update(`slice3-${randomUUID()}-${sortOrder}`)
+          .digest('hex'),
+        sortOrder,
+      };
+    }
+
+    async function createRequestWithImages(images: StoredRequestImage[]) {
+      const uniqueServiceId = `slice3-reads-${randomUUID()}`;
+      const customer = await repository.upsertCustomer(
+        `+9665${String(Math.floor(10_000_000 + Math.random() * 89_999_999))}`,
+      );
+      const request = await repository.create(
+        {
+          serviceId: uniqueServiceId,
+          address: 'حي الصفراء، بريدة',
+          details: 'تفاصيل الصور',
+          timing: 'as-soon-as-possible',
+        },
+        customer.id,
+        undefined,
+        images,
+      );
+      return { request, customerId: customer.id };
+    }
+
+    it('reads committed image metadata for many requests in one batch, ordered by sort_order', async () => {
+      const firstImages = [storedImageFor(1), storedImageFor(0)];
+      const secondImages = [storedImageFor(2), storedImageFor(0)];
+      const first = await createRequestWithImages(firstImages);
+      const second = await createRequestWithImages(secondImages);
+
+      const byRequest = await repository.findRequestImagesByRequestIds([
+        first.request.id,
+        second.request.id,
+      ]);
+
+      expect(
+        byRequest.get(first.request.id)?.map((image) => image.sortOrder),
+      ).toEqual([0, 1]);
+      expect(
+        byRequest.get(second.request.id)?.map((image) => image.sortOrder),
+      ).toEqual([0, 2]);
+      expect(
+        byRequest.get(first.request.id)?.map((image) => image.storageKey),
+      ).toEqual(
+        firstImages
+          .slice()
+          .sort((a, b) => a.sortOrder - b.sortOrder)
+          .map((image) => image.storageKey),
+      );
+    });
+
+    it('returns an empty map for an empty id list without querying', async () => {
+      await expect(
+        repository.findRequestImagesByRequestIds([]),
+      ).resolves.toEqual(new Map());
+    });
+
+    it('exposes address/details/request status only for opportunities the provider owns', async () => {
+      const uniqueServiceId = `slice3-opp-${randomUUID()}`;
+      const { request } = await createPendingRequest(uniqueServiceId);
+      const provider = await createVerifiedProvider([uniqueServiceId]);
+      const otherProvider = await createVerifiedProvider([uniqueServiceId]);
+      await repository.inviteProvidersToRequest(request.id, [provider.id]);
+
+      await expect(
+        repository.listProviderOpportunities(provider.id),
+      ).resolves.toEqual([
+        expect.objectContaining({
+          requestId: request.id,
+          serviceId: uniqueServiceId,
+          opportunityStatus: 'invited',
+          address: 'حي الصفراء، بريدة',
+          details: 'تفاصيل حساسة للخصوصية',
+          requestStatus: 'pending_dispatch',
+        }),
+      ]);
+      await expect(
+        repository.listProviderOpportunities(otherProvider.id),
+      ).resolves.toEqual([]);
+    });
+
+    it('pages committed storage keys under an exact validated prefix only', async () => {
+      const outsideKey = `request-images/other/2026/08/${randomUUID()}.jpg`;
+      const myKeys = [
+        `request-images/test/2026/08/${randomUUID()}-a.jpg`,
+        `request-images/test/2026/08/${randomUUID()}-b.jpg`,
+        `request-images/test/2026/08/${randomUUID()}-c.jpg`,
+      ];
+      await createRequestWithImages([
+        storedImageFor(0, myKeys[0]),
+        storedImageFor(1, myKeys[1]),
+      ]);
+      await createRequestWithImages([
+        storedImageFor(0, myKeys[2]),
+        storedImageFor(1, outsideKey),
+      ]);
+
+      // Pagination mechanics: walk every page until the keyset cursor ends
+      // (other tests in this worker schema leave additional image rows, so
+      // only relative invariants are asserted).
+      const collected: string[] = [];
+      let after: string | undefined;
+      let pages = 0;
+      for (;;) {
+        const page = await repository.listImageStorageKeys(
+          'request-images/test/',
+          after,
+          2,
+        );
+        expect(page.keys.length).toBeLessThanOrEqual(2);
+        expect([...page.keys].sort()).toEqual(page.keys);
+        for (const key of page.keys) {
+          expect(key.startsWith('request-images/test/')).toBe(true);
+          expect(after === undefined || key > after).toBe(true);
+        }
+        collected.push(...page.keys);
+        pages += 1;
+        expect(pages).toBeLessThanOrEqual(50);
+        if (!page.nextAfter) break;
+        after = page.nextAfter;
+      }
+
+      for (const key of myKeys) {
+        expect(collected).toContain(key);
+      }
+      expect(collected).not.toContain(outsideKey);
+
+      await expect(
+        repository.listImageStorageKeys('request-images/../prod/'),
+      ).rejects.toThrow('Invalid request image storage prefix');
+      await expect(
+        repository.listImageStorageKeys('avatars/prod/'),
+      ).rejects.toThrow('Invalid request image storage prefix');
+      await expect(
+        repository.listImageStorageKeys(
+          'request-images/test/',
+          'request-images/test/../../etc/passwd',
+        ),
+      ).rejects.toThrow('Invalid request image storage key');
     });
   });
 });

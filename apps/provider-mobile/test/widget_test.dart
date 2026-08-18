@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
@@ -46,6 +48,31 @@ void main() {
       expect(providerActionLabel(job), 'بانتظار قرار العميل على عرض السعر');
     },
   );
+
+  test('provider job parsing keeps the assigned-provider customer phone', () {
+    final job = ProviderJob.fromJson({
+      'id': 'MOE-1003',
+      'serviceId': 'ac-cleaning',
+      'address': 'حي الصفراء، بريدة',
+      'timing': 'as-soon-as-possible',
+      'status': 'assigned',
+      'customerPhone': '+966****0012',
+    });
+
+    expect(job.customerPhone, '+966****0012');
+  });
+
+  test('provider job parsing yields no customer phone when the API omits it', () {
+    final job = ProviderJob.fromJson({
+      'id': 'MOE-1004',
+      'serviceId': 'ac-cleaning',
+      'address': 'حي الصفراء، بريدة',
+      'timing': 'as-soon-as-possible',
+      'status': 'completed',
+    });
+
+    expect(job.customerPhone, isNull);
+  });
 
   test('provider api reports a 401 as an unauthorized exception', () async {
     final api = ProviderApi(
@@ -190,6 +217,283 @@ void main() {
     expect(find.text('في أقرب وقت · مدعو'), findsOneWidget);
     expect(find.text('تقديم عرض'), findsOneWidget);
   });
+
+
+  testWidgets('shows the customer phone on an assigned job when the API returns it', (tester) async {
+    final store = _MemorySessionStore()..token = 'stale-token';
+    final api = ProviderApi(
+      baseUrl: 'https://api.example.test',
+      client: MockClient((request) async {
+        final path = request.url.path;
+        if (path == '/provider/auth/me') {
+          return http.Response(_providerJson, 200, headers: _jsonUtf8);
+        }
+        if (path == '/provider/service-requests') {
+          return http.Response(
+            '[{"id":"MOE-1001","serviceId":"ac-cleaning",'
+            '"address":"حي الصفراء، بريدة","timing":"as-soon-as-possible",'
+            '"status":"assigned","customerPhone":"+966****0012"}]',
+            200,
+            headers: _jsonUtf8,
+          );
+        }
+        if (path == '/provider/opportunities') {
+          return http.Response('[]', 200);
+        }
+        return http.Response('{}', 404);
+      }),
+    );
+
+    await tester.pumpWidget(
+      MoeenProviderApp(
+        api: api,
+        sessionStore: store,
+        hiddenStore: _MemoryHiddenStore(),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('رقم العميل: +966****0012'), findsOneWidget);
+  });
+
+  testWidgets('does not show a customer phone label when the API omits the field', (tester) async {
+    final store = _MemorySessionStore()..token = 'stale-token';
+    final api = ProviderApi(
+      baseUrl: 'https://api.example.test',
+      client: MockClient((request) async {
+        final path = request.url.path;
+        if (path == '/provider/auth/me') {
+          return http.Response(_providerJson, 200, headers: _jsonUtf8);
+        }
+        if (path == '/provider/service-requests') {
+          return http.Response(
+            '[{"id":"MOE-1001","serviceId":"ac-cleaning",'
+            '"address":"حي الصفراء، بريدة","timing":"as-soon-as-possible",'
+            '"status":"completed"}]',
+            200,
+            headers: _jsonUtf8,
+          );
+        }
+        if (path == '/provider/opportunities') {
+          return http.Response('[]', 200);
+        }
+        return http.Response('{}', 404);
+      }),
+    );
+
+    await tester.pumpWidget(
+      MoeenProviderApp(
+        api: api,
+        sessionStore: store,
+        hiddenStore: _MemoryHiddenStore(),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('رقم العميل'), findsNothing);
+  });
+
+  testWidgets(
+    'tapping تأكيد الانطلاق opens the confirmation sheet and confirming '
+    'advances an assigned job to on_the_way',
+    (tester) async {
+      final store = _MemorySessionStore()..token = 'stale-token';
+      var patchedStatus = '';
+      var jobStatus = 'assigned';
+      final api = ProviderApi(
+        baseUrl: 'https://api.example.test',
+        client: MockClient((request) async {
+          final method = request.method;
+          final path = request.url.path;
+          if (method == 'GET' && path == '/provider/auth/me') {
+            return http.Response(_providerJson, 200, headers: _jsonUtf8);
+          }
+          if (method == 'GET' && path == '/provider/service-requests') {
+            final body = jobStatus == 'on_the_way'
+                ? '[$_jobOnTheWayJson]'
+                : '[$_jobAssignedJson]';
+            return http.Response(body, 200, headers: _jsonUtf8);
+          }
+          if (method == 'GET' && path == '/provider/opportunities') {
+            return http.Response('[]', 200, headers: _jsonUtf8);
+          }
+          if (method == 'PATCH' &&
+              path == '/provider/service-requests/MOE-2001/status') {
+            patchedStatus =
+                (jsonDecode(request.body) as Map<String, dynamic>)['status']
+                    as String;
+            jobStatus = 'on_the_way';
+            return http.Response(_jobOnTheWayJson, 200, headers: _jsonUtf8);
+          }
+          return http.Response('{}', 404);
+        }),
+      );
+
+      await tester.pumpWidget(
+        MoeenProviderApp(
+          api: api,
+          sessionStore: store,
+          hiddenStore: _MemoryHiddenStore(),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.text('تأكيد الانطلاق'), findsOneWidget);
+
+      // Opening the sheet from a pre-MaterialApp context throws
+      // "debugCheckHasMaterialLocalizations"; this tap must not crash.
+      await tester.ensureVisible(find.text('تأكيد الانطلاق'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('تأكيد الانطلاق'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('تأكيد: تأكيد الانطلاق'), findsOneWidget);
+      expect(
+        find.text(
+          'سيتم إبلاغ العميل بأنك في الطريق. تأكد من استعدادك للمغادرة.',
+        ),
+        findsOneWidget,
+      );
+
+      await tester.tap(find.text('تأكيد: تأكيد الانطلاق'));
+      await tester.pumpAndSettle();
+
+      expect(patchedStatus, 'on_the_way');
+      expect(find.text('تأكيد الانطلاق'), findsNothing);
+      expect(find.text('بدء الخدمة'), findsOneWidget);
+    },
+  );
+
+  testWidgets(
+    'tapping بدء الخدمة opens the confirmation sheet and رجوع closes it '
+    'without sending a status update',
+    (tester) async {
+      final store = _MemorySessionStore()..token = 'stale-token';
+      var patchedStatus = '';
+      final api = ProviderApi(
+        baseUrl: 'https://api.example.test',
+        client: MockClient((request) async {
+          final method = request.method;
+          final path = request.url.path;
+          if (method == 'GET' && path == '/provider/auth/me') {
+            return http.Response(_providerJson, 200, headers: _jsonUtf8);
+          }
+          if (method == 'GET' && path == '/provider/service-requests') {
+            return http.Response('[$_jobOnTheWayJson]', 200, headers: _jsonUtf8);
+          }
+          if (method == 'GET' && path == '/provider/opportunities') {
+            return http.Response('[]', 200, headers: _jsonUtf8);
+          }
+          if (method == 'PATCH' &&
+              path == '/provider/service-requests/MOE-2002/status') {
+            patchedStatus = 'sent';
+            return http.Response(_jobInProgressJson, 200, headers: _jsonUtf8);
+          }
+          return http.Response('{}', 404);
+        }),
+      );
+
+      await tester.pumpWidget(
+        MoeenProviderApp(
+          api: api,
+          sessionStore: store,
+          hiddenStore: _MemoryHiddenStore(),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.text('بدء الخدمة'), findsOneWidget);
+
+      await tester.ensureVisible(find.text('بدء الخدمة'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('بدء الخدمة'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('تأكيد: بدء الخدمة'), findsOneWidget);
+      expect(
+        find.text(
+          'سيتم تحديث حالة الطلب إلى قيد التنفيذ. ابدأ الخدمة بعد وصولك للموقع.',
+        ),
+        findsOneWidget,
+      );
+
+      await tester.tap(find.text('رجوع'));
+      await tester.pumpAndSettle();
+
+      expect(patchedStatus, isEmpty);
+      expect(find.text('تأكيد: بدء الخدمة'), findsNothing);
+      expect(find.text('بدء الخدمة'), findsOneWidget);
+    },
+  );
+
+  testWidgets(
+    'tapping إنهاء الخدمة opens the confirmation sheet and confirming '
+    'advances an in-progress job to completed',
+    (tester) async {
+      final store = _MemorySessionStore()..token = 'stale-token';
+      var patchedStatus = '';
+      var jobStatus = 'in_progress';
+      final api = ProviderApi(
+        baseUrl: 'https://api.example.test',
+        client: MockClient((request) async {
+          final method = request.method;
+          final path = request.url.path;
+          if (method == 'GET' && path == '/provider/auth/me') {
+            return http.Response(_providerJson, 200, headers: _jsonUtf8);
+          }
+          if (method == 'GET' && path == '/provider/service-requests') {
+            final body = jobStatus == 'completed'
+                ? '[$_jobCompletedJson]'
+                : '[$_jobInProgressJson]';
+            return http.Response(body, 200, headers: _jsonUtf8);
+          }
+          if (method == 'GET' && path == '/provider/opportunities') {
+            return http.Response('[]', 200, headers: _jsonUtf8);
+          }
+          if (method == 'PATCH' &&
+              path == '/provider/service-requests/MOE-2003/status') {
+            patchedStatus =
+                (jsonDecode(request.body) as Map<String, dynamic>)['status']
+                    as String;
+            jobStatus = 'completed';
+            return http.Response(_jobCompletedJson, 200, headers: _jsonUtf8);
+          }
+          return http.Response('{}', 404);
+        }),
+      );
+
+      await tester.pumpWidget(
+        MoeenProviderApp(
+          api: api,
+          sessionStore: store,
+          hiddenStore: _MemoryHiddenStore(),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.text('إنهاء الخدمة'), findsOneWidget);
+
+      await tester.ensureVisible(find.text('إنهاء الخدمة'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('إنهاء الخدمة'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('تأكيد: إنهاء الخدمة'), findsOneWidget);
+      expect(
+        find.text(
+          'سيتم إبلاغ العميل باكتمال الخدمة. تأكد من إنهاء العمل المتفق عليه قبل المتابعة.',
+        ),
+        findsOneWidget,
+      );
+
+      await tester.tap(find.text('تأكيد: إنهاء الخدمة'));
+      await tester.pumpAndSettle();
+
+      expect(patchedStatus, 'completed');
+      expect(find.text('إنهاء الخدمة'), findsNothing);
+      expect(find.text('لا يوجد إجراء متاح'), findsOneWidget);
+    },
+  );
 
   testWidgets('shows the empty state when there are no opportunities', (
     tester,
@@ -626,6 +930,144 @@ void main() {
 
     expect(find.text('إخفاء من قائمتي'), findsOneWidget);
   });
+
+  test('ProviderOpportunity parses pre-quote address, details and images', () {
+    final opp = ProviderOpportunity.fromJson({
+      'requestId': 'MOE-30',
+      'serviceId': 'ac-cleaning',
+      'timing': 'scheduled',
+      'opportunityStatus': 'invited',
+      'address': 'حي الصفراء، بريدة',
+      'details': 'مكيف سبليت لا يبرد',
+      'images': [
+        {
+          'id': 'img-2',
+          'mimeType': 'image/jpeg',
+          'byteSize': 1024,
+          'sortOrder': 1,
+          'url': 'https://signed.example.test/img-2?sig=z',
+          'urlExpiresAt': '2026-08-17T12:00:00.000Z',
+        },
+        {
+          'id': 'img-1',
+          'mimeType': 'image/jpeg',
+          'byteSize': 2048,
+          'sortOrder': 0,
+          'url': 'https://signed.example.test/img-1?sig=y',
+        },
+      ],
+    } as Map<String, dynamic>);
+
+    expect(opp.address, 'حي الصفراء، بريدة');
+    expect(opp.details, 'مكيف سبليت لا يبرد');
+    expect(opp.images, hasLength(2));
+    // Server sort order is preserved exactly as returned.
+    expect(opp.images.map((image) => image.id), ['img-2', 'img-1']);
+    expect(opp.images.first.url, 'https://signed.example.test/img-2?sig=z');
+  });
+
+  test('ProviderOpportunity ignores malformed image entries', () {
+    final opp = ProviderOpportunity.fromJson({
+      'requestId': 'MOE-31',
+      'serviceId': 'plumbing',
+      'timing': 'as-soon-as-possible',
+      'opportunityStatus': 'invited',
+      'address': 'حي النهضة، بريدة',
+      'images': [
+        {'id': 'img-1', 'mimeType': 'image/jpeg', 'byteSize': 10, 'sortOrder': 0, 'url': 'https://signed.example.test/img-1'},
+        'not-an-object',
+        null,
+      ],
+    } as Map<String, dynamic>);
+
+    expect(opp.images, hasLength(1));
+    expect(opp.images.single.id, 'img-1');
+  });
+
+  test('ProviderOpportunity without pre-quote fields stays safe and empty', () {
+    final opp = ProviderOpportunity.fromJson({
+      'requestId': 'MOE-32',
+      'serviceId': 'ac-cleaning',
+      'timing': 'as-soon-as-possible',
+      'opportunityStatus': 'closed',
+      'myQuote': {
+        'id': 'QTE-30',
+        'amountHalalas': 10000,
+        'scope': 'test',
+        'status': 'rejected',
+      },
+    } as Map<String, dynamic>);
+
+    expect(opp.address, isNull);
+    expect(opp.details, isNull);
+    expect(opp.images, isEmpty);
+  });
+
+  testWidgets(
+    'an invited opportunity renders service, timing, address, details and '
+    'image thumbnails before quoting',
+    (tester) async {
+      final store = _MemorySessionStore()..token = 'stale-token';
+      final api = ProviderApi(
+        baseUrl: 'https://api.example.test',
+        client: _dashboardMockClient(
+          opportunitiesHandler: (_) async => http.Response(
+            _opportunitiesInvitedWithImagesJson,
+            200,
+            headers: _jsonUtf8,
+          ),
+        ),
+      );
+
+      await tester.pumpWidget(
+        MoeenProviderApp(
+          api: api,
+          sessionStore: store,
+          hiddenStore: _MemoryHiddenStore(),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.text('تنظيف المكيفات'), findsOneWidget);
+      expect(find.text('موعد محدد · مدعو'), findsOneWidget);
+      expect(find.text('حي الصفراء، بريدة'), findsOneWidget);
+      expect(find.text('مكيف سبليت لا يبرد'), findsOneWidget);
+      // Network images fail in the test environment; the failure state tile
+      // proves the thumbnail gallery rendered with a safe fallback.
+      expect(find.text('تعذر تحميل الصورة'), findsNWidgets(2));
+      expect(find.text('تقديم عرض'), findsOneWidget);
+    },
+  );
+
+  testWidgets(
+    'a terminal opportunity never renders address, details or images',
+    (tester) async {
+      final store = _MemorySessionStore()..token = 'stale-token';
+      final api = ProviderApi(
+        baseUrl: 'https://api.example.test',
+        client: _dashboardMockClient(
+          opportunitiesHandler: (_) async => http.Response(
+            _opportunitiesRejectedJson,
+            200,
+            headers: _jsonUtf8,
+          ),
+        ),
+      );
+
+      await tester.pumpWidget(
+        MoeenProviderApp(
+          api: api,
+          sessionStore: store,
+          hiddenStore: _MemoryHiddenStore(),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.textContaining('تم رفض عرضك'), findsOneWidget);
+      expect(find.text('حي الصفراء، بريدة'), findsNothing);
+      expect(find.text('تعذر تحميل الصورة'), findsNothing);
+    },
+  );
 }
 
 class _MemorySessionStore implements ProviderSessionStore {
@@ -668,6 +1110,18 @@ const _opportunitiesInvitedJson =
     '[{"requestId":"MOE-1","serviceId":"ac-cleaning",'
     '"timing":"as-soon-as-possible","opportunityStatus":"invited"}]';
 
+const _opportunitiesInvitedWithImagesJson =
+    '[{"requestId":"MOE-30","serviceId":"ac-cleaning",'
+    '"timing":"scheduled","opportunityStatus":"invited",'
+    '"address":"حي الصفراء، بريدة","details":"مكيف سبليت لا يبرد",'
+    '"images":['
+    '{"id":"img-1","mimeType":"image/jpeg","byteSize":1024,"sortOrder":0,'
+    '"url":"https://signed.example.test/img-1?sig=a",'
+    '"urlExpiresAt":"2026-08-17T12:00:00.000Z"},'
+    '{"id":"img-2","mimeType":"image/jpeg","byteSize":2048,"sortOrder":1,'
+    '"url":"https://signed.example.test/img-2?sig=b"}'
+    ']}]';
+
 const _opportunitiesQuotedJson =
     '[{"requestId":"MOE-1","serviceId":"ac-cleaning",'
     '"timing":"as-soon-as-possible","opportunityStatus":"quoted",'
@@ -707,6 +1161,26 @@ const _quoteCreatedJson =
     '{"id":"QTE-1","providerId":"provider-1","amountHalalas":15000,'
     '"scope":"full clean","status":"proposed",'
     '"proposedAt":"2026-08-07T00:00:00.000Z"}';
+
+const _jobAssignedJson =
+    '{"id":"MOE-2001","serviceId":"ac-cleaning",'
+    '"address":"حي الصفراء، بريدة","timing":"as-soon-as-possible",'
+    '"status":"assigned"}';
+
+const _jobOnTheWayJson =
+    '{"id":"MOE-2002","serviceId":"ac-cleaning",'
+    '"address":"حي الصفراء، بريدة","timing":"as-soon-as-possible",'
+    '"status":"on_the_way"}';
+
+const _jobInProgressJson =
+    '{"id":"MOE-2003","serviceId":"ac-cleaning",'
+    '"address":"حي الصفراء، بريدة","timing":"as-soon-as-possible",'
+    '"status":"in_progress"}';
+
+const _jobCompletedJson =
+    '{"id":"MOE-2003","serviceId":"ac-cleaning",'
+    '"address":"حي الصفراء، بريدة","timing":"as-soon-as-possible",'
+    '"status":"completed"}';
 
 MockClient _dashboardMockClient({
   required Future<http.Response> Function(http.Request) opportunitiesHandler,

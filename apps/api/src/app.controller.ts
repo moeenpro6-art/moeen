@@ -13,14 +13,29 @@ import {
   Post,
   Req,
   UnauthorizedException,
+  UploadedFiles,
+  UseGuards,
+  UseInterceptors,
 } from '@nestjs/common';
+import { FilesInterceptor } from '@nestjs/platform-express';
 import type { Request } from 'express';
+import {
+  CustomerSessionGuard,
+  type CustomerAuthenticatedRequest,
+} from './customer-session.guard';
+import type { RequestImageUploadFile } from './request-image.types';
+import {
+  MAX_REQUEST_IMAGES,
+  MAX_REQUEST_IMAGE_AGGREGATE_BYTES,
+  MAX_REQUEST_IMAGE_BYTES,
+} from './request-image.service';
+
+import {
+  parseIdempotencyKey,
+  validateCreateServiceRequestMultipart,
+} from './request-image-create.contracts';
 import { AppService } from './app.service';
-import type {
-  CreateServiceRequest,
-  LaunchService,
-  ServiceRequest,
-} from './app.service';
+import type { LaunchService, ServiceRequest } from './app.service';
 import { StaffAuditService } from './staff-audit.service';
 import { CustomerAuthService } from './customer-auth.service';
 import { ProviderAuthService } from './provider-auth.service';
@@ -360,13 +375,64 @@ export class AppController {
   }
 
   @Post('service-requests')
+  @UseGuards(CustomerSessionGuard)
+  @UseInterceptors(
+    FilesInterceptor('images', MAX_REQUEST_IMAGES, {
+      limits: {
+        fileSize: MAX_REQUEST_IMAGE_BYTES,
+        files: MAX_REQUEST_IMAGES,
+        fields: 4,
+        parts: MAX_REQUEST_IMAGES + 10,
+      },
+    }),
+  )
   createServiceRequest(
-    @Headers('authorization') authorization: string | undefined,
-    @Body() request: CreateServiceRequest,
-  ): Promise<ServiceRequest> {
-    return this.appService.createMyServiceRequest(
-      this.extractBearerToken(authorization),
-      request,
+    @Req() request: CustomerAuthenticatedRequest,
+    @Headers('content-type') contentType: string | undefined,
+    @Headers('idempotency-key') idempotencyKey: string | undefined,
+    @Body() body: unknown,
+    @UploadedFiles()
+    images: RequestImageUploadFile[] | undefined,
+  ): Promise<
+    ServiceRequest &
+      import('./request-image-create.contracts').CreateServiceRequestMultipartResult
+  > {
+    // EXECUTION ORDER (Nest pipeline): Express body-parser middleware runs
+    // first (it skips multipart bodies), then guards run BEFORE interceptors,
+    // so CustomerSessionGuard authenticates and rejects missing/invalid/
+    // expired sessions BEFORE the bounded Multer parsing below. Only after
+    // the guard passes can multipart parts reach this handler; the
+    // interceptor's Multer limits (5 files, 5 MiB per file, 4 fields,
+    // 9 parts) bound the parsed stream, and the aggregate 20 MiB check runs
+    // here before any image canonicalization/storage work.
+    const isMultipart =
+      contentType?.split(';')[0]?.trim().toLowerCase() ===
+      'multipart/form-data';
+    if (!isMultipart) {
+      return this.appService.createAuthenticatedServiceRequest(
+        request.customer,
+        body,
+      );
+    }
+    const idempotencyKeyValue = parseIdempotencyKey(idempotencyKey);
+    const normalized = validateCreateServiceRequestMultipart({
+      serviceId: (body as Record<string, unknown> | null)?.serviceId,
+      address: (body as Record<string, unknown> | null)?.address,
+      details: (body as Record<string, unknown> | null)?.details,
+      timing: (body as Record<string, unknown> | null)?.timing,
+      images: images ?? [],
+    });
+    if (
+      normalized.images.length > 0 &&
+      normalized.images.reduce((sum, image) => sum + image.size, 0) >
+        MAX_REQUEST_IMAGE_AGGREGATE_BYTES
+    ) {
+      throw new BadRequestException('Request images exceed 20 MiB in total');
+    }
+    return this.appService.createAuthenticatedServiceRequestWithImages(
+      request.customer,
+      normalized,
+      idempotencyKeyValue,
     );
   }
 
