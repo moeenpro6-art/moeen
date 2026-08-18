@@ -166,6 +166,80 @@ String generateUuidV4() {
       '${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20)}';
 }
 
+/// Holds the multipart submission Idempotency-Key for the current booking
+/// payload together with a snapshot of the payload the key was minted for.
+///
+/// Lifecycle:
+/// - [keyFor] returns the stored key while the payload snapshot is unchanged,
+///   and mints a fresh UUID v4 key whenever any request-defining input
+///   changed (service id, address, details, timing, or the ORDERED image
+///   bytes — the same inputs the API folds into its submission fingerprint).
+/// - [clear] drops the stored key. Callers clear after a confirmed 201
+///   Created (the booking is committed and the key is spent) and after a 409
+///   idempotency conflict (the server permanently bound that key to
+///   different content, so the key can never succeed again).
+///
+/// A transport failure, timeout, dropped response, or retryable server
+/// failure must NOT clear the key: a retry of the unchanged payload then
+/// reuses the exact same key, and the API replays the committed request
+/// instead of creating a duplicate.
+class BookingSubmissionIdentity {
+  String? _key;
+  String? _serviceId;
+  String? _address;
+  String? _details;
+  String? _timing;
+  List<Uint8List>? _orderedImageBytes;
+
+  String keyFor({
+    required String serviceId,
+    required String address,
+    required String timing,
+    String? details,
+    required List<Uint8List> orderedImageBytes,
+  }) {
+    final storedKey = _key;
+    final unchanged =
+        storedKey != null &&
+        _serviceId == serviceId &&
+        _address == address &&
+        _details == details &&
+        _timing == timing &&
+        _imageBytesMatch(_orderedImageBytes!, orderedImageBytes);
+    if (!unchanged) {
+      _key = generateUuidV4();
+      _serviceId = serviceId;
+      _address = address;
+      _details = details;
+      _timing = timing;
+      _orderedImageBytes = List.of(orderedImageBytes);
+    }
+    return _key!;
+  }
+
+  /// Forgets the stored key and its payload snapshot. Safe to call when no
+  /// key is stored.
+  void clear() {
+    _key = null;
+    _serviceId = null;
+    _address = null;
+    _details = null;
+    _timing = null;
+    _orderedImageBytes = null;
+  }
+
+  static bool _imageBytesMatch(
+    List<Uint8List> stored,
+    List<Uint8List> current,
+  ) {
+    if (stored.length != current.length) return false;
+    for (var i = 0; i < stored.length; i++) {
+      if (!requestImageBytesEqual(stored[i], current[i])) return false;
+    }
+    return true;
+  }
+}
+
 /// A file selected from the device gallery before it is uploaded.
 class PickedImageFile {
   const PickedImageFile({

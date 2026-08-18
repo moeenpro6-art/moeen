@@ -290,10 +290,26 @@ class _ServiceCard extends StatelessWidget {
 }
 
 class BookingPage extends StatefulWidget {
-  const BookingPage({super.key, required this.service, this.imagePicker});
+  const BookingPage({
+    super.key,
+    required this.service,
+    this.imagePicker,
+    this.sessionManager,
+    this.httpClient,
+    this.apiConfig,
+  });
 
   final ServiceOption service;
   final RequestImagePicker? imagePicker;
+
+  /// Test seam: overrides the global customer session manager.
+  final CustomerSessionManager? sessionManager;
+
+  /// Test seam: overrides the HTTP client used to create service requests.
+  final http.Client? httpClient;
+
+  /// Test seam: overrides the API origin configuration.
+  final MoeenApiConfig? apiConfig;
 
   @override
   State<BookingPage> createState() => _BookingPageState();
@@ -309,8 +325,21 @@ class _BookingPageState extends State<BookingPage> {
   String? _imageError;
   List<SelectedRequestImage> _selectedImages = [];
 
+  /// One Idempotency-Key per booking payload. Reused verbatim on every
+  /// retry of the unchanged payload and invalidated when the payload
+  /// changes, so a retry after a lost response replays the committed
+  /// request instead of creating a duplicate.
+  final _submissionIdentity = BookingSubmissionIdentity();
+
   RequestImagePicker get _imagePicker =>
       widget.imagePicker ?? ImagePickerRequestImagePicker();
+
+  CustomerSessionManager get _sessionManager =>
+      widget.sessionManager ?? customerSessionManager;
+
+  http.Client get _httpClient => widget.httpClient ?? http.Client();
+
+  MoeenApiConfig get _apiConfig => widget.apiConfig ?? moeenApi;
 
   @override
   void dispose() {
@@ -425,7 +454,7 @@ class _BookingPageState extends State<BookingPage> {
     setState(() => _isSubmitting = true);
     http.Response? response;
     try {
-      final session = await customerSessionManager.restore();
+      final session = await _sessionManager.restore();
       if (session == null) throw Exception('Customer session required');
       final address = _addressController.text.trim();
       final details = _detailsController.text.trim();
@@ -434,8 +463,10 @@ class _BookingPageState extends State<BookingPage> {
           : 'scheduled';
       if (_selectedImages.isEmpty) {
         // Legacy zero-image flow: plain JSON body, no Idempotency-Key.
-        response = await http.post(
-          moeenApi.endpoint('/service-requests'),
+        // The API's JSON create path has no idempotency contract, so no key
+        // is sent here (adding one would invent a backend contract).
+        response = await _httpClient.post(
+          _apiConfig.endpoint('/service-requests'),
           headers: {
             'Content-Type': 'application/json',
             'Authorization': 'Bearer ${session.token}',
@@ -449,17 +480,29 @@ class _BookingPageState extends State<BookingPage> {
         );
       } else {
         // Multipart contract: `images` file parts plus a UUID v4
-        // Idempotency-Key. The API canonicalizes and commits images in the
-        // same transaction as the request.
+        // Idempotency-Key. The key is minted once per payload snapshot and
+        // reused on every retry of the SAME payload, so a retry after a
+        // lost/failed response replays the committed request instead of
+        // creating a duplicate.
+        final idempotencyKey = _submissionIdentity.keyFor(
+          serviceId: widget.service.id,
+          address: address,
+          details: details.isEmpty ? null : details,
+          timing: timing,
+          orderedImageBytes: [
+            for (final image in _selectedImages) image.bytes,
+          ],
+        );
         response = await submitServiceRequestWithImages(
-          client: http.Client(),
-          endpoint: moeenApi.endpoint('/service-requests'),
+          client: _httpClient,
+          endpoint: _apiConfig.endpoint('/service-requests'),
           token: session.token,
           serviceId: widget.service.id,
           address: address,
           details: details.isEmpty ? null : details,
           timing: timing,
           images: _selectedImages,
+          idempotencyKey: idempotencyKey,
         );
       }
 
@@ -469,6 +512,9 @@ class _BookingPageState extends State<BookingPage> {
       }
 
       final request = jsonDecode(response.body) as Map<String, dynamic>;
+      // The booking is committed: the submission identity is spent. Clearing
+      // it guarantees a later new booking starts with a fresh key.
+      _submissionIdentity.clear();
       await Navigator.of(context).pushReplacement(
         MaterialPageRoute<void>(
           builder: (_) => RequestConfirmedPage(
@@ -479,6 +525,12 @@ class _BookingPageState extends State<BookingPage> {
       );
     } on _ImageAwareRequestException catch (error) {
       if (!mounted) return;
+      if (error.response.statusCode == 409) {
+        // The server permanently bound this key to different content; it can
+        // never succeed again. Drop it so the next attempt mints a fresh key
+        // instead of being stuck in an endless conflict.
+        _submissionIdentity.clear();
+      }
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(_imageAwareFailureMessage(error.response)),
@@ -503,6 +555,9 @@ class _BookingPageState extends State<BookingPage> {
   String _imageAwareFailureMessage(http.Response response) {
     if (response.statusCode == 413) {
       return 'تعذر قبول الصور: إحدى الصور أكبر من الحد المسموح (5 م.ب).';
+    }
+    if (response.statusCode == 409) {
+      return 'حدث تعارض مع محاولة سابقة. أعد المحاولة لإرسال طلبك.';
     }
     if (response.statusCode == 400) {
       final body = response.body.toLowerCase();

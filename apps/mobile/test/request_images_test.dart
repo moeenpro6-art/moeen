@@ -327,4 +327,105 @@ void main() {
       );
     });
   });
+
+  group('BookingSubmissionIdentity', () {
+    final uuidV4 = RegExp(
+      r'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-'
+      r'[0-9a-f]{12}$',
+    );
+
+    String keyFor(
+      BookingSubmissionIdentity identity, {
+      String serviceId = 'ac-cleaning',
+      String address = 'حي الصفراء، بريدة',
+      String timing = 'as-soon-as-possible',
+      String? details = 'مكيف لا يبرد',
+      List<Uint8List>? bytes,
+    }) => identity.keyFor(
+      serviceId: serviceId,
+      address: address,
+      timing: timing,
+      details: details,
+      orderedImageBytes: bytes ?? [_jpegBytes()],
+    );
+
+    test('reuses the exact same key while the payload is unchanged', () {
+      final identity = BookingSubmissionIdentity();
+      final first = keyFor(identity);
+      expect(uuidV4.hasMatch(first), isTrue);
+
+      final second = keyFor(identity);
+      expect(second, first);
+    });
+
+    test('mints a new key when a request-defining field changes', () {
+      final identity = BookingSubmissionIdentity();
+      final original = keyFor(identity);
+
+      expect(keyFor(identity, serviceId: 'plumbing'), isNot(original));
+      expect(keyFor(identity, address: 'حي آخر، بريدة'), isNot(original));
+      expect(keyFor(identity, details: 'وصف مختلف'), isNot(original));
+      expect(keyFor(identity, timing: 'scheduled'), isNot(original));
+    });
+
+    test('mints a new key when images are added, removed, replaced or reordered', () {
+      final identity = BookingSubmissionIdentity();
+      final original = keyFor(identity);
+
+      // Replace: same count, different bytes.
+      final replaced = keyFor(identity, bytes: [_pngBytes()]);
+      expect(replaced, isNot(original));
+
+      // Add: one more image.
+      final added = keyFor(identity, bytes: [_pngBytes(), _jpegBytes()]);
+      expect(added, isNot(replaced));
+
+      // Remove: back to a single image.
+      final removed = keyFor(identity, bytes: [_pngBytes()]);
+      expect(removed, isNot(added));
+
+      // Reorder: ordering participates in the fingerprint.
+      final reordered = keyFor(identity, bytes: [_jpegBytes(), _pngBytes()]);
+      expect(reordered, isNot(removed));
+
+      // Unchanged payload after a change still reuses the latest key.
+      expect(
+        keyFor(identity, bytes: [_jpegBytes(), _pngBytes()]),
+        reordered,
+      );
+    });
+
+    test('does not key off image file names or MIME types', () {
+      final identity = BookingSubmissionIdentity();
+      // keyFor only receives content bytes: identical bytes always mean the
+      // same key, so renaming/retyping a file cannot invalidate the key
+      // (matching the server fingerprint, which hashes content only).
+      final first = keyFor(identity);
+      final second = keyFor(identity);
+      expect(second, first);
+    });
+
+    test('clear() forgets the key so a new booking gets a fresh key', () {
+      final identity = BookingSubmissionIdentity();
+      final first = keyFor(identity);
+      identity.clear();
+      final second = keyFor(identity);
+      expect(second, isNot(first));
+      expect(uuidV4.hasMatch(second), isTrue);
+    });
+
+    test('clear() before any key is safe and the first key is still valid', () {
+      final identity = BookingSubmissionIdentity();
+      identity.clear();
+      final key = keyFor(identity);
+      expect(uuidV4.hasMatch(key), isTrue);
+    });
+
+    test('a null details value differs from an empty details value', () {
+      final identity = BookingSubmissionIdentity();
+      final withNull = keyFor(identity, details: null);
+      final withEmpty = keyFor(identity, details: '');
+      expect(withEmpty, isNot(withNull));
+    });
+  });
 }
