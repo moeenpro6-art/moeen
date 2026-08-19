@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
@@ -6,6 +7,7 @@ import 'package:http/http.dart' as http;
 
 import 'request_images.dart';
 import 'moeen_ui.dart';
+import 'provider_notifications.dart';
 
 const _providerTokenStorageKey = 'moeen_provider_session_token';
 const _serviceNames = {
@@ -472,6 +474,11 @@ class MoeenProviderApp extends StatefulWidget {
 
 class _MoeenProviderAppState extends State<MoeenProviderApp> {
   final _accessCodeController = TextEditingController();
+  final _scaffoldMessengerKey = GlobalKey<ScaffoldMessengerState>();
+  final Map<String, GlobalKey> _opportunityCardKeys = {};
+  final Map<String, GlobalKey> _jobCardKeys = {};
+  late final ProviderNotificationController _notifications;
+
   String? _token;
   ProviderProfile? _provider;
   List<ProviderJob> _jobs = const [];
@@ -486,11 +493,27 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
   @override
   void initState() {
     super.initState();
+    _notifications = ProviderNotificationController(
+      enabled: ProviderFcmConfig.enabled,
+      messaging: FirebaseProviderMessagingClient(),
+      deviceApi: HttpProviderDeviceApi(
+        endpoint: (path) => widget._api._config.endpoint(path),
+      ),
+      deviceStore: SecureProviderDeviceIdStore(),
+      sessionTokenProvider: () async => _token,
+      onForegroundMessage: _showForegroundNotification,
+      onOpenedIntent: _openNotificationIntent,
+    );
+    // Both calls are intentionally non-blocking. If Firebase is unconfigured,
+    // the controller swallows that optional failure and the existing restore
+    // flow continues unchanged.
+    unawaited(_notifications.handleInitialMessage());
     _restoreSession();
   }
 
   @override
   void dispose() {
+    _notifications.dispose();
     _accessCodeController.dispose();
     super.dispose();
   }
@@ -505,6 +528,9 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
       await _loadDashboard(token);
       await _loadHiddenOpportunities();
       await _loadOpportunities();
+      // Authentication and provider data are ready before a pending notification
+      // tap may focus an existing opportunity or assigned-job card.
+      unawaited(_notifications.onAuthenticated());
     } catch (_) {
       await _expireSession();
     }
@@ -523,7 +549,12 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
   }
 
   Future<void> _expireSession() async {
+    // There may be no trustworthy bearer token left after an auth expiry, but
+    // invalidate the FCM generation before clearing app state so a stale device
+    // registration can never reappear for a later provider login.
+    unawaited(_notifications.onSessionInvalidated());
     await widget._sessionStore.clearToken();
+
     if (mounted) {
       setState(() {
         _token = null;
@@ -567,6 +598,68 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
         _opportunitiesError = 'تعذر تحميل الفرص. حاول مرة أخرى.';
       });
     }
+  }
+
+  /// Shows a lightweight foreground indication. The push payload itself never
+  /// changes provider data; choosing the action re-fetches authenticated API
+  /// state before the existing list UI is focused.
+  void _showForegroundNotification(ProviderNotificationIntent intent) {
+    if (!mounted || _provider == null) return;
+    _scaffoldMessengerKey.currentState
+      ?..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Text(providerNotificationSummary(intent)),
+          action: SnackBarAction(
+            label: 'فتح',
+            onPressed: () => unawaited(_openNotificationIntent(intent)),
+          ),
+        ),
+      );
+  }
+
+  /// Routes only through refreshed, already-authorized provider data. The public
+  /// request id is a focus hint, never a credential or source of service data.
+  Future<void> _openNotificationIntent(
+    ProviderNotificationIntent intent,
+  ) async {
+    final token = _token;
+    if (!mounted || token == null || _provider == null) return;
+    try {
+      switch (intent.navigate) {
+        case ProviderNotificationNavigate.opportunity:
+          await _loadOpportunities();
+          _focusCard(_opportunityCardKeys[intent.requestId]);
+          return;
+        case ProviderNotificationNavigate.job:
+          await _loadDashboard(token);
+          _focusCard(_jobCardKeys[intent.requestId]);
+          return;
+        case ProviderNotificationNavigate.dashboard:
+          await _refresh();
+          return;
+      }
+    } on ProviderUnauthorizedException {
+      await _expireSession();
+    } catch (_) {
+      // A stale/closed/ineligible request simply leaves the provider on the
+      // refreshed dashboard. Push navigation must never create a new route or
+      // surface unverified data.
+    }
+  }
+
+  void _focusCard(GlobalKey? cardKey) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final cardContext = cardKey?.currentContext;
+      if (cardContext != null) {
+        Scrollable.ensureVisible(
+          cardContext,
+          duration: const Duration(milliseconds: 250),
+          curve: Curves.easeOut,
+          alignment: 0.18,
+        );
+      }
+    });
   }
 
   Future<void> _openQuoteSheet(
@@ -626,6 +719,9 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
       await _loadDashboard(login.token);
       await _loadHiddenOpportunities();
       await _loadOpportunities();
+      // Device registration and notification permission are optional. They run
+      // after login has succeeded and never decide its outcome.
+      unawaited(_notifications.onAuthenticated());
     } on ProviderApiConfigurationException {
       if (mounted) {
         setState(() => _error = 'لم يتم ضبط رابط النظام لهذا الإصدار.');
@@ -715,18 +811,17 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
             children: [
               Text(
                 action,
-                style: Theme.of(bottomSheetContext).textTheme.titleLarge?.copyWith(
-                  color: MoeenColors.primaryDark,
-                  fontWeight: FontWeight.w800,
-                ),
+                style: Theme.of(bottomSheetContext).textTheme.titleLarge
+                    ?.copyWith(
+                      color: MoeenColors.primaryDark,
+                      fontWeight: FontWeight.w800,
+                    ),
               ),
               const SizedBox(height: MoeenSpacing.sm),
               Text(
                 explanation,
-                style: Theme.of(bottomSheetContext).textTheme.bodyLarge?.copyWith(
-                  color: MoeenColors.mutedText,
-                  height: 1.45,
-                ),
+                style: Theme.of(bottomSheetContext).textTheme.bodyLarge
+                    ?.copyWith(color: MoeenColors.mutedText, height: 1.45),
               ),
               const SizedBox(height: MoeenSpacing.lg),
               FilledButton(
@@ -773,11 +868,17 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
   Future<void> _logout() async {
     final token = _token;
     if (token != null) {
+      // Starts by invalidating notification ownership and attempts the device
+      // revoke while this provider bearer token is still usable. It is detached
+      // so an offline notification endpoint can never trap the provider in the
+      // logout UI.
+      unawaited(_notifications.onLogout(sessionToken: token));
       try {
         await widget._api.logout(token);
       } catch (_) {}
     }
     await widget._sessionStore.clearToken();
+
     if (mounted) {
       setState(() {
         _token = null;
@@ -792,7 +893,9 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
+      scaffoldMessengerKey: _scaffoldMessengerKey,
       title: 'معين للمحترفين',
+
       theme: MoeenTheme.light(),
       home: Directionality(
         textDirection: TextDirection.rtl,
@@ -1019,13 +1122,19 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
   }
 
   Widget _buildOpportunityCard(ProviderOpportunity opportunity) {
+    final cardKey = _opportunityCardKeys.putIfAbsent(
+      opportunity.requestId,
+      GlobalKey.new,
+    );
     final serviceLabel =
         _serviceNames[opportunity.serviceId] ?? opportunity.serviceId;
     final timingLabel = _timingLabels[opportunity.timing] ?? opportunity.timing;
     final statusLabel = opportunityMessage(opportunity);
     final quote = opportunity.myQuote;
     return Card(
+      key: cardKey,
       margin: const EdgeInsets.only(bottom: 12),
+
       child: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
@@ -1145,8 +1254,11 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
 
   Widget _buildJobCard(ProviderJob job) {
     final nextStatus = nextProviderStatus(job);
+    final cardKey = _jobCardKeys.putIfAbsent(job.id, GlobalKey.new);
     return Card(
+      key: cardKey,
       margin: const EdgeInsets.only(bottom: 12),
+
       child: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
