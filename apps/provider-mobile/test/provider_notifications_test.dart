@@ -22,6 +22,21 @@ class FakeDeviceIdStore implements ProviderDeviceIdStore {
   }
 }
 
+/// In-memory "permission attempt" store. Mirrors the app-level semantics of
+/// the real secure-storage store: the flag is set once a prompt was
+/// attempted and is NOT cleared by logout.
+class FakePermissionRequestedStore implements ProviderPermissionRequestedStore {
+  FakePermissionRequestedStore({this.permissionRequested = false});
+
+  bool permissionRequested;
+
+  @override
+  Future<bool> hasRequested() async => permissionRequested;
+
+  @override
+  Future<void> markRequested() async => permissionRequested = true;
+}
+
 class FakeDeviceApi implements ProviderDeviceApi {
   final registrations = <({String token, String session})>[];
   final revoked = <String>[];
@@ -202,6 +217,7 @@ ProviderNotificationController controller({
   required FakeMessagingClient messaging,
   ProviderDeviceApi? deviceApi,
   FakeDeviceIdStore? deviceStore,
+  ProviderPermissionRequestedStore? permissionRequestedStore,
   Future<String?> Function()? sessionTokenProvider,
   void Function(ProviderNotificationIntent)? onForegroundMessage,
   Future<void> Function(ProviderNotificationIntent)? onOpenedIntent,
@@ -210,6 +226,8 @@ ProviderNotificationController controller({
   messaging: messaging,
   deviceApi: deviceApi ?? FakeDeviceApi(),
   deviceStore: deviceStore ?? FakeDeviceIdStore(),
+  permissionRequestedStore:
+      permissionRequestedStore ?? FakePermissionRequestedStore(),
   sessionTokenProvider: sessionTokenProvider ?? () async => 'provider-session',
   onForegroundMessage: onForegroundMessage,
   onOpenedIntent: onOpenedIntent,
@@ -384,6 +402,7 @@ void main() {
           messaging: messaging,
           deviceApi: api,
           deviceStore: FakeDeviceIdStore(),
+          permissionRequestedStore: FakePermissionRequestedStore(),
           sessionTokenProvider: () async => 'provider-session',
         );
 
@@ -694,15 +713,53 @@ void main() {
       },
     );
 
-    test('denied permission does not prevent registration', () async {
-      final api = FakeDeviceApi();
-      await controller(
-        messaging: FakeMessagingClient()
-          ..currentPermissionValue = ProviderNotificationPermission.denied,
-        deviceApi: api,
-      ).onAuthenticated();
-      expect(api.registrations, hasLength(1));
-    });
+    test(
+      'fresh install (denied + never requested) prompts once and registers',
+      () async {
+        final messaging = FakeMessagingClient()
+          ..currentPermissionValue = ProviderNotificationPermission.denied;
+        final api = FakeDeviceApi();
+        final permissionStore = FakePermissionRequestedStore();
+
+        await controller(
+          messaging: messaging,
+          deviceApi: api,
+          permissionRequestedStore: permissionStore,
+        ).onAuthenticated();
+
+        // Android 13+ reports `denied` before the first request; a fresh
+        // install must show the native prompt exactly once and record it.
+        expect(messaging.requestPermissionCalls, 1);
+        expect(permissionStore.permissionRequested, isTrue);
+        // Denied permission never blocks token registration.
+        expect(api.registrations, hasLength(1));
+      },
+    );
+
+    test(
+      'explicit prior denial (flag set) never re-prompts on login/restore',
+      () async {
+        final messaging = FakeMessagingClient()
+          ..currentPermissionValue = ProviderNotificationPermission.denied;
+        final api = FakeDeviceApi();
+        final permissionStore = FakePermissionRequestedStore(
+          permissionRequested: true,
+        );
+        final sut = controller(
+          messaging: messaging,
+          deviceApi: api,
+          permissionRequestedStore: permissionStore,
+        );
+
+        await sut.onAuthenticated();
+        await sut.onAuthenticated();
+
+        expect(messaging.requestPermissionCalls, 0);
+        // Registration still proceeds (each auth activation registers once,
+        // independently of display permission).
+        expect(api.registrations, isNotEmpty);
+      },
+    );
 
     test('authorized permission proceeds without requesting again', () async {
       final messaging = FakeMessagingClient()
@@ -715,11 +772,76 @@ void main() {
 
     test('not-determined permission is requested only once', () async {
       final messaging = FakeMessagingClient();
-      final sut = controller(messaging: messaging);
+      final permissionStore = FakePermissionRequestedStore();
+      final sut = controller(
+        messaging: messaging,
+        permissionRequestedStore: permissionStore,
+      );
       await sut.onAuthenticated();
       await sut.onAuthenticated();
       expect(messaging.requestPermissionCalls, 1);
+      expect(permissionStore.permissionRequested, isTrue);
     });
+
+    test('denied permission does not break login/core lifecycle', () async {
+      final messaging = FakeMessagingClient()
+        ..currentPermissionValue = ProviderNotificationPermission.denied
+        ..requestedPermission = ProviderNotificationPermission.denied;
+      final api = FakeDeviceApi();
+      final store = FakeDeviceIdStore();
+      final sut = controller(
+        messaging: messaging,
+        deviceApi: api,
+        deviceStore: store,
+      );
+
+      // Logout followed by a fresh login on a NEW controller instance
+      // (simulating an app restart) must not throw or block registration.
+      await sut.onAuthenticated();
+      await sut.onLogout(sessionToken: 'provider-session');
+      final second = controller(
+        messaging: messaging,
+        deviceApi: api,
+        deviceStore: store,
+        permissionRequestedStore: FakePermissionRequestedStore(
+          permissionRequested: true,
+        ),
+      );
+      await second.onAuthenticated();
+
+      expect(api.registrations, isNotEmpty);
+      expect(api.revoked, isNotEmpty);
+    });
+
+    test(
+      'logout/login again does not re-prompt after explicit denial',
+      () async {
+        // The attempt flag is app-level and survives logout and restarts.
+        final messaging = FakeMessagingClient()
+          ..currentPermissionValue = ProviderNotificationPermission.denied;
+        final permissionStore = FakePermissionRequestedStore();
+        final first = controller(
+          messaging: messaging,
+          permissionRequestedStore: permissionStore,
+        );
+        await first.onAuthenticated();
+        expect(messaging.requestPermissionCalls, 1);
+        expect(permissionStore.permissionRequested, isTrue);
+
+        await first.onLogout(sessionToken: 'provider-session');
+
+        // A later login (even in a new process sharing the same store)
+        // never re-prompts after the explicit denial.
+        final second = controller(
+          messaging: messaging,
+          permissionRequestedStore: permissionStore,
+        );
+        await second.onAuthenticated();
+
+        expect(messaging.requestPermissionCalls, 1);
+        expect(permissionStore.permissionRequested, isTrue);
+      },
+    );
 
     test(
       'Firebase initialization failure leaves provider lifecycle usable',

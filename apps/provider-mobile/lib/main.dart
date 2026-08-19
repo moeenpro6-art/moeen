@@ -413,6 +413,39 @@ class SecureProviderSessionStore implements ProviderSessionStore {
   Future<void> clearToken() => _storage.delete(key: _providerTokenStorageKey);
 }
 
+/// Secure-storage-backed "permission prompt attempted" flag for the provider
+/// app. Stores ONLY a boolean under an app-specific key (never the FCM token,
+/// provider ids, request data, or secrets). The key is distinct from the
+/// customer app's key so both apps can share a device without overlapping.
+///
+/// The flag survives logout (Android notification permission is app-level,
+/// not account-level) and is cleared by wiping app data / reinstall, which
+/// makes the first prompt eligible again.
+class SecureProviderPermissionRequestedStore
+    implements ProviderPermissionRequestedStore {
+  SecureProviderPermissionRequestedStore({FlutterSecureStorage? storage})
+    : _storage = storage ?? const FlutterSecureStorage();
+
+  final FlutterSecureStorage _storage;
+  static const _key = 'moeen_provider_notification_permission_requested';
+
+  Future<bool> _readBool() async {
+    try {
+      return await _storage.read(key: _key) == 'true';
+    } catch (_) {
+      // A storage failure must never block login; treat as not attempted so
+      // the first prompt remains eligible on a later launch.
+      return false;
+    }
+  }
+
+  @override
+  Future<bool> hasRequested() => _readBool();
+
+  @override
+  Future<void> markRequested() => _storage.write(key: _key, value: 'true');
+}
+
 /// Stores requestIds the provider chose to hide from their own opportunity
 /// list on this device only. Keyed per provider account so a different
 /// provider on the same device never sees another account's hidden list.
@@ -500,6 +533,7 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
         endpoint: (path) => widget._api._config.endpoint(path),
       ),
       deviceStore: SecureProviderDeviceIdStore(),
+      permissionRequestedStore: SecureProviderPermissionRequestedStore(),
       sessionTokenProvider: () async => _token,
       onForegroundMessage: _showForegroundNotification,
       onOpenedIntent: _openNotificationIntent,

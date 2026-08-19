@@ -360,6 +360,25 @@ abstract interface class ProviderDeviceIdStore {
   Future<void> clear();
 }
 
+/// Local record of whether this app has already attempted to request the
+/// notification permission (Android-first, app-level).
+///
+/// On Android 13+, `firebase_messaging` reports `denied` both when the
+/// permission has never been requested and after an explicit denial, so the
+/// persisted "attempted" flag is the only way to (a) show the native first
+/// prompt on a fresh install and (b) never nag a provider who already denied.
+///
+/// Only a boolean is stored — never the FCM token, provider ids, request
+/// data, or secrets. Logout does not reset it (the permission belongs to the
+/// app, not the account); wiping app data / reinstalling does reset it.
+abstract interface class ProviderPermissionRequestedStore {
+  /// Whether the app has previously attempted the native permission request.
+  Future<bool> hasRequested();
+
+  /// Persists that the native permission request has now been attempted.
+  Future<void> markRequested();
+}
+
 class SecureProviderDeviceIdStore implements ProviderDeviceIdStore {
   SecureProviderDeviceIdStore({FlutterSecureStorage? storage})
     : _storage = storage ?? const FlutterSecureStorage();
@@ -388,6 +407,7 @@ class ProviderNotificationController {
     required this.messaging,
     required this.deviceApi,
     required this.deviceStore,
+    required this.permissionRequestedStore,
     required this.sessionTokenProvider,
     this.onForegroundMessage,
     this.onOpenedIntent,
@@ -397,6 +417,11 @@ class ProviderNotificationController {
   final ProviderMessagingClient messaging;
   final ProviderDeviceApi deviceApi;
   final ProviderDeviceIdStore deviceStore;
+
+  /// Persistent record of whether the native permission prompt has been
+  /// attempted on this Android device. App-level, never account-level, so it
+  /// survives logout and is cleared only by wiping app data / reinstalling.
+  final ProviderPermissionRequestedStore permissionRequestedStore;
 
   /// The current authenticated provider session, or null while logged out.
   final Future<String?> Function() sessionTokenProvider;
@@ -520,13 +545,41 @@ class ProviderNotificationController {
     if (intent != null) await _handleOpenedIntent(intent);
   }
 
+  /// Requests the native permission at most once per app install.
+  ///
+  /// Android first: on Android 13+, the OS reports `denied` BOTH before the
+  /// permission has ever been requested and after the user denied it, so the
+  /// persisted "attempted" flag distinguishes a fresh install (prompt now)
+  /// from an explicit denial (never re-prompt). `notDetermined` (iOS and some
+  /// Android builds) is handled the same way: request once, then record it.
+  ///
+  /// Every outcome — authorized, provisional, or denied — still lets token
+  /// acquisition and device registration proceed; notification permission
+  /// never gates login or operational flows.
   Future<void> _requestPermissionOnce() async {
     if (_permissionRequested) return;
     _permissionRequested = true;
     try {
-      if (await messaging.currentPermission() ==
-          ProviderNotificationPermission.notDetermined) {
-        await messaging.requestPermission();
+      final current = await messaging.currentPermission();
+      if (current == ProviderNotificationPermission.authorized ||
+          current == ProviderNotificationPermission.provisional) {
+        // Already authorized (or provisional on iOS): no prompt needed.
+        return;
+      }
+      if (await permissionRequestedStore.hasRequested()) {
+        // Explicitly denied on a previous attempt: never re-prompt on
+        // login/rebuild/session restore. Registration still proceeds.
+        return;
+      }
+      // Fresh install (or flag cleared): show the native prompt once.
+      await messaging.requestPermission();
+      // Record the attempt even when the user denies, so the prompt is
+      // never shown again for this app install.
+      try {
+        await permissionRequestedStore.markRequested();
+      } catch (_) {
+        // A persistence failure only risks one extra prompt later; it never
+        // affects login or registration.
       }
     } catch (_) {
       // Permission rejection must not affect device registration or app use.

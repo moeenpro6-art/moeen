@@ -17,6 +17,21 @@ class FakeDeviceIdStore implements CustomerDeviceIdStore {
   Future<void> clear() async => deviceId = null;
 }
 
+/// In-memory "permission attempt" store. Mirrors the app-level semantics of
+/// the real secure-storage store: the flag is set once a prompt was
+/// attempted and is NOT cleared by logout.
+class FakePermissionRequestedStore implements CustomerPermissionRequestedStore {
+  FakePermissionRequestedStore({this.permissionRequested = false});
+
+  bool permissionRequested;
+
+  @override
+  Future<bool> hasRequested() async => permissionRequested;
+
+  @override
+  Future<void> markRequested() async => permissionRequested = true;
+}
+
 /// In-memory device API for tests. Records registration/revocation calls.
 class FakeDeviceApi implements CustomerDeviceApi {
   final registered = <String>[];
@@ -191,6 +206,7 @@ CustomerNotificationController _controller({
   required FakeMessagingClient messaging,
   CustomerDeviceApi? deviceApi,
   FakeDeviceIdStore? deviceStore,
+  CustomerPermissionRequestedStore? permissionRequestedStore,
   Future<String?> Function()? sessionTokenProvider,
   void Function(CustomerNotificationIntent)? onForegroundMessage,
   void Function(CustomerNotificationIntent)? onOpenedIntent,
@@ -200,6 +216,8 @@ CustomerNotificationController _controller({
     messaging: messaging,
     deviceApi: deviceApi ?? FakeDeviceApi(),
     deviceStore: deviceStore ?? FakeDeviceIdStore(),
+    permissionRequestedStore:
+        permissionRequestedStore ?? FakePermissionRequestedStore(),
     sessionTokenProvider: sessionTokenProvider ?? () async => 'token-123',
     onForegroundMessage: onForegroundMessage,
     onOpenedIntent: onOpenedIntent,
@@ -374,6 +392,7 @@ void main() {
         messaging: messaging,
         deviceApi: deviceApi,
         deviceStore: FakeDeviceIdStore(),
+        permissionRequestedStore: FakePermissionRequestedStore(),
         sessionTokenProvider: () async => 'token-123',
       );
 
@@ -784,6 +803,7 @@ void main() {
           messaging: messaging,
           deviceApi: deviceApi,
           deviceStore: FakeDeviceIdStore(),
+          permissionRequestedStore: FakePermissionRequestedStore(),
           sessionTokenProvider: () async => loggedIn ? 'token-123' : null,
           onOpenedIntent: (intent) => seen = intent,
         );
@@ -832,21 +852,54 @@ void main() {
   });
 
   group('android / permission', () {
-    test('denied permission does not block registration flow', () async {
-      final messaging = FakeMessagingClient()
-        ..currentPermissionValue = CustomerNotificationPermission.denied;
-      final deviceApi = FakeDeviceApi();
-      final controller = _controller(
-        messaging: messaging,
-        deviceApi: deviceApi,
-      );
+    test(
+      'fresh install (denied + never requested) prompts once and registers',
+      () async {
+        final messaging = FakeMessagingClient()
+          ..currentPermissionValue = CustomerNotificationPermission.denied;
+        final deviceApi = FakeDeviceApi();
+        final permissionStore = FakePermissionRequestedStore();
+        final controller = _controller(
+          messaging: messaging,
+          deviceApi: deviceApi,
+          permissionRequestedStore: permissionStore,
+        );
 
-      await controller.onAuthenticated();
+        await controller.onAuthenticated();
 
-      // No crash; registration still proceeds (token registration is
-      // independent of the notification display permission).
-      expect(deviceApi.registered, ['fcm-token-1234567890']);
-    });
+        // Android 13+ reports `denied` before the first request; a fresh
+        // install must show the native prompt exactly once and record it.
+        expect(messaging.requestPermissionCalls, 1);
+        expect(permissionStore.permissionRequested, isTrue);
+        // Denied permission never blocks token registration.
+        expect(deviceApi.registered, ['fcm-token-1234567890']);
+      },
+    );
+
+    test(
+      'explicit prior denial (flag set) never re-prompts on login/restore',
+      () async {
+        final messaging = FakeMessagingClient()
+          ..currentPermissionValue = CustomerNotificationPermission.denied;
+        final permissionStore = FakePermissionRequestedStore(
+          permissionRequested: true,
+        );
+        final deviceApi = FakeDeviceApi();
+        final controller = _controller(
+          messaging: messaging,
+          deviceApi: deviceApi,
+          permissionRequestedStore: permissionStore,
+        );
+
+        await controller.onAuthenticated();
+        await controller.onAuthenticated();
+
+        expect(messaging.requestPermissionCalls, 0);
+        // Registration still proceeds (each auth activation registers once,
+        // independently of display permission).
+        expect(deviceApi.registered, isNotEmpty);
+      },
+    );
 
     test('authorized permission proceeds to registration', () async {
       final messaging = FakeMessagingClient()
@@ -866,17 +919,80 @@ void main() {
     test('notDetermined permission is requested exactly once', () async {
       final messaging = FakeMessagingClient()
         ..currentPermissionValue = CustomerNotificationPermission.notDetermined;
+      final permissionStore = FakePermissionRequestedStore();
       final deviceApi = FakeDeviceApi();
       final controller = _controller(
         messaging: messaging,
         deviceApi: deviceApi,
+        permissionRequestedStore: permissionStore,
       );
 
       await controller.onAuthenticated();
       await controller.onAuthenticated();
 
       expect(messaging.requestPermissionCalls, 1);
+      expect(permissionStore.permissionRequested, isTrue);
     });
+
+    test('denied permission does not break login/core lifecycle', () async {
+      final messaging = FakeMessagingClient()
+        ..currentPermissionValue = CustomerNotificationPermission.denied
+        ..requestedPermission = CustomerNotificationPermission.denied;
+      final deviceApi = FakeDeviceApi();
+      final sessionStore = FakeDeviceIdStore();
+      final controller = _controller(
+        messaging: messaging,
+        deviceApi: deviceApi,
+        deviceStore: sessionStore,
+      );
+
+      // Logout followed by a fresh login on a NEW controller instance
+      // (simulating an app restart) must not throw or block registration.
+      await controller.onAuthenticated();
+      await controller.onLogout(sessionToken: 'token-123');
+      final second = _controller(
+        messaging: messaging,
+        deviceApi: deviceApi,
+        deviceStore: sessionStore,
+        permissionRequestedStore: FakePermissionRequestedStore(
+          permissionRequested: true,
+        ),
+      );
+      await second.onAuthenticated();
+
+      expect(deviceApi.registered, isNotEmpty);
+      expect(deviceApi.revoked, isNotEmpty);
+    });
+
+    test(
+      'logout/login again does not re-prompt after explicit denial',
+      () async {
+        // The attempt flag is app-level and survives logout and restarts.
+        final messaging = FakeMessagingClient()
+          ..currentPermissionValue = CustomerNotificationPermission.denied;
+        final permissionStore = FakePermissionRequestedStore();
+        final first = _controller(
+          messaging: messaging,
+          permissionRequestedStore: permissionStore,
+        );
+        await first.onAuthenticated();
+        expect(messaging.requestPermissionCalls, 1);
+        expect(permissionStore.permissionRequested, isTrue);
+
+        await first.onLogout(sessionToken: 'token-123');
+
+        // A later login (even in a new process sharing the same store)
+        // never re-prompts after the explicit denial.
+        final second = _controller(
+          messaging: messaging,
+          permissionRequestedStore: permissionStore,
+        );
+        await second.onAuthenticated();
+
+        expect(messaging.requestPermissionCalls, 1);
+        expect(permissionStore.permissionRequested, isTrue);
+      },
+    );
 
     test('messaging initialize failure leaves app usable', () async {
       final messaging = FakeMessagingClient()..initializeResult = false;

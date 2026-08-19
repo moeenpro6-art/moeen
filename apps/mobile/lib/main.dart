@@ -2172,6 +2172,38 @@ class SecureCustomerDeviceIdStore implements CustomerDeviceIdStore {
   Future<void> clear() => _storage.delete(key: _deviceIdKey);
 }
 
+/// Secure-storage-backed "permission prompt attempted" flag for the customer
+/// app. Stores ONLY a boolean under an app-specific key (never the FCM token,
+/// customer ids, request data, or secrets). The key is distinct from the
+/// provider app's key so both apps can share a device without overlapping.
+///
+/// The flag survives logout (Android notification permission is app-level,
+/// not account-level) and is cleared by wiping app data / reinstall, which
+/// makes the first prompt eligible again.
+class SecureCustomerPermissionRequestedStore
+    implements CustomerPermissionRequestedStore {
+  const SecureCustomerPermissionRequestedStore();
+
+  static const _storage = FlutterSecureStorage();
+  static const _key = 'moeen_customer_notification_permission_requested';
+
+  Future<bool> _readBool() async {
+    try {
+      return await _storage.read(key: _key) == 'true';
+    } catch (_) {
+      // A storage failure must never block login; treat as not attempted so
+      // the first prompt remains eligible on a later launch.
+      return false;
+    }
+  }
+
+  @override
+  Future<bool> hasRequested() => _readBool();
+
+  @override
+  Future<void> markRequested() => _storage.write(key: _key, value: 'true');
+}
+
 /// Process-wide notification controller. A no-op whenever FCM is disabled
 /// (the default); UI callbacks are attached by `_MoeenAppState`.
 final customerNotificationController = CustomerNotificationController(
@@ -2179,6 +2211,7 @@ final customerNotificationController = CustomerNotificationController(
   messaging: FirebaseMessagingClient(),
   deviceApi: HttpCustomerDeviceApi(client: http.Client(), config: moeenApi),
   deviceStore: const SecureCustomerDeviceIdStore(),
+  permissionRequestedStore: const SecureCustomerPermissionRequestedStore(),
   sessionTokenProvider: () async =>
       (await customerSessionManager.restore())?.token,
 );
