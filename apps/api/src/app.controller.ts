@@ -40,6 +40,11 @@ import { StaffAuditService } from './staff-audit.service';
 import { CustomerAuthService } from './customer-auth.service';
 import { ProviderAuthService } from './provider-auth.service';
 import { PublicAuthRateLimiter } from './public-auth-rate-limiter.service';
+import { FcmDeviceService } from './fcm-device.service';
+import {
+  validateFcmDeviceRegistration,
+  type FcmDevice,
+} from './fcm-device.contracts';
 import {
   StaffAuthService,
   type StaffPrincipal,
@@ -62,6 +67,7 @@ export class AppController {
     private readonly customerAuthService: CustomerAuthService,
     private readonly providerAuthService: ProviderAuthService = undefined as never,
     private readonly publicAuthRateLimiter: PublicAuthRateLimiter = undefined as never,
+    private readonly fcmDeviceService: FcmDeviceService = undefined as never,
   ) {}
 
   @Get()
@@ -498,6 +504,54 @@ export class AppController {
       body.rating,
       body.comment,
     );
+  }
+
+  @Post('my/devices')
+  @UseGuards(CustomerSessionGuard)
+  registerMyDevice(
+    @Req() request: CustomerAuthenticatedRequest,
+    @Body() body: unknown,
+  ): Promise<FcmDevice> {
+    const input = validateFcmDeviceRegistration(body);
+    return this.fcmDeviceService.registerCustomerDevice(
+      request.customer.id,
+      input,
+    );
+  }
+
+  @Delete('my/devices/:deviceId')
+  @UseGuards(CustomerSessionGuard)
+  revokeMyDevice(
+    @Req() request: CustomerAuthenticatedRequest,
+    @Param('deviceId') deviceId: string,
+  ): Promise<FcmDevice> {
+    return this.fcmDeviceService.revokeCustomerDevice(
+      request.customer.id,
+      deviceId,
+    );
+  }
+
+  @Post('provider/devices')
+  async registerProviderDevice(
+    @Headers('authorization') authorization: string | undefined,
+    @Body() body: unknown,
+  ): Promise<FcmDevice> {
+    const provider = await this.providerAuthService.getCurrentProvider(
+      this.extractBearerToken(authorization),
+    );
+    const input = validateFcmDeviceRegistration(body);
+    return this.fcmDeviceService.registerProviderDevice(provider.id, input);
+  }
+
+  @Delete('provider/devices/:deviceId')
+  async revokeProviderDevice(
+    @Headers('authorization') authorization: string | undefined,
+    @Param('deviceId') deviceId: string,
+  ): Promise<FcmDevice> {
+    const provider = await this.providerAuthService.getCurrentProvider(
+      this.extractBearerToken(authorization),
+    );
+    return this.fcmDeviceService.revokeProviderDevice(provider.id, deviceId);
   }
 
   @Get('provider/opportunities')

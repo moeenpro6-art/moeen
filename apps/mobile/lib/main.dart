@@ -6,6 +6,7 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
 import 'api_config.dart';
 import 'customer_session.dart';
+import 'customer_notifications.dart';
 import 'request_images.dart';
 import 'moeen_ui.dart';
 
@@ -68,23 +69,73 @@ class MoeenApp extends StatefulWidget {
 }
 
 class _MoeenAppState extends State<MoeenApp> {
+  final GlobalKey<NavigatorState> _navigatorKey = GlobalKey<NavigatorState>();
   Widget _home = const CustomerLoginPage();
 
   @override
   void initState() {
     super.initState();
-    _restoreSession();
+    _wireNotifications();
+    _bootstrap();
   }
 
-  Future<void> _restoreSession() async {
+  /// Connects the notification controller to UI callbacks. Push remains
+  /// optional: when FCM is disabled the controller is a no-op, so these
+  /// callbacks are never invoked.
+  void _wireNotifications() {
+    customerNotificationController.onForegroundMessage = (intent) {
+      final context = _navigatorKey.currentContext;
+      if (context == null) return;
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+          SnackBar(
+            content: Text(customerNotificationSummary(intent)),
+            action: SnackBarAction(
+              label: 'عرض',
+              onPressed: () => _openNotificationIntent(intent),
+            ),
+          ),
+        );
+    };
+    customerNotificationController.onOpenedIntent = _openNotificationIntent;
+  }
+
+  Future<void> _bootstrap() async {
+    CustomerSession? session;
     try {
-      final session = await customerSessionManager.restore();
-      if (session != null && mounted) {
-        setState(() => _home = const MoeenHomePage());
-      }
+      session = await customerSessionManager.restore();
     } catch (_) {
       // A storage failure should not block a customer from signing in again.
     }
+    if (!mounted) return;
+    if (session != null) setState(() => _home = const MoeenHomePage());
+
+    // Push is optional and best-effort. initialize()/handleInitialMessage()
+    // are no-ops when FCM is disabled; any failure is swallowed.
+    await customerNotificationController.initialize();
+    await customerNotificationController.handleInitialMessage();
+    if (session != null) {
+      await customerNotificationController.onAuthenticated();
+    }
+  }
+
+  /// Deep-link into the existing customer request list/detail flow. The
+  /// target is opened from the authenticated API list, never from the push
+  /// payload; a stale/missing request simply lands on the list.
+  void _openNotificationIntent(CustomerNotificationIntent intent) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final navigator = _navigatorKey.currentState;
+      if (navigator == null) return;
+      final route = MaterialPageRoute<void>(
+        builder: (_) =>
+            intent.navigate ==
+                CustomerNotificationNavigate.customerRequestDetail
+            ? CustomerRequestsPage(openRequestId: intent.requestId)
+            : const CustomerRequestsPage(),
+      );
+      navigator.push(route);
+    });
   }
 
   @override
@@ -92,6 +143,7 @@ class _MoeenAppState extends State<MoeenApp> {
     return MaterialApp(
       title: 'معين',
       debugShowCheckedModeBanner: false,
+      navigatorKey: _navigatorKey,
       theme: MoeenTheme.light(),
       builder: (context, child) => Directionality(
         textDirection: TextDirection.rtl,
@@ -127,6 +179,14 @@ class MoeenHomePage extends StatelessWidget {
             tooltip: 'تسجيل الخروج',
             icon: const Icon(Icons.logout_rounded),
             onPressed: () async {
+              // Best-effort FCM device revocation BEFORE the session is
+              // cleared. A failure never traps the user in the account.
+              final session = await customerSessionManager.restore();
+              if (session != null) {
+                await customerNotificationController.onLogout(
+                  sessionToken: session.token,
+                );
+              }
               await customerSessionManager.clear();
               if (!context.mounted) return;
               Navigator.of(context).pushAndRemoveUntil(
@@ -489,9 +549,7 @@ class _BookingPageState extends State<BookingPage> {
           address: address,
           details: details.isEmpty ? null : details,
           timing: timing,
-          orderedImageBytes: [
-            for (final image in _selectedImages) image.bytes,
-          ],
+          orderedImageBytes: [for (final image in _selectedImages) image.bytes],
         );
         response = await submitServiceRequestWithImages(
           client: _httpClient,
@@ -1610,7 +1668,12 @@ class CustomerRequestCard extends StatelessWidget {
 }
 
 class CustomerRequestsPage extends StatefulWidget {
-  const CustomerRequestsPage({super.key});
+  const CustomerRequestsPage({super.key, this.openRequestId});
+
+  /// When set, the page auto-opens the matching request detail (if visible)
+  /// once the list loads. Used by notification deep-links; a stale/absent id
+  /// simply leaves the list as the landing screen.
+  final String? openRequestId;
 
   @override
   State<CustomerRequestsPage> createState() => _CustomerRequestsPageState();
@@ -1627,9 +1690,37 @@ class _CustomerRequestsPageState extends State<CustomerRequestsPage> {
       headers: {'Authorization': 'Bearer ${session.token}'},
     );
     if (response.statusCode != 200) throw Exception('Request list failed');
-    return (jsonDecode(response.body) as List<dynamic>)
+    final requests = (jsonDecode(response.body) as List<dynamic>)
         .map((item) => CustomerRequest.fromJson(item as Map<String, dynamic>))
         .toList();
+    _maybeAutoOpen(requests);
+    return requests;
+  }
+
+  bool _autoOpenHandled = false;
+
+  void _maybeAutoOpen(List<CustomerRequest> requests) {
+    final targetId = widget.openRequestId;
+    if (targetId == null || _autoOpenHandled) return;
+    _autoOpenHandled = true;
+    final match = requests
+        .where((request) => request.id == targetId)
+        .firstOrNull;
+    if (match == null) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      Navigator.of(context).push(
+        MaterialPageRoute<void>(
+          builder: (_) => CustomerRequestDetailsPage(
+            request: match,
+            statusLabel: _status(match.status),
+            onReviewQuote: () => _showQuoteDecisionDialog(match),
+            onRate: () => _showRatingDialog(match),
+            onSupport: () => _showSupportDialog(match),
+          ),
+        ),
+      );
+    });
   }
 
   @override
@@ -2061,6 +2152,70 @@ final customerSessionManager = CustomerSessionManager(
   const FlutterSecureSessionStore(),
 );
 
+/// Secure-storage-backed device identity store for the registered FCM device.
+/// Keeps ONLY the backend-issued `deviceId` under its own key (never the raw
+/// FCM token), and clearing it never touches the auth session.
+class SecureCustomerDeviceIdStore implements CustomerDeviceIdStore {
+  const SecureCustomerDeviceIdStore();
+
+  static const _storage = FlutterSecureStorage();
+  static const _deviceIdKey = 'moeen_fcm_device_id';
+
+  @override
+  Future<String?> read() => _storage.read(key: _deviceIdKey);
+
+  @override
+  Future<void> write(String deviceId) =>
+      _storage.write(key: _deviceIdKey, value: deviceId);
+
+  @override
+  Future<void> clear() => _storage.delete(key: _deviceIdKey);
+}
+
+/// Secure-storage-backed "permission prompt attempted" flag for the customer
+/// app. Stores ONLY a boolean under an app-specific key (never the FCM token,
+/// customer ids, request data, or secrets). The key is distinct from the
+/// provider app's key so both apps can share a device without overlapping.
+///
+/// The flag survives logout (Android notification permission is app-level,
+/// not account-level) and is cleared by wiping app data / reinstall, which
+/// makes the first prompt eligible again.
+class SecureCustomerPermissionRequestedStore
+    implements CustomerPermissionRequestedStore {
+  const SecureCustomerPermissionRequestedStore();
+
+  static const _storage = FlutterSecureStorage();
+  static const _key = 'moeen_customer_notification_permission_requested';
+
+  Future<bool> _readBool() async {
+    try {
+      return await _storage.read(key: _key) == 'true';
+    } catch (_) {
+      // A storage failure must never block login; treat as not attempted so
+      // the first prompt remains eligible on a later launch.
+      return false;
+    }
+  }
+
+  @override
+  Future<bool> hasRequested() => _readBool();
+
+  @override
+  Future<void> markRequested() => _storage.write(key: _key, value: 'true');
+}
+
+/// Process-wide notification controller. A no-op whenever FCM is disabled
+/// (the default); UI callbacks are attached by `_MoeenAppState`.
+final customerNotificationController = CustomerNotificationController(
+  enabled: CustomerFcmConfig.enabled,
+  messaging: FirebaseMessagingClient(),
+  deviceApi: HttpCustomerDeviceApi(client: http.Client(), config: moeenApi),
+  deviceStore: const SecureCustomerDeviceIdStore(),
+  permissionRequestedStore: const SecureCustomerPermissionRequestedStore(),
+  sessionTokenProvider: () async =>
+      (await customerSessionManager.restore())?.token,
+);
+
 class CustomerLoginPage extends StatefulWidget {
   const CustomerLoginPage({super.key});
 
@@ -2214,6 +2369,9 @@ class _OtpPageState extends State<OtpPage> {
         token: body['token'] as String,
         customerId: (body['customer'] as Map<String, dynamic>)['id'] as String,
       );
+      // Best-effort push enablement AFTER authentication; a permission denial
+      // or registration failure never blocks the login.
+      await customerNotificationController.onAuthenticated();
       if (!mounted) return;
       Navigator.of(context).pushAndRemoveUntil(
         MaterialPageRoute<void>(builder: (_) => const MoeenHomePage()),

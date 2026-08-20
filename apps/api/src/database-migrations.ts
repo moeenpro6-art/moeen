@@ -575,6 +575,197 @@ const V2_SCHEMA_CONTRACT: SchemaContract = {
   },
 };
 
+const V3_SCHEMA_CONTRACT: SchemaContract = {
+  columnTypes: {
+    ...V2_SCHEMA_CONTRACT.columnTypes,
+    fcm_devices: {
+      id: 'uuid!',
+      customer_id: 'bigint',
+      provider_id: 'text',
+      token_secret: 'text!',
+      token_hash: 'character(64)!',
+      platform: 'text!',
+      created_at: 'timestamp with time zone!',
+      last_seen_at: 'timestamp with time zone!',
+      revoked_at: 'timestamp with time zone',
+    },
+    notification_outbox: {
+      id: 'bigint!',
+      dedupe_key: 'text!',
+      recipient_owner_kind: 'text!',
+      recipient_customer_id: 'bigint',
+      recipient_provider_id: 'text',
+      notification_type: 'text!',
+      service_request_id: 'bigint',
+      payload: 'jsonb!',
+      status: 'text!',
+      attempts: 'smallint!',
+      available_at: 'timestamp with time zone!',
+      next_attempt_at: 'timestamp with time zone',
+      lease_claimed_at: 'timestamp with time zone',
+      lease_claimed_by: 'text',
+      last_error_kind: 'text',
+      created_at: 'timestamp with time zone!',
+      delivered_at: 'timestamp with time zone',
+    },
+  },
+  columnDefaults: {
+    ...V2_SCHEMA_CONTRACT.columnDefaults,
+    'fcm_devices.created_at': 'now()',
+    'fcm_devices.last_seen_at': 'now()',
+    'notification_outbox.id': "nextval('notification_outbox_id_seq'::regclass)",
+    'notification_outbox.status': "'pending'::text",
+    'notification_outbox.attempts': '0',
+    'notification_outbox.available_at': 'now()',
+    'notification_outbox.created_at': 'now()',
+  },
+  serialColumns: {
+    ...V2_SCHEMA_CONTRACT.serialColumns,
+    'notification_outbox.id': BIGSERIAL_SEQUENCE_CONTRACT,
+  },
+  indexTokens: {
+    ...V2_SCHEMA_CONTRACT.indexTokens,
+    fcm_devices_customer_active_idx: [
+      'fcm_devices',
+      '(customer_id)',
+      'revoked_at IS NULL',
+    ],
+    fcm_devices_provider_active_idx: [
+      'fcm_devices',
+      '(provider_id)',
+      'revoked_at IS NULL',
+    ],
+    fcm_devices_active_token_hash_unique: [
+      'CREATE UNIQUE INDEX',
+      'fcm_devices',
+      '(token_hash)',
+      'revoked_at IS NULL',
+    ],
+    notification_outbox_pending_available_idx: [
+      'notification_outbox',
+      '(available_at, id)',
+      "status = 'pending'",
+    ],
+    notification_outbox_sending_claimed_idx: [
+      'notification_outbox',
+      '(lease_claimed_at)',
+      "status = 'sending'",
+    ],
+  },
+  keyConstraints: [
+    ...V2_SCHEMA_CONTRACT.keyConstraints,
+    'fcm_devices:p:id',
+    'notification_outbox:p:id',
+    'notification_outbox:u:dedupe_key',
+  ],
+  foreignKeys: [
+    ...V2_SCHEMA_CONTRACT.foreignKeys,
+    currentSchemaForeignKey('fcm_devices', ['customer_id'], 'customers', [
+      'id',
+    ]),
+    currentSchemaForeignKey('fcm_devices', ['provider_id'], 'providers', [
+      'id',
+    ]),
+    currentSchemaForeignKey(
+      'notification_outbox',
+      ['recipient_customer_id'],
+      'customers',
+      ['id'],
+    ),
+    currentSchemaForeignKey(
+      'notification_outbox',
+      ['recipient_provider_id'],
+      'providers',
+      ['id'],
+    ),
+    currentSchemaForeignKey(
+      'notification_outbox',
+      ['service_request_id'],
+      'service_requests',
+      ['id'],
+    ),
+  ],
+  constraintTokens: {
+    ...V2_SCHEMA_CONTRACT.constraintTokens,
+    fcm_devices_single_owner_check: ['customer_id', 'provider_id', 'IS NULL'],
+    fcm_devices_token_hash_check: ['token_hash', '^[0-9a-f]{64}$'],
+    fcm_devices_platform_check: ['platform', 'android', 'ios'],
+    notification_outbox_recipient_owner_kind_check: [
+      'recipient_owner_kind',
+      'customer',
+      'provider',
+    ],
+    notification_outbox_notification_type_check: [
+      'notification_type',
+      'request_created',
+      'provider_assigned',
+      'provider_on_the_way',
+      'request_completed',
+      'opportunity_invited',
+      'quote_approved',
+    ],
+    notification_outbox_payload_check: ['payload', 'jsonb_typeof'],
+    notification_outbox_status_check: [
+      'status',
+      'pending',
+      'sending',
+      'delivered',
+      'dead',
+    ],
+    notification_outbox_attempts_check: ['attempts', '>= 0'],
+    notification_outbox_last_error_kind_check: [
+      'last_error_kind',
+      'no_active_device',
+      'invalid_token',
+      'unregistered_token',
+      'network_error',
+      'throttled',
+      'unknown',
+    ],
+    notification_outbox_single_recipient_check: [
+      'recipient_customer_id',
+      'recipient_provider_id',
+      'IS NULL',
+    ],
+  },
+};
+
+/**
+ * Migration 0004 is an additive CHECK-constraint widening required by the
+ * approved FCM-2 Pilot event matrix. The table/column/index shape is unchanged;
+ * only the accepted notification types and safe error classifications grow.
+ */
+const V4_SCHEMA_CONTRACT: SchemaContract = {
+  ...V3_SCHEMA_CONTRACT,
+  constraintTokens: {
+    ...V3_SCHEMA_CONTRACT.constraintTokens,
+    notification_outbox_notification_type_check: [
+      'notification_type',
+      'request_created',
+      'quote_received',
+      'assignment_confirmed',
+      'provider_on_the_way',
+      'service_in_progress',
+      'request_completed',
+      'request_cancelled',
+      'opportunity_invited',
+      'provider_assigned',
+      'opportunity_closed',
+      'quote_approved',
+    ],
+    notification_outbox_last_error_kind_check: [
+      'last_error_kind',
+      'no_active_device',
+      'invalid_token',
+      'unregistered_token',
+      'network_error',
+      'throttled',
+      'config_error',
+      'unknown',
+    ],
+  },
+};
+
 export type DatabaseMigration = {
   version: string;
   name: string;
@@ -1148,6 +1339,15 @@ function contractForMigration(
     migration.name === 'service_request_images'
   ) {
     return V2_SCHEMA_CONTRACT;
+  }
+  if (migration?.version === '0003' && migration.name === 'fcm_notifications') {
+    return V3_SCHEMA_CONTRACT;
+  }
+  if (
+    migration?.version === '0004' &&
+    migration.name === 'fcm_notification_types'
+  ) {
+    return V4_SCHEMA_CONTRACT;
   }
   return undefined;
 }

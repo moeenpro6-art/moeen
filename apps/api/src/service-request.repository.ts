@@ -1,5 +1,11 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import {
+  Inject,
+  Injectable,
+  OnModuleDestroy,
+  OnModuleInit,
+  Optional,
+} from '@nestjs/common';
 import { Pool, type PoolClient } from 'pg';
 import { resolveDatabaseConnectionString } from './database.config';
 import {
@@ -44,6 +50,13 @@ import {
   type ServiceRequestSubmissionContext,
 } from './request-image-create.contracts';
 import type { StoredRequestImage } from './request-image.types';
+import { fcmConfigFromEnvironment } from './fcm.config';
+import { NotificationOutboxWriter } from './notification-outbox.writer';
+import {
+  customerStatusNotificationType,
+  toRequestPublicId,
+  type FcmNotificationType,
+} from './notification-templates';
 
 type ServiceRequestImageRow = {
   id: string;
@@ -196,6 +209,81 @@ export class ServiceRequestRepository
   private readonly pool = new Pool({
     connectionString: resolveDatabaseConnectionString(),
   });
+
+  private readonly notificationOutbox: NotificationOutboxWriter;
+
+  constructor(
+    @Optional()
+    @Inject(NotificationOutboxWriter)
+    notificationOutbox?: NotificationOutboxWriter,
+  ) {
+    // AppModule injects the shared, fully configured writer. Direct repository
+    // construction in focused tests remains supported and follows the same
+    // environment contract instead of silently forcing notifications off.
+    this.notificationOutbox =
+      notificationOutbox ??
+      new NotificationOutboxWriter(fcmConfigFromEnvironment(process.env));
+  }
+
+  /**
+   * Enqueues a customer-recipient notification inside the caller's domain
+   * transaction. The recipient identity is always the server-side customer
+   * database id captured at the mutation site -- never a client-supplied
+   * value. A null customer id (legacy service-request rows with nullable
+   * ownership, FCM-2 HIGH #2) is preserved and passed through so the writer
+   * deterministically SKIPS the notification instead of the repository
+   * coercing it into a fabricated customer 0 that would fail the FK and
+   * roll back an otherwise-valid domain mutation.
+   */
+  private enqueueCustomerNotification(
+    client: PoolClient,
+    args: {
+      notificationType: FcmNotificationType;
+      serviceRequestDatabaseId: number;
+      customerDatabaseId: number | null;
+      dedupeKey: string;
+      reliability?: 'required' | 'best-effort';
+    },
+  ): Promise<void> {
+    return this.notificationOutbox.writeOnClient(client, {
+      notificationType: args.notificationType,
+      serviceRequestDatabaseId: args.serviceRequestDatabaseId,
+      recipient:
+        args.customerDatabaseId === null
+          ? undefined
+          : {
+              ownerKind: 'customer',
+              customerDatabaseId: args.customerDatabaseId,
+            },
+      dedupeKey: args.dedupeKey,
+      requestPublicId: toRequestPublicId(args.serviceRequestDatabaseId),
+      reliability: args.reliability,
+    });
+  }
+
+  /**
+   * Enqueues a provider-recipient notification inside the caller's domain
+   * transaction. The provider id comes from the server-side domain state at
+   * the mutation site (opportunity/quote/assignment rows), never from a
+   * client body.
+   */
+  private enqueueProviderNotification(
+    client: PoolClient,
+    args: {
+      notificationType: FcmNotificationType;
+      serviceRequestDatabaseId: number;
+      providerId: string;
+      dedupeKey: string;
+    },
+  ): Promise<void> {
+    return this.notificationOutbox.writeOnClient(client, {
+      notificationType: args.notificationType,
+      serviceRequestDatabaseId: args.serviceRequestDatabaseId,
+      recipient: { ownerKind: 'provider', providerId: args.providerId },
+      dedupeKey: args.dedupeKey,
+      requestPublicId: toRequestPublicId(args.serviceRequestDatabaseId),
+    });
+  }
 
   /**
    * Fail-safe cleanup for a transaction-scoped pool client.
@@ -840,8 +928,17 @@ export class ServiceRequestRepository
         row.service_id,
         row.status,
       );
+      // C1 request_created -> customer, best-effort (architecture report).
+      await this.enqueueCustomerNotification(client, {
+        notificationType: 'request_created',
+        serviceRequestDatabaseId: Number.parseInt(row.id, 10),
+        customerDatabaseId: databaseCustomerId,
+        dedupeKey: `request_created:${row.id}`,
+        reliability: 'best-effort',
+      });
       await client.query('COMMIT');
       client.release();
+      this.notificationOutbox.notifyEnqueued();
       return this.toServiceRequest(row);
     } catch (error) {
       await this.rollbackAndRelease(client);
@@ -1065,6 +1162,15 @@ export class ServiceRequestRepository
         Array(inserted.rows.length).fill(requestStatus),
       ],
     );
+    // P1 opportunity_invited -> provider (per inserted opportunity), required.
+    for (const opportunity of inserted.rows) {
+      await this.enqueueProviderNotification(client, {
+        notificationType: 'opportunity_invited',
+        serviceRequestDatabaseId,
+        providerId: opportunity.provider_id,
+        dedupeKey: `opportunity_invited:${serviceRequestDatabaseId}:${opportunity.provider_id}`,
+      });
+    }
   }
 
   async findAll(): Promise<ServiceRequest[]> {
@@ -1635,8 +1741,9 @@ export class ServiceRequestRepository
       const request = await client.query<{
         status: ServiceRequest['status'];
         assigned_provider_id: string | null;
+        customer_id: string;
       }>(
-        `SELECT status, assigned_provider_id
+        `SELECT status, assigned_provider_id, customer_id::text
          FROM service_requests WHERE id = $1 FOR UPDATE`,
         [databaseId],
       );
@@ -1644,6 +1751,9 @@ export class ServiceRequestRepository
       if (!currentStatus) {
         throw new Error('Request not found');
       }
+      const requestCustomerId = this.customerDatabaseIdOrNull(
+        request.rows[0]?.customer_id,
+      );
       if (currentStatus !== 'pending_dispatch') {
         throw new Error(
           'Request is not pending dispatch; manual assignment is not allowed',
@@ -1668,12 +1778,15 @@ export class ServiceRequestRepository
       // selected provider is the single authoritative provider: every active
       // provider quote is rejected and every open opportunity is closed,
       // mirroring the closing behavior of a quote approval.
-      const closedQuotes = await client.query<{ id: string }>(
+      const closedQuotes = await client.query<{
+        id: string;
+        provider_id: string | null;
+      }>(
         `UPDATE service_quotes
          SET status = 'rejected', decided_at = NOW()
          WHERE service_request_id = $1 AND provider_id IS NOT NULL
            AND status = 'proposed'
-         RETURNING id`,
+         RETURNING id, provider_id`,
         [databaseId],
       );
       for (let index = 0; index < closedQuotes.rows.length; index += 1) {
@@ -1683,11 +1796,14 @@ export class ServiceRequestRepository
           [databaseId],
         );
       }
-      const closedOpportunities = await client.query<{ id: string }>(
+      const closedOpportunities = await client.query<{
+        id: string;
+        provider_id: string;
+      }>(
         `UPDATE request_provider_opportunities
          SET status = 'closed'
          WHERE service_request_id = $1 AND status IN ('invited', 'quoted')
-         RETURNING id`,
+         RETURNING id, provider_id`,
         [databaseId],
       );
       for (let index = 0; index < closedOpportunities.rows.length; index += 1) {
@@ -1702,6 +1818,30 @@ export class ServiceRequestRepository
          VALUES ($1, 'provider_assigned', 'assigned')`,
         [databaseId],
       );
+      // P2 provider_assigned -> winner, C3 assignment_confirmed -> customer,
+      // P3 opportunity_closed -> each closed-opportunity provider excluding
+      // the winner (all required, architecture report section 3).
+      await this.enqueueProviderNotification(client, {
+        notificationType: 'provider_assigned',
+        serviceRequestDatabaseId: databaseId,
+        providerId,
+        dedupeKey: `provider_assigned:${databaseId}:${providerId}`,
+      });
+      await this.enqueueCustomerNotification(client, {
+        notificationType: 'assignment_confirmed',
+        serviceRequestDatabaseId: databaseId,
+        customerDatabaseId: requestCustomerId,
+        dedupeKey: `assignment_confirmed:${databaseId}`,
+      });
+      for (const opportunity of closedOpportunities.rows) {
+        if (opportunity.provider_id === providerId) continue;
+        await this.enqueueProviderNotification(client, {
+          notificationType: 'opportunity_closed',
+          serviceRequestDatabaseId: databaseId,
+          providerId: opportunity.provider_id,
+          dedupeKey: `opportunity_closed:${databaseId}:${opportunity.provider_id}`,
+        });
+      }
       if (audit) {
         await this.insertStaffAuditEvent(
           client,
@@ -1718,6 +1858,7 @@ export class ServiceRequestRepository
       }
       await client.query('COMMIT');
       client.release();
+      this.notificationOutbox.notifyEnqueued();
       return this.toServiceRequest(row);
     } catch (error) {
       await this.rollbackAndRelease(client);
@@ -1774,11 +1915,17 @@ export class ServiceRequestRepository
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
-      const current = await client.query<{ status: ServiceRequest['status'] }>(
-        'SELECT status FROM service_requests WHERE id = $1 FOR UPDATE',
+      const current = await client.query<{
+        status: ServiceRequest['status'];
+        customer_id: string | null;
+      }>(
+        'SELECT status, customer_id::text FROM service_requests WHERE id = $1 FOR UPDATE',
         [databaseId],
       );
       const currentStatus = current.rows[0]?.status;
+      const customerDatabaseId = this.customerDatabaseIdOrNull(
+        current.rows[0]?.customer_id,
+      );
       if (!currentStatus || !previousStatuses.includes(currentStatus)) {
         throw new Error('Invalid status transition');
       }
@@ -1794,6 +1941,17 @@ export class ServiceRequestRepository
          VALUES ($1, 'status_updated', $2)`,
         [databaseId, status],
       );
+      // C4-C7 status notifications -> customer (required). Cancellation is
+      // only reachable through the staff updateStatus path.
+      const notificationType = customerStatusNotificationType(status);
+      if (notificationType) {
+        await this.enqueueCustomerNotification(client, {
+          notificationType,
+          serviceRequestDatabaseId: databaseId,
+          customerDatabaseId,
+          dedupeKey: `status_updated:${databaseId}:${status}`,
+        });
+      }
       if (audit) {
         await this.insertStaffAuditEvent(
           client,
@@ -1804,6 +1962,7 @@ export class ServiceRequestRepository
       }
       await client.query('COMMIT');
       client.release();
+      if (notificationType) this.notificationOutbox.notifyEnqueued();
     } catch (error) {
       await this.rollbackAndRelease(client);
       throw error;
@@ -1837,14 +1996,20 @@ export class ServiceRequestRepository
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
-      const current = await client.query<{ status: ServiceRequest['status'] }>(
-        `SELECT status
+      const current = await client.query<{
+        status: ServiceRequest['status'];
+        customer_id: string | null;
+      }>(
+        `SELECT status, customer_id::text
          FROM service_requests
          WHERE id = $1 AND assigned_provider_id = $2
          FOR UPDATE`,
         [databaseId, providerId],
       );
       const currentStatus = current.rows[0]?.status;
+      const customerDatabaseId = this.customerDatabaseIdOrNull(
+        current.rows[0]?.customer_id,
+      );
       if (!currentStatus) {
         throw new Error('Assigned provider request not found');
       }
@@ -1863,8 +2028,19 @@ export class ServiceRequestRepository
          VALUES ($1, 'status_updated', $2)`,
         [databaseId, status],
       );
+      // C4-C6 provider-driven status notifications -> customer (required).
+      const notificationType = customerStatusNotificationType(status);
+      if (notificationType) {
+        await this.enqueueCustomerNotification(client, {
+          notificationType,
+          serviceRequestDatabaseId: databaseId,
+          customerDatabaseId,
+          dedupeKey: `status_updated:${databaseId}:${status}`,
+        });
+      }
       await client.query('COMMIT');
       client.release();
+      if (notificationType) this.notificationOutbox.notifyEnqueued();
     } catch (error) {
       await this.rollbackAndRelease(client);
       throw error;
@@ -1887,11 +2063,17 @@ export class ServiceRequestRepository
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
-      const request = await client.query<{ status: ServiceRequest['status'] }>(
-        'SELECT status FROM service_requests WHERE id = $1 FOR UPDATE',
+      const request = await client.query<{
+        status: ServiceRequest['status'];
+        customer_id: string | null;
+      }>(
+        'SELECT status, customer_id::text FROM service_requests WHERE id = $1 FOR UPDATE',
         [databaseId],
       );
       const status = request.rows[0]?.status;
+      const customerDatabaseId = this.customerDatabaseIdOrNull(
+        request.rows[0]?.customer_id,
+      );
       if (!status || !['assigned', 'on_the_way'].includes(status)) {
         throw new Error('Quote can only be proposed before service starts');
       }
@@ -1927,6 +2109,13 @@ export class ServiceRequestRepository
          VALUES ($1, 'quote_proposed', $2)`,
         [databaseId, status],
       );
+      // C2 quote_received -> customer (required; staff quote).
+      await this.enqueueCustomerNotification(client, {
+        notificationType: 'quote_received',
+        serviceRequestDatabaseId: databaseId,
+        customerDatabaseId,
+        dedupeKey: `quote_received:${databaseId}:${quote.id}`,
+      });
       if (audit) {
         await this.insertStaffAuditEvent(client, audit, undefined, {
           quoteStatus: quote.status,
@@ -1935,6 +2124,7 @@ export class ServiceRequestRepository
       }
       await client.query('COMMIT');
       client.release();
+      this.notificationOutbox.notifyEnqueued();
       return this.toServiceQuote(quote);
     } catch (error) {
       await this.rollbackAndRelease(client);
@@ -1953,6 +2143,7 @@ export class ServiceRequestRepository
     try {
       await client.query('BEGIN');
       const quoteDatabaseId = this.toQuoteDatabaseId(quoteId);
+      const customerDatabaseId = this.toCustomerDatabaseId(customerId);
       // Lock the request row FIRST so a quote decision serializes on the same
       // request row as manual assignment (assignProvider) and every other
       // request-scoped transition, with a consistent request -> quote lock
@@ -2059,8 +2250,11 @@ export class ServiceRequestRepository
               [databaseId],
             );
           }
-          const openOpportunities = await client.query<{ id: string }>(
-            `SELECT id FROM request_provider_opportunities
+          const openOpportunities = await client.query<{
+            id: string;
+            provider_id: string;
+          }>(
+            `SELECT id, provider_id FROM request_provider_opportunities
              WHERE service_request_id = $1 AND status IN ('invited', 'quoted')`,
             [databaseId],
           );
@@ -2096,6 +2290,31 @@ export class ServiceRequestRepository
              VALUES ($1, 'provider_assigned', 'assigned')`,
             [databaseId],
           );
+          // C3 assignment_confirmed -> customer, P2 provider_assigned ->
+          // winner, P3 opportunity_closed -> each closed-opportunity provider
+          // excluding the winner. Approval is what atomically closes
+          // competitors.
+          await this.enqueueCustomerNotification(client, {
+            notificationType: 'assignment_confirmed',
+            serviceRequestDatabaseId: databaseId,
+            customerDatabaseId,
+            dedupeKey: `assignment_confirmed:${databaseId}`,
+          });
+          await this.enqueueProviderNotification(client, {
+            notificationType: 'provider_assigned',
+            serviceRequestDatabaseId: databaseId,
+            providerId: updatedQuote.provider_id,
+            dedupeKey: `provider_assigned:${databaseId}:${updatedQuote.provider_id}`,
+          });
+          for (const opportunity of openOpportunities.rows) {
+            if (opportunity.provider_id === updatedQuote.provider_id) continue;
+            await this.enqueueProviderNotification(client, {
+              notificationType: 'opportunity_closed',
+              serviceRequestDatabaseId: databaseId,
+              providerId: opportunity.provider_id,
+              dedupeKey: `opportunity_closed:${databaseId}:${opportunity.provider_id}`,
+            });
+          }
         }
       }
       await client.query(
@@ -2109,6 +2328,9 @@ export class ServiceRequestRepository
       );
       await client.query('COMMIT');
       client.release();
+      if (decision === 'approved' && updatedQuote.provider_id) {
+        this.notificationOutbox.notifyEnqueued();
+      }
       return this.toServiceQuote(updatedQuote);
     } catch (error) {
       await this.rollbackAndRelease(client);
@@ -2191,6 +2413,13 @@ export class ServiceRequestRepository
             opportunityStatus: 'invited',
           });
           insertedProviderIds.push(providerId);
+          // P1 opportunity_invited -> provider (required).
+          await this.enqueueProviderNotification(client, {
+            notificationType: 'opportunity_invited',
+            serviceRequestDatabaseId: databaseId,
+            providerId,
+            dedupeKey: `opportunity_invited:${databaseId}:${providerId}`,
+          });
         }
       }
       if (audit && insertedProviderIds.length > 0) {
@@ -2206,6 +2435,9 @@ export class ServiceRequestRepository
       }
       await client.query('COMMIT');
       client.release();
+      if (insertedProviderIds.length > 0) {
+        this.notificationOutbox.notifyEnqueued();
+      }
       return created;
     } catch (error) {
       await this.rollbackAndRelease(client);
@@ -2286,11 +2518,17 @@ export class ServiceRequestRepository
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
-      const request = await client.query<{ status: ServiceRequest['status'] }>(
-        'SELECT status FROM service_requests WHERE id = $1 FOR UPDATE',
+      const request = await client.query<{
+        status: ServiceRequest['status'];
+        customer_id: string | null;
+      }>(
+        'SELECT status, customer_id::text FROM service_requests WHERE id = $1 FOR UPDATE',
         [databaseId],
       );
       const currentStatus = request.rows[0]?.status;
+      const customerDatabaseId = this.customerDatabaseIdOrNull(
+        request.rows[0]?.customer_id,
+      );
       if (!currentStatus) throw new Error('Service request not found');
       if (currentStatus !== 'pending_dispatch') {
         throw new Error(
@@ -2361,8 +2599,16 @@ export class ServiceRequestRepository
          VALUES ($1, 'provider_quote_submitted', 'pending_dispatch')`,
         [databaseId],
       );
+      // C2 quote_received -> customer (required; provider quote).
+      await this.enqueueCustomerNotification(client, {
+        notificationType: 'quote_received',
+        serviceRequestDatabaseId: databaseId,
+        customerDatabaseId,
+        dedupeKey: `quote_received:${databaseId}:${insertedQuote.id}`,
+      });
       await client.query('COMMIT');
       client.release();
+      this.notificationOutbox.notifyEnqueued();
       return this.toServiceQuote(insertedQuote);
     } catch (error) {
       await this.rollbackAndRelease(client);
@@ -2879,6 +3125,20 @@ export class ServiceRequestRepository
     const match = /^CUS-(\d+)$/.exec(customerId);
     if (!match) throw new Error('Invalid customer id');
     return Number(match[1]) - 1000;
+  }
+
+  /**
+   * Null-safe conversion of a `customer_id::text` column read. Legacy
+   * service-request rows may carry a NULL customer ownership; those sites
+   * must pass `null` through to the outbox writer (which skips the
+   * notification) rather than coercing NULL to `Number(null) === 0`, a
+   * fabricated customer id that would fail the FK and roll back an
+   * otherwise-valid domain mutation (FCM-2 HIGH #2).
+   */
+  private customerDatabaseIdOrNull(
+    value: string | null | undefined,
+  ): number | null {
+    return value === null || value === undefined ? null : Number(value);
   }
 
   private toRequestDatabaseId(requestId: string): number {

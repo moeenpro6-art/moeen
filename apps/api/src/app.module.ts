@@ -16,6 +16,20 @@ import { LoginAttemptLimiter } from './login-attempt-limiter.service';
 import { PublicAuthRateLimiter } from './public-auth-rate-limiter.service';
 import { ProviderAuthService } from './provider-auth.service';
 import { RequestImageService } from './request-image.service';
+import { FcmDeviceRepository } from './fcm-device.repository';
+import { FcmDeviceService } from './fcm-device.service';
+import {
+  FCM_CONFIG,
+  fcmConfigFromEnvironment,
+  type FcmConfig,
+} from './fcm.config';
+import { DisabledFcmSender, FCM_SENDER, FirebaseFcmSender } from './fcm.sender';
+import {
+  FCM_DISPATCH_WAKE,
+  NotificationOutboxWriter,
+} from './notification-outbox.writer';
+import { FcmDispatchWorker } from './fcm-dispatch.worker';
+import { EventEmitter } from 'node:events';
 import {
   DisabledRequestImageStorage,
   REQUEST_IMAGE_STORAGE,
@@ -50,7 +64,34 @@ import type { RequestImageConfig } from './request-image.config';
       provide: OTP_PROVIDER,
       useFactory: () => otpProviderFromEnvironment(process.env),
     },
+    {
+      provide: FCM_CONFIG,
+      useFactory: () => fcmConfigFromEnvironment(process.env),
+    },
+    {
+      provide: FCM_SENDER,
+      useFactory: async (config: FcmConfig) => {
+        if (!config.enabled) return new DisabledFcmSender();
+        const sender = new FirebaseFcmSender(config);
+        // FCM-2 HIGH #3: prove the configured credential material is usable
+        // BEFORE the app starts serving. A malformed key / unconstructable
+        // credential / inconsistent project id throws here and aborts Nest
+        // bootstrap, so enabled-but-unusable credentials can never serve
+        // normal traffic. No network I/O, no push sent.
+        await sender.validateCredentialsUsable();
+        return sender;
+      },
+      inject: [FCM_CONFIG],
+    },
+    {
+      provide: FCM_DISPATCH_WAKE,
+      useValue: new EventEmitter(),
+    },
+    NotificationOutboxWriter,
+    FcmDispatchWorker,
     ServiceRequestRepository,
+    FcmDeviceRepository,
+    FcmDeviceService,
     StaffAuthRepository,
     LoginAttemptLimiter,
     PublicAuthRateLimiter,
