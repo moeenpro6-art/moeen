@@ -12,11 +12,7 @@ import type {
   RequestImageDto,
   RequestImageUploadFile,
 } from './request-image.types';
-import type {
-  ServiceRequest,
-  ServiceRequestStore,
-} from './app.service';
-import type { RequestImageService } from './request-image.service';
+import type { ServiceRequest, ServiceRequestStore } from './app.service';
 
 function sha256Hex(value: string): string {
   return createHash('sha256').update(value).digest('hex');
@@ -86,8 +82,11 @@ describe('RequestImageCreateOrchestrator', () => {
   it('creates a request through the multipart contract and returns signed image DTOs', async () => {
     const first = canonicalImage(0, 'first');
     const second = canonicalImage(1, 'second');
+    const create = jest
+      .fn<ServiceRequestStore['create']>()
+      .mockResolvedValue(persistedRequest);
     const store = {
-      create: jest.fn().mockResolvedValue(persistedRequest),
+      create,
       findCustomerBySession: jest.fn().mockResolvedValue({ id: 'CUS-1001' }),
     };
     const orchestrator = new RequestImageCreateOrchestrator(
@@ -116,7 +115,9 @@ describe('RequestImageCreateOrchestrator', () => {
 
     expect(created).toEqual({ ...persistedRequest, images: [dto] });
     expect(store.create).toHaveBeenCalledTimes(1);
-    const createArguments = store.create.mock.calls[0];
+    const createArguments = create.mock.calls[0] as unknown as Parameters<
+      ServiceRequestStore['create']
+    >;
     expect(createArguments[0]).toEqual({
       serviceId: 'ac-cleaning',
       address: 'حي الصفراء، بريدة',
@@ -128,7 +129,10 @@ describe('RequestImageCreateOrchestrator', () => {
       clientSubmissionId: '11111111-1111-4111-8111-111111111111',
       submissionFingerprint: 'fingerprint-value',
     });
-    expect(createArguments[3]).toEqual([storedImage(first), storedImage(second)]);
+    expect(createArguments[3]).toEqual([
+      storedImage(first),
+      storedImage(second),
+    ]);
   });
 
   it('replays the original request when the same key and fingerprint already committed', async () => {
@@ -232,7 +236,10 @@ describe('RequestImageCreateOrchestrator', () => {
         '11111111-1111-4111-8111-111111111111',
       ),
     ).rejects.toThrow('transaction failed');
-    expect(cleanupSpy).toHaveBeenCalledWith([first.storageKey, second.storageKey]);
+    expect(cleanupSpy).toHaveBeenCalledWith([
+      first.storageKey,
+      second.storageKey,
+    ]);
   });
 
   it('keeps the primary failure when object cleanup itself fails', async () => {
@@ -314,7 +321,7 @@ class AppServiceWithOrchestrator {
     const customer = await this.store.findCustomerBySession(token);
     if (!customer) throw new Error('Unauthorized');
     const canonical = await this.orchestrator.canonicalizeImages(input.images);
-    const submissionFingerprint = await this.orchestrator.computeFingerprint(
+    const submissionFingerprint = this.orchestrator.computeFingerprint(
       input,
       canonical,
     );
@@ -324,7 +331,7 @@ class AppServiceWithOrchestrator {
       submissionFingerprint,
     };
     try {
-      const created = (await this.store.create(
+      const created = await this.store.create(
         {
           serviceId: input.serviceId,
           address: input.address,
@@ -341,7 +348,7 @@ class AppServiceWithOrchestrator {
           contentSha256: image.contentSha256,
           sortOrder: image.sortOrder,
         })),
-      )) as unknown as ServiceRequest;
+      );
       const images =
         canonical.length > 0
           ? await this.orchestrator.toPublicDtos(
@@ -365,9 +372,7 @@ class AppServiceWithOrchestrator {
       }
       if (error instanceof RequestSubmissionReplayError) {
         const replayed = await this.store.findByCustomerId(customer.id);
-        const original = replayed.find(
-          (request) => request.id === 'MOE-2001',
-        );
+        const original = replayed.find((request) => request.id === 'MOE-2001');
         if (!original) throw error;
         const images =
           canonical.length > 0

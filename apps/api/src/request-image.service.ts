@@ -28,6 +28,38 @@ export const MAX_REQUEST_IMAGE_AGGREGATE_BYTES = 20 * 1024 * 1024;
 export const MAX_REQUEST_IMAGE_PIXELS = 40_000_000;
 export const MAX_CANONICAL_DIMENSION = 2048;
 
+/**
+ * Stable request identity shared by JSON and multipart creation. Location is
+ * appended only when present so every legacy no-location hash remains byte-for-
+ * byte compatible with existing clients and persisted submissions.
+ */
+export function requestSubmissionFingerprint(
+  request: CreateServiceRequest,
+  orderedContentHashes: string[],
+): string {
+  return createHash('sha256')
+    .update(
+      JSON.stringify([
+        request.serviceId,
+        request.address,
+        request.details ?? '',
+        request.timing,
+        orderedContentHashes,
+        ...(request.location
+          ? [
+              [
+                request.location.point.latitude.toFixed(6),
+                request.location.point.longitude.toFixed(6),
+                request.location.source,
+                request.location.displayAddress,
+              ],
+            ]
+          : []),
+      ]),
+    )
+    .digest('hex');
+}
+
 const SOURCE_FORMATS = new Set(['jpeg', 'png', 'webp']);
 const MIME_BY_FORMAT: Readonly<Record<string, string>> = {
   jpeg: 'image/jpeg',
@@ -99,17 +131,7 @@ export class RequestImageService {
     request: CreateServiceRequest,
     orderedContentHashes: string[],
   ): string {
-    return createHash('sha256')
-      .update(
-        JSON.stringify([
-          request.serviceId,
-          request.address,
-          request.details ?? '',
-          request.timing,
-          orderedContentHashes,
-        ]),
-      )
-      .digest('hex');
+    return requestSubmissionFingerprint(request, orderedContentHashes);
   }
 
   async upload(images: CanonicalRequestImage[]): Promise<string[]> {

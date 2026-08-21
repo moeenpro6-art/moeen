@@ -67,18 +67,22 @@ const SENSITIVE_CUSTOMER_MARKERS = [
 ];
 
 describe('provider pre-quote visibility (Slice 3)', () => {
-  it('shows address, description and signed images to the eligible owner of an invited opportunity', async () => {
+  it('shows details and signed images while redacting exact location for an invited opportunity', async () => {
     const images = [storedImage(1), storedImage(0)];
     const { toDtos } = imageService(images);
-    const opportunity: ProviderOpportunityAccess = {
+    const opportunity = {
       requestId: REQUEST.id,
       serviceId: REQUEST.serviceId,
       timing: REQUEST.timing,
       opportunityStatus: 'invited',
       address: REQUEST.address,
       details: REQUEST.details,
+      location: {
+        point: { latitude: 26.359123, longitude: 43.981988 },
+        displayAddress: REQUEST.address,
+      },
       requestStatus: 'pending_dispatch',
-    };
+    } as unknown as ProviderOpportunityAccess;
     const store = {
       listProviderOpportunities: jest.fn().mockResolvedValue([opportunity]),
       findRequestImagesByRequestIds: jest
@@ -97,7 +101,6 @@ describe('provider pre-quote visibility (Slice 3)', () => {
       serviceId: REQUEST.serviceId,
       timing: REQUEST.timing,
       opportunityStatus: 'invited',
-      address: REQUEST.address,
       details: REQUEST.details,
       // Signed DTOs preserve the store's sort_order order exactly.
       images: images.map((image) => signedDto(image)),
@@ -106,6 +109,10 @@ describe('provider pre-quote visibility (Slice 3)', () => {
     expect(store.findRequestImagesByRequestIds).toHaveBeenCalledWith([
       REQUEST.id,
     ]);
+    expect(result).not.toHaveProperty('address');
+    expect(result).not.toHaveProperty('location');
+    expect(JSON.stringify(result)).not.toContain('26.359123');
+    expect(JSON.stringify(result)).not.toContain('43.981988');
   });
 
   it('never exposes customer identity or contact fields in the pre-quote projection', async () => {
@@ -119,10 +126,17 @@ describe('provider pre-quote visibility (Slice 3)', () => {
       opportunityStatus: 'invited',
       address: REQUEST.address,
       details: REQUEST.details,
+      location: {
+        point: { latitude: 26.359123, longitude: 43.981988 },
+      },
       requestStatus: 'pending_dispatch',
       customerId: 'CUS-1001',
+      customerName: 'عميل مسرب',
       customerPhone: '+966****0000',
       customerEmail: 'leak@example.test',
+      sessionToken: 'provider-session-leak',
+      storageKey: 'request-images/internal/secret.jpg',
+      bucket: 'internal-bucket',
       myQuote: {
         id: 'QTE-7',
         providerId: 'provider-1',
@@ -146,7 +160,6 @@ describe('provider pre-quote visibility (Slice 3)', () => {
 
     expect(Object.keys(result).sort()).toEqual(
       [
-        'address',
         'details',
         'images',
         'myQuote',
@@ -162,6 +175,11 @@ describe('provider pre-quote visibility (Slice 3)', () => {
     }
     expect(serialized).not.toContain('leak@example.test');
     expect(serialized).not.toContain('عميل مسرب');
+    expect(serialized).not.toContain('provider-session-leak');
+    expect(serialized).not.toContain('request-images/internal/secret.jpg');
+    expect(serialized).not.toContain('internal-bucket');
+    expect(result).not.toHaveProperty('address');
+    expect(result).not.toHaveProperty('location');
   });
 
   it('signs images only for opportunities the authenticated provider actually owns', async () => {
@@ -302,8 +320,12 @@ describe('customer / staff / assigned provider image reads (Slice 3)', () => {
   it('attaches images for the assigned provider and only for its assigned requests', async () => {
     const images = [storedImage(0)];
     const { toDtos } = imageService(images);
+    const assignedRequest = {
+      ...REQUEST,
+      status: 'assigned' as const,
+    };
     const store = {
-      findByProviderId: jest.fn().mockResolvedValue([REQUEST]),
+      findByProviderId: jest.fn().mockResolvedValue([assignedRequest]),
       findRequestImagesByRequestIds: jest
         .fn()
         .mockResolvedValue(new Map([[REQUEST.id, images]])),
@@ -315,7 +337,10 @@ describe('customer / staff / assigned provider image reads (Slice 3)', () => {
 
     const [result] = await appService.getProviderServiceRequests('provider-1');
 
-    expect(result).toEqual(requestWithImages(images));
+    expect(result).toEqual({
+      ...assignedRequest,
+      images: images.map((image) => signedDto(image)),
+    });
     expect(store.findByProviderId).toHaveBeenCalledWith('provider-1');
     expect(store.findRequestImagesByRequestIds).toHaveBeenCalledWith([
       REQUEST.id,

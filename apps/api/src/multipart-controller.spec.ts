@@ -217,17 +217,23 @@ describe('POST /service-requests multipart entry', () => {
   });
 
   it('rejects missing auth before multipart parsing and request creation', async () => {
-    await request(app.getHttpServer())
+    let pending = request(app.getHttpServer())
       .post('/service-requests')
       .set('Idempotency-Key', VALID_IDEMPOTENCY_KEY)
       .field('serviceId', 'ac-cleaning')
       .field('address', 'حي الصفراء، بريدة')
-      .field('timing', 'as-soon-as-possible')
-      .attach('images', Buffer.alloc(5 * 1024 * 1024 + 1), {
-        filename: 'would-be-oversized.jpg',
+      .field('timing', 'as-soon-as-possible');
+    // Six files are a deterministic parser tripwire: Multer would reject this
+    // request with 400 if it ran before the authentication guard. Tiny bodies
+    // avoid racing Supertest's ephemeral-server close against a 5 MiB upload.
+    for (let index = 0; index < 6; index += 1) {
+      pending = pending.attach('images', Buffer.from(`image-${index}`), {
+        filename: `${index}.jpg`,
         contentType: 'image/jpeg',
-      })
-      .expect(401);
+      });
+    }
+
+    await pending.expect(401);
 
     expect(sessionStore.findCustomerBySession).not.toHaveBeenCalled();
     expect(appService.createAuthenticatedServiceRequest).not.toHaveBeenCalled();

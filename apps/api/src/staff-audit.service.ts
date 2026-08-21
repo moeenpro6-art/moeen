@@ -5,6 +5,7 @@ import type {
   StaffAuditEvent,
 } from './staff-auth.repository';
 import type { StaffPrincipal } from './staff-auth.service';
+import { assertBroadAuditLocationSafe } from './location-privacy';
 
 export interface StaffAuditStore {
   appendAuditEvent(input: CreateAuditEventInput): Promise<void>;
@@ -20,11 +21,13 @@ export class StaffAuditService {
     @Inject(StaffAuthRepository) private readonly store: StaffAuditStore,
   ) {}
 
-  record(
+  async record(
     actor: StaffPrincipal,
     event: Omit<CreateAuditEventInput, 'staffId'>,
   ): Promise<void> {
-    return this.store.appendAuditEvent({ ...event, staffId: actor.id });
+    assertBroadAuditLocationSafe(event.oldState);
+    assertBroadAuditLocationSafe(event.newState);
+    await this.store.appendAuditEvent({ ...event, staffId: actor.id });
   }
 
   list(limit?: number): Promise<StaffAuditEvent[]> {

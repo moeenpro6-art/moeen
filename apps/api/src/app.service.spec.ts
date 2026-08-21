@@ -619,6 +619,81 @@ describe('AppService', () => {
     ).resolves.toEqual([opportunity]);
     expect(store.listProviderOpportunities).toHaveBeenCalledWith('provider-1');
   });
+
+  it('exposes quote inputs while redacting exact location and identity data', async () => {
+    const image = {
+      id: 'image-1',
+      storageKey: 'request-images/internal/image-1.jpg',
+      mimeType: 'image/jpeg' as const,
+      byteSize: 100,
+      contentSha256: 'a'.repeat(64),
+      sortOrder: 0,
+    };
+    const imageDto = {
+      id: image.id,
+      mimeType: image.mimeType,
+      byteSize: image.byteSize,
+      sortOrder: image.sortOrder,
+      url: 'https://signed.example.test/image-1',
+      urlExpiresAt: '2026-08-21T12:05:00.000Z',
+    };
+    const opportunity = {
+      requestId: 'MOE-1042',
+      serviceId: 'ac-cleaning',
+      timing: 'as-soon-as-possible' as const,
+      opportunityStatus: 'quoted' as const,
+      address: 'sensitive-address',
+      details: 'details-needed-to-price',
+      location: { point: { latitude: 'sensitive', longitude: 'sensitive' } },
+      requestStatus: 'pending_dispatch' as const,
+      customerId: 'CUS-sensitive',
+      customerPhone: '+966-sensitive',
+      myQuote: {
+        id: 'QTE-9',
+        providerId: 'provider-1',
+        providerName: 'Sensitive provider name',
+        amountHalalas: 15_000,
+        scope: 'عرض الخدمة',
+        status: 'proposed' as const,
+        proposedAt: '2026-08-21T12:00:00.000Z',
+      },
+    };
+    const store = {
+      listProviderOpportunities: jest.fn().mockResolvedValue([opportunity]),
+      findRequestImagesByRequestIds: jest
+        .fn()
+        .mockResolvedValue(new Map([[opportunity.requestId, [image]]])),
+    };
+    const toDtos = jest.fn().mockResolvedValue([imageDto]);
+    const service = new AppService(store as never, { toDtos } as never);
+
+    const [projected] = await service.getProviderOpportunities('provider-1');
+
+    expect(projected).toEqual({
+      requestId: opportunity.requestId,
+      serviceId: opportunity.serviceId,
+      timing: opportunity.timing,
+      opportunityStatus: opportunity.opportunityStatus,
+      details: opportunity.details,
+      images: [imageDto],
+      myQuote: {
+        id: opportunity.myQuote.id,
+        providerId: opportunity.myQuote.providerId,
+        amountHalalas: opportunity.myQuote.amountHalalas,
+        scope: opportunity.myQuote.scope,
+        status: opportunity.myQuote.status,
+        proposedAt: opportunity.myQuote.proposedAt,
+        decidedAt: undefined,
+      },
+    });
+    expect(projected).not.toHaveProperty('address');
+    expect(projected).not.toHaveProperty('location');
+    expect(projected).not.toHaveProperty('customerId');
+    expect(projected).not.toHaveProperty('customerPhone');
+    expect(projected.myQuote).not.toHaveProperty('providerName');
+    expect(JSON.stringify(projected)).not.toContain(image.storageKey);
+    expect(toDtos).toHaveBeenCalledWith([image]);
+  });
 });
 
 describe('AppService multipart image creation (Slice 2B)', () => {

@@ -4,6 +4,7 @@ import { Pool, type PoolClient } from 'pg';
 import type { LoginAttemptScope } from './login-attempt-limiter.service';
 import type { PublicAuthAttemptScope } from './public-auth-rate-limiter.service';
 import { resolveDatabaseConnectionString } from './database.config';
+import { assertBroadAuditLocationSafe } from './location-privacy';
 import type {
   StaffAuthStore,
   StaffPrincipal,
@@ -432,6 +433,8 @@ export class StaffAuthRepository
   }
 
   async appendAuditEvent(input: CreateAuditEventInput): Promise<void> {
+    assertBroadAuditLocationSafe(input.oldState);
+    assertBroadAuditLocationSafe(input.newState);
     await this.pool.query(
       `INSERT INTO staff_audit_events
         (staff_user_id, action, subject_type, subject_id, old_state, new_state)

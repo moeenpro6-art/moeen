@@ -1,13 +1,10 @@
-import {
-  BadRequestException,
-  ConflictException,
-  Injectable,
-} from '@nestjs/common';
+import { BadRequestException, Injectable } from '@nestjs/common';
 import type { RequestImageDto } from './request-image.types';
 import type {
   CanonicalRequestImage,
   RequestImageUploadFile,
 } from './request-image.types';
+import type { ServiceLocationInput } from './service-location.contracts';
 
 /**
  * Verified, bounded multipart payload extracted from the request stream.
@@ -16,9 +13,10 @@ import type {
  */
 export type ServiceRequestMultipartInput = {
   serviceId: string;
-  address: string;
+  address?: string;
   details?: string;
   timing: 'as-soon-as-possible' | 'scheduled';
+  location?: ServiceLocationInput;
   images: RequestImageUploadFile[];
 };
 
@@ -47,8 +45,7 @@ export type CreateServiceRequestMultipartResult =
 const UUID_V4_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-export const requestImageCountError =
-  'At most 5 request images are allowed';
+export const requestImageCountError = 'At most 5 request images are allowed';
 export const requestImageSizeError = 'Request image exceeds 5 MiB';
 export const requestImageAggregateError =
   'Request images exceed 20 MiB in total';
@@ -79,13 +76,48 @@ export function validateCreateServiceRequestMultipart(
   const timing = candidate.timing;
   const details = candidate.details;
   const images = candidate.images;
+  const locationField = candidate.location;
+  const allowedKeys = new Set([
+    'serviceId',
+    'address',
+    'details',
+    'timing',
+    'location',
+    'images',
+  ]);
+
+  let location: ServiceLocationInput | undefined;
+  if (locationField !== undefined) {
+    if (
+      typeof locationField !== 'string' ||
+      Buffer.byteLength(locationField, 'utf8') > 2048
+    ) {
+      throw new BadRequestException(multipartFieldError);
+    }
+    try {
+      const parsed: unknown = JSON.parse(locationField);
+      if (
+        typeof parsed !== 'object' ||
+        parsed === null ||
+        Array.isArray(parsed)
+      ) {
+        throw new Error('invalid location shape');
+      }
+      location = parsed as ServiceLocationInput;
+    } catch {
+      throw new BadRequestException(multipartFieldError);
+    }
+  }
 
   if (
+    Object.keys(candidate).some((key) => !allowedKeys.has(key)) ||
     typeof serviceId !== 'string' ||
     !/^[a-z0-9-]{1,64}$/.test(serviceId) ||
-    typeof address !== 'string' ||
-    address.trim().length < 3 ||
-    address.trim().length > 240 ||
+    (address !== undefined &&
+      (typeof address !== 'string' ||
+        address.trim().length < 3 ||
+        address.trim().length > 240)) ||
+    (address === undefined && location === undefined) ||
     typeof timing !== 'string' ||
     !['as-soon-as-possible', 'scheduled'].includes(timing) ||
     (details !== undefined &&
@@ -106,9 +138,10 @@ export function validateCreateServiceRequestMultipart(
   const normalizedDetails = details?.trim();
   return {
     serviceId,
-    address: address.trim(),
+    ...(typeof address === 'string' ? { address: address.trim() } : {}),
     timing: timing as ServiceRequestMultipartInput['timing'],
     ...(normalizedDetails ? { details: normalizedDetails } : {}),
+    ...(location ? { location } : {}),
     images: (images ?? []) as RequestImageUploadFile[],
   };
 }
@@ -169,7 +202,7 @@ export class RequestImageCreateOrchestrator {
     return this.canonicalize(files);
   }
 
-  async computeFingerprint(
+  computeFingerprint(
     request: {
       serviceId: string;
       address: string;
@@ -177,16 +210,14 @@ export class RequestImageCreateOrchestrator {
       timing: 'as-soon-as-possible' | 'scheduled';
     },
     images: CanonicalRequestImage[],
-  ): Promise<string> {
+  ): string {
     return this.fingerprint(
       request,
       images.map((image) => image.contentSha256),
     );
   }
 
-  async uploadImages(
-    images: CanonicalRequestImage[],
-  ): Promise<string[]> {
+  async uploadImages(images: CanonicalRequestImage[]): Promise<string[]> {
     return this.upload(images);
   }
 

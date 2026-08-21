@@ -766,6 +766,58 @@ const V4_SCHEMA_CONTRACT: SchemaContract = {
   },
 };
 
+/**
+ * Migration 0005 adds one nullable, all-or-nothing customer-confirmed service
+ * location snapshot to service_requests. Existing rows remain valid with all
+ * four fields NULL and location_confirmed_at deliberately has no default.
+ */
+const V5_SCHEMA_CONTRACT: SchemaContract = {
+  ...V4_SCHEMA_CONTRACT,
+  columnTypes: {
+    ...V4_SCHEMA_CONTRACT.columnTypes,
+    service_requests: {
+      ...V4_SCHEMA_CONTRACT.columnTypes.service_requests,
+      location_latitude: 'numeric(9,6)',
+      location_longitude: 'numeric(10,6)',
+      location_source: 'text',
+      location_confirmed_at: 'timestamp with time zone',
+    },
+  },
+  // No location column is listed: all four must remain nullable and have no
+  // database default. The generic contract check rejects any added default.
+  columnDefaults: V4_SCHEMA_CONTRACT.columnDefaults,
+  constraintTokens: {
+    ...V4_SCHEMA_CONTRACT.constraintTokens,
+    service_requests_location_completeness_check: [
+      'location_latitude',
+      'location_longitude',
+      'location_source',
+      'location_confirmed_at',
+      'IS NULL',
+      'IS NOT NULL',
+    ],
+    service_requests_location_latitude_check: [
+      'location_latitude',
+      '>=',
+      '-90',
+      '<=',
+      '90',
+    ],
+    service_requests_location_longitude_check: [
+      'location_longitude',
+      '>=',
+      '-180',
+      '<=',
+      '180',
+    ],
+    service_requests_location_source_check: [
+      'location_source',
+      'current_location',
+      'map_pin',
+    ],
+  },
+};
+
 export type DatabaseMigration = {
   version: string;
   name: string;
@@ -1348,6 +1400,12 @@ function contractForMigration(
     migration.name === 'fcm_notification_types'
   ) {
     return V4_SCHEMA_CONTRACT;
+  }
+  if (
+    migration?.version === '0005' &&
+    migration.name === 'service_request_locations'
+  ) {
+    return V5_SCHEMA_CONTRACT;
   }
   return undefined;
 }

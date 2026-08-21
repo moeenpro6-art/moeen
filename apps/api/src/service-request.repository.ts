@@ -51,6 +51,7 @@ import {
 } from './request-image-create.contracts';
 import type { StoredRequestImage } from './request-image.types';
 import { fcmConfigFromEnvironment } from './fcm.config';
+import { assertBroadAuditLocationSafe } from './location-privacy';
 import { NotificationOutboxWriter } from './notification-outbox.writer';
 import {
   customerStatusNotificationType,
@@ -74,6 +75,10 @@ type ServiceRequestRow = {
   id: string;
   service_id: string;
   address: string;
+  location_latitude: string | number | null;
+  location_longitude: string | number | null;
+  location_source: 'current_location' | 'map_pin' | null;
+  location_confirmed_at: Date | null;
   details: string | null;
   timing: CreateServiceRequest['timing'];
   status: ServiceRequest['status'];
@@ -319,6 +324,8 @@ export class ServiceRequestRepository
     oldState?: Record<string, unknown>,
     newState?: Record<string, unknown>,
   ): Promise<void> {
+    assertBroadAuditLocationSafe(oldState);
+    assertBroadAuditLocationSafe(newState);
     await client.query(
       `INSERT INTO staff_audit_events
         (staff_user_id, action, subject_type, subject_id, old_state, new_state)
@@ -852,12 +859,16 @@ export class ServiceRequestRepository
         const inserted = await client.query<ServiceRequestRow>(
           `INSERT INTO service_requests
              (service_id, address, details, timing, customer_id,
-              client_submission_id, submission_fingerprint)
-           VALUES ($1, $2, $3, $4, $5, $6, $7)
+              client_submission_id, submission_fingerprint,
+              location_latitude, location_longitude, location_source,
+              location_confirmed_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
            ON CONFLICT (customer_id, client_submission_id)
              WHERE client_submission_id IS NOT NULL
            DO NOTHING
-           RETURNING id, service_id, address, details, timing, status, created_at`,
+           RETURNING id, service_id, address, details, timing, status,
+                     location_latitude, location_longitude, location_source,
+                     location_confirmed_at, created_at`,
           [
             input.serviceId,
             input.address,
@@ -866,6 +877,10 @@ export class ServiceRequestRepository
             databaseCustomerId,
             submission.clientSubmissionId,
             submission.submissionFingerprint,
+            input.location?.point.latitude ?? null,
+            input.location?.point.longitude ?? null,
+            input.location?.source ?? null,
+            input.location?.confirmedAt ?? null,
           ],
         );
         row = inserted.rows[0];
@@ -893,15 +908,24 @@ export class ServiceRequestRepository
         }
       } else {
         const result = await client.query<ServiceRequestRow>(
-          `INSERT INTO service_requests (service_id, address, details, timing, customer_id)
-           VALUES ($1, $2, $3, $4, $5)
-           RETURNING id, service_id, address, details, timing, status, created_at`,
+          `INSERT INTO service_requests
+             (service_id, address, details, timing, customer_id,
+              location_latitude, location_longitude, location_source,
+              location_confirmed_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+           RETURNING id, service_id, address, details, timing, status,
+                     location_latitude, location_longitude, location_source,
+                     location_confirmed_at, created_at`,
           [
             input.serviceId,
             input.address,
             input.details ?? null,
             input.timing,
             databaseCustomerId,
+            input.location?.point.latitude ?? null,
+            input.location?.point.longitude ?? null,
+            input.location?.source ?? null,
+            input.location?.confirmedAt ?? null,
           ],
         );
         row = result.rows[0];
@@ -988,7 +1012,9 @@ export class ServiceRequestRepository
     clientSubmissionId: string,
   ): Promise<ServiceRequest | undefined> {
     const result = await this.pool.query<ServiceRequestRow>(
-      `SELECT r.id, r.service_id, r.address, r.details, r.timing, r.status, r.created_at,
+      `SELECT r.id, r.service_id, r.address, r.details, r.timing, r.status,
+              r.location_latitude, r.location_longitude, r.location_source,
+              r.location_confirmed_at, r.created_at,
               p.id AS assigned_provider_id, p.name AS assigned_provider_name,
               p.specialties AS assigned_provider_specialties, p.available AS assigned_provider_available,
               r.rating, r.rating_comment,
@@ -1175,7 +1201,9 @@ export class ServiceRequestRepository
 
   async findAll(): Promise<ServiceRequest[]> {
     const result = await this.pool.query<ServiceRequestRow>(
-      `SELECT r.id, r.service_id, r.address, r.details, r.timing, r.status, r.created_at,
+      `SELECT r.id, r.service_id, r.address, r.details, r.timing, r.status,
+              r.location_latitude, r.location_longitude, r.location_source,
+              r.location_confirmed_at, r.created_at,
               p.id AS assigned_provider_id, p.name AS assigned_provider_name,
               p.specialties AS assigned_provider_specialties, p.available AS assigned_provider_available,
               r.rating, r.rating_comment,
@@ -1227,7 +1255,9 @@ export class ServiceRequestRepository
 
   async findByCustomerId(customerId: string): Promise<ServiceRequest[]> {
     const result = await this.pool.query<ServiceRequestRow>(
-      `SELECT r.id, r.service_id, r.address, r.details, r.timing, r.status, r.created_at,
+      `SELECT r.id, r.service_id, r.address, r.details, r.timing, r.status,
+              r.location_latitude, r.location_longitude, r.location_source,
+              r.location_confirmed_at, r.created_at,
               p.id AS assigned_provider_id, p.name AS assigned_provider_name,
               p.specialties AS assigned_provider_specialties, p.available AS assigned_provider_available,
               r.rating, r.rating_comment,
@@ -1389,7 +1419,9 @@ export class ServiceRequestRepository
 
   async findByProviderId(providerId: string): Promise<ServiceRequest[]> {
     const result = await this.pool.query<ServiceRequestRow>(
-      `SELECT r.id, r.service_id, r.address, r.details, r.timing, r.status, r.created_at,
+      `SELECT r.id, r.service_id, r.address, r.details, r.timing, r.status,
+              r.location_latitude, r.location_longitude, r.location_source,
+              r.location_confirmed_at, r.created_at,
               c.phone AS customer_phone,
               p.id AS assigned_provider_id, p.name AS assigned_provider_name,
               p.specialties AS assigned_provider_specialties, p.available AS assigned_provider_available,
@@ -2452,7 +2484,6 @@ export class ServiceRequestRepository
       request_id: string;
       service_id: string;
       timing: ServiceRequest['timing'];
-      address: string;
       details: string | null;
       request_status: ServiceRequest['status'];
       opportunity_status: ProviderOpportunityStatus;
@@ -2464,8 +2495,8 @@ export class ServiceRequestRepository
       quote_proposed_at: Date | null;
       quote_decided_at: Date | null;
     }>(
-      `SELECT r.id AS request_id, r.service_id, r.timing,
-              r.address, r.details, r.status AS request_status,
+      `SELECT r.id AS request_id, r.service_id, r.timing, r.details,
+              r.status AS request_status,
               o.status AS opportunity_status,
               q.id AS quote_id, q.provider_id AS quote_provider_id,
               q.amount_halalas AS quote_amount_halalas, q.scope AS quote_scope,
@@ -2489,9 +2520,8 @@ export class ServiceRequestRepository
       serviceId: row.service_id,
       timing: row.timing,
       opportunityStatus: row.opportunity_status,
-      // Server-side authorization inputs for the pre-quote projection. These
-      // are stripped by AppService before anything reaches a client.
-      address: row.address,
+      // Request content needed to assess and price the job. Exact address and
+      // coordinates are intentionally absent from this query/projection.
       details: row.details ?? undefined,
       requestStatus: row.request_status,
       myQuote: row.quote_id
@@ -3210,6 +3240,21 @@ export class ServiceRequestRepository
       id: `MOE-${1000 + Number(row.id)}`,
       serviceId: row.service_id,
       address: row.address,
+      location:
+        row.location_latitude != null &&
+        row.location_longitude != null &&
+        row.location_source != null &&
+        row.location_confirmed_at != null
+          ? {
+              point: {
+                latitude: Number(row.location_latitude),
+                longitude: Number(row.location_longitude),
+              },
+              displayAddress: row.address,
+              source: row.location_source,
+              confirmedAt: row.location_confirmed_at.toISOString(),
+            }
+          : undefined,
       details: row.details ?? undefined,
       timing: row.timing,
       status: row.status,

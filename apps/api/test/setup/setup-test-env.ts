@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import { Pool } from 'pg';
+import { runDatabaseMigrations } from '../../src/database-migrations';
 import {
   TestDatabaseGuardError,
   assertTestDatabaseUrl,
@@ -40,10 +41,11 @@ function isPostgresDuplicateSchemaError(error: unknown): boolean {
  *  3. creates it with a plain CREATE SCHEMA (no IF NOT EXISTS) and records
  *     the run's ownership marker (run id + SHA-256 of the run owner token)
  *     INSIDE it, so teardown can prove ownership per worker schema;
- *  4. rewrites THIS worker process's TEST_DATABASE_URL to its own schema —
+ *  4. applies the application's ordered migration manifest to the worker
+ *     schema before any test module or repository can execute;
+ *  5. rewrites THIS worker process's TEST_DATABASE_URL to its own schema —
  *     pools constructed after setupFiles therefore all target this worker's
- *     schema; no worker ever shares another worker's schema, and each worker
- *     bootstraps its own tables lazily (repository initialize()).
+ *     fully migrated schema; no worker ever shares another worker's schema.
  *
  * No sleeps, no retries, no global state: the rewrite is per-process.
  *
@@ -142,10 +144,23 @@ async function setupTestEnv(): Promise<void> {
     await pool.end();
   }
 
-  // Rewrite THIS worker's URL to its own schema. Every pool constructed from
-  // here on in this process targets the worker schema; the effective
-  // search_path is the worker schema plus the always-implicit pg_catalog.
-  process.env.TEST_DATABASE_URL = withWorkerSchema(baseUrl, runId, workerId);
+  // Apply the SAME ordered migration contract used by the application before
+  // any repository/test module executes. This is deliberately not another
+  // hand-written test schema: adding a migration to the release manifest is
+  // sufficient to advance every isolated worker schema.
+  const workerUrl = withWorkerSchema(baseUrl, runId, workerId);
+  const migrationPool = new Pool({ connectionString: workerUrl });
+  try {
+    await runDatabaseMigrations(migrationPool);
+  } finally {
+    await migrationPool.end();
+  }
+
+  // Rewrite THIS worker's URL to its fully migrated schema. Every pool
+  // constructed from here on in this process targets the worker schema; the
+  // effective search_path is the worker schema plus the always-implicit
+  // pg_catalog.
+  process.env.TEST_DATABASE_URL = workerUrl;
   process.stdout.write(`[test-db] worker schema: ${workerSchema}\n`);
 }
 

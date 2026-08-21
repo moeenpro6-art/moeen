@@ -777,6 +777,12 @@ describe('ServiceRequestRepository', () => {
       for (let index = 0; index < 200; index += 1) {
         const providerId = `PILOT-perf-${index}`;
         const code = `perf-access-${index}-${randomUUID().slice(0, 8)}`;
+        // The unknown-code path must not read or verify any of these hashes.
+        // Keep each fixture structurally valid and unique so the legacy O(N)
+        // implementation would still perform 200 real scrypt verifications,
+        // without spending the test timeout generating 200 unused hashes.
+        const salt = index.toString(16).padStart(32, '0');
+        const expectedKey = index.toString(16).padStart(128, '0');
 
         await probe.query(
           `INSERT INTO providers (id, name, specialties, available, service_zone, verification_status)
@@ -788,7 +794,7 @@ describe('ServiceRequestRepository', () => {
            VALUES ($1, $2, $3)`,
           [
             providerId,
-            await hashProviderAccessCode(code),
+            `scrypt$${salt}$${expectedKey}`,
             providerAccessCodeLookupId(code),
           ],
         );
@@ -2432,7 +2438,7 @@ describe('ServiceRequestRepository', () => {
     expect(await readEventTypes(request.id)).toContain('quote_proposed');
   });
 
-  it('carries job fields for the pre-quote projection but never any customer identity data', async () => {
+  it('carries pre-quote details but no exact address or customer identity data', async () => {
     const provider = await createVerifiedProvider(['ac-cleaning']);
     const customer = await repository.upsertCustomer(
       `+9665${String(Math.floor(10_000_000 + Math.random() * 89_999_999))}`,
@@ -2443,6 +2449,12 @@ describe('ServiceRequestRepository', () => {
         address: 'شارع الأمير سلطان، حي الصفراء، بريدة — منزل خاص',
         details: 'معلومات حساسة جدًا مع رقم جوال في الملاحظات',
         timing: 'as-soon-as-possible',
+        location: {
+          point: { latitude: 26.359123, longitude: 43.981988 },
+          displayAddress: 'شارع الأمير سلطان، حي الصفراء، بريدة — منزل خاص',
+          source: 'map_pin',
+          confirmedAt: '2026-08-21T12:00:00.000Z',
+        },
       },
       customer.id,
     );
@@ -2453,16 +2465,16 @@ describe('ServiceRequestRepository', () => {
     );
     expect(opportunities).toHaveLength(1);
     const opportunity = opportunities[0];
-    // Slice 3: the repository supplies the server-side inputs (address,
-    // details, request status) that AppService gates for eligible pre-quote
-    // providers. These fields are stripped again before any client DTO.
     expect(opportunity).toMatchObject({
-      address: 'شارع الأمير سلطان، حي الصفراء، بريدة — منزل خاص',
       details: 'معلومات حساسة جدًا مع رقم جوال في الملاحظات',
       requestStatus: 'pending_dispatch',
     });
-    // Customer identity never participates in this shape at any layer.
+    expect(opportunity).not.toHaveProperty('address');
+    expect(opportunity).not.toHaveProperty('location');
+    // Customer identity and exact coordinates never participate in this shape.
     const serialized = JSON.stringify(opportunity);
+    expect(serialized).not.toContain('26.359123');
+    expect(serialized).not.toContain('43.981988');
     expect(serialized).not.toContain('CUS-');
     expect(serialized).not.toContain(customer.id);
     for (const key of Object.keys(opportunity)) {
@@ -3077,7 +3089,7 @@ describe('ServiceRequestRepository', () => {
             `SELECT count(*)::int AS n
                FROM service_request_images
               WHERE service_request_id = $1`,
-            [databaseCustomerId(customer.id)],
+            [Number(first.id.replace('MOE-', '')) - 1000],
           )
         ).rows[0].n;
         expect(imageCount).toBe(1);
@@ -3330,7 +3342,7 @@ describe('ServiceRequestRepository', () => {
       ).resolves.toEqual(new Map());
     });
 
-    it('exposes address/details/request status only for opportunities the provider owns', async () => {
+    it('returns details but no exact location only for opportunities the provider owns', async () => {
       const uniqueServiceId = `slice3-opp-${randomUUID()}`;
       const { request } = await createPendingRequest(uniqueServiceId);
       const provider = await createVerifiedProvider([uniqueServiceId]);
@@ -3344,11 +3356,15 @@ describe('ServiceRequestRepository', () => {
           requestId: request.id,
           serviceId: uniqueServiceId,
           opportunityStatus: 'invited',
-          address: 'حي الصفراء، بريدة',
           details: 'تفاصيل حساسة للخصوصية',
           requestStatus: 'pending_dispatch',
         }),
       ]);
+      const [opportunity] = await repository.listProviderOpportunities(
+        provider.id,
+      );
+      expect(opportunity).not.toHaveProperty('address');
+      expect(opportunity).not.toHaveProperty('location');
       await expect(
         repository.listProviderOpportunities(otherProvider.id),
       ).resolves.toEqual([]);
