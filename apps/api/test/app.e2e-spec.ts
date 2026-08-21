@@ -13,6 +13,10 @@ import { configureApiSecurity } from './../src/api-security';
 import { StaffAuthRepository } from './../src/staff-auth.repository';
 import { OTP_PROVIDER, type OtpProvider } from './../src/otp-provider';
 import { hashStaffPassword, type StaffRole } from './../src/staff-auth.service';
+import {
+  REQUEST_IMAGE_STORAGE,
+  type RequestImageStorage,
+} from './../src/request-image.storage';
 
 function responseObject(value: unknown): Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
@@ -25,6 +29,28 @@ function requiredString(value: unknown, field: string): string {
   const result = responseObject(value)[field];
   if (typeof result !== 'string') throw new Error(`Expected ${field} string`);
   return result;
+}
+
+function deterministicRequestImageStorage(
+  signedKeys: string[],
+): RequestImageStorage {
+  return {
+    put: () => Promise.resolve(),
+    deleteMany: () => Promise.resolve(),
+    signGet: (key) => {
+      signedKeys.push(key);
+      const imageId = key
+        .split('/')
+        .at(-1)
+        ?.replace(/[.]jpg$/, '');
+      if (!imageId) throw new Error('Expected request image key');
+      return Promise.resolve({
+        url: `https://signed.example.test/${imageId}`,
+        expiresAt: new Date('2026-08-21T12:05:00.000Z'),
+      });
+    },
+    list: () => Promise.resolve({ items: [], isTruncated: false }),
+  };
 }
 
 function hasRequestStatusAuditEvent(
@@ -235,6 +261,57 @@ async function createCustomerServiceRequest(
   return requiredString(created.body, 'id');
 }
 
+async function setConfirmedLocationForPrivacyTest(
+  requestId: string,
+): Promise<void> {
+  const databaseId = Number(requestId.slice('MOE-'.length)) - 1000;
+  if (!Number.isSafeInteger(databaseId) || databaseId < 1) {
+    throw new Error('Expected service request id');
+  }
+  const pool = new Pool({ connectionString: process.env.TEST_DATABASE_URL });
+  try {
+    const updated = await pool.query(
+      `UPDATE service_requests
+          SET location_latitude = $2,
+              location_longitude = $3,
+              location_source = 'map_pin',
+              location_confirmed_at = $4
+        WHERE id = $1`,
+      [databaseId, '26.359123', '43.981988', '2026-08-21T12:00:00.000Z'],
+    );
+    if (updated.rowCount !== 1) {
+      throw new Error('Expected service request location update');
+    }
+  } finally {
+    await pool.end();
+  }
+}
+
+async function commitRequestImageForPrivacyTest(requestId: string): Promise<{
+  id: string;
+  storageKey: string;
+}> {
+  const databaseId = Number(requestId.slice('MOE-'.length)) - 1000;
+  if (!Number.isSafeInteger(databaseId) || databaseId < 1) {
+    throw new Error('Expected service request id');
+  }
+  const id = randomUUID();
+  const storageKey = `request-images/test/privacy/${id}.jpg`;
+  const pool = new Pool({ connectionString: process.env.TEST_DATABASE_URL });
+  try {
+    await pool.query(
+      `INSERT INTO service_request_images
+         (id, service_request_id, storage_key, mime_type, byte_size,
+          content_sha256, sort_order)
+       VALUES ($1, $2, $3, 'image/jpeg', 321, $4, 0)`,
+      [id, databaseId, storageKey, 'a'.repeat(64)],
+    );
+    return { id, storageKey };
+  } finally {
+    await pool.end();
+  }
+}
+
 /**
  * Makes a seeded provider (provider-1/2/3) unavailable so automatic
  * invitations skip it. Returns a provider authorization for later use.
@@ -294,8 +371,10 @@ function uniqueTestPhone(): string {
 
 describe('AppController (e2e)', () => {
   let app: NestExpressApplication;
+  let signedRequestImageKeys: string[];
 
   beforeEach(async () => {
+    signedRequestImageKeys = [];
     const otpProvider: OtpProvider = {
       startVerification: jest.fn().mockResolvedValue(undefined),
       checkVerification: jest.fn().mockResolvedValue('approved'),
@@ -305,6 +384,8 @@ describe('AppController (e2e)', () => {
     })
       .overrideProvider(OTP_PROVIDER)
       .useValue(otpProvider)
+      .overrideProvider(REQUEST_IMAGE_STORAGE)
+      .useValue(deterministicRequestImageStorage(signedRequestImageKeys))
       .compile();
 
     app = moduleFixture.createNestApplication<NestExpressApplication>();
@@ -1068,6 +1149,7 @@ describe('AppController (e2e)', () => {
       app,
       customerAuthorization,
     );
+    await setConfirmedLocationForPrivacyTest(requestId);
     const providerA = await createProviderAuthorization(app, ['ac-cleaning']);
     const providerB = await createProviderAuthorization(app, ['ac-cleaning']);
     const dispatcherAuthorization = await createStaffAuthorization(
@@ -1100,11 +1182,10 @@ describe('AppController (e2e)', () => {
       .expect(200);
     const body = opportunities.body as Record<string, unknown>[];
     expect(body).toHaveLength(1);
-    // Pre-quote product contract (Slice 3): the eligible owner of an invited
-    // opportunity sees the job service/timing/address/details/images and the
-    // opportunity state — but never any customer identity or contact field.
+    // Phase 1 pre-quote contract: an invited provider receives the job details
+    // and image list needed to quote, but exact location and customer identity
+    // or contact data stay hidden.
     expect(Object.keys(body[0]).sort()).toEqual([
-      'address',
       'details',
       'images',
       'opportunityStatus',
@@ -1112,11 +1193,99 @@ describe('AppController (e2e)', () => {
       'serviceId',
       'timing',
     ]);
+    expect(body[0]).toMatchObject({
+      details: 'معلومات حساسة للخصوصية',
+      images: [],
+    });
     const serialized = JSON.stringify(body);
-    expect(serialized).toContain('حي الصفراء');
+    expect(serialized).not.toContain('حي الصفراء');
+    expect(serialized).not.toContain('26.359123');
+    expect(serialized).not.toContain('43.981988');
     expect(serialized).toContain('معلومات حساسة');
     expect(serialized).not.toContain('CUS-');
     expect(serialized).not.toContain('+966');
+    expect(body[0]).not.toHaveProperty('address');
+    expect(body[0]).not.toHaveProperty('location');
+    expect(body[0]).not.toHaveProperty('latitude');
+    expect(body[0]).not.toHaveProperty('longitude');
+    expect(body[0]).not.toHaveProperty('customerId');
+    expect(body[0]).not.toHaveProperty('customerName');
+    expect(body[0]).not.toHaveProperty('phone');
+    expect(body[0]).not.toHaveProperty('email');
+  });
+
+  it('signs committed pre-quote images only for the eligible opportunity owner', async () => {
+    const customerAuthorization = await createCustomerAuthorization(app);
+    const requestId = await createCustomerServiceRequest(
+      app,
+      customerAuthorization,
+    );
+    const image = await commitRequestImageForPrivacyTest(requestId);
+    const owner = await createProviderAuthorization(app, ['ac-cleaning']);
+    const nonOwner = await createProviderAuthorization(app, ['ac-cleaning']);
+    const dispatcherAuthorization = await createStaffAuthorization(
+      app,
+      'dispatcher',
+    );
+
+    await request(app.getHttpServer())
+      .post(`/service-requests/${requestId}/opportunities`)
+      .set('Authorization', dispatcherAuthorization)
+      .send({ providerIds: [owner.providerId] })
+      .expect(201);
+
+    const ownerResponse = await request(app.getHttpServer())
+      .get('/provider/opportunities')
+      .set('Authorization', owner.authorization)
+      .expect(200);
+    const ownerBody = ownerResponse.body as Record<string, unknown>[];
+    const opportunity = ownerBody.find((item) => item.requestId === requestId);
+    expect(opportunity).toBeDefined();
+    const images = opportunity?.images as Record<string, unknown>[];
+    expect(images).toEqual([
+      {
+        id: image.id,
+        mimeType: 'image/jpeg',
+        byteSize: 321,
+        sortOrder: 0,
+        url: `https://signed.example.test/${image.id}`,
+        urlExpiresAt: '2026-08-21T12:05:00.000Z',
+      },
+    ]);
+    expect(signedRequestImageKeys).toEqual([image.storageKey]);
+    expect(JSON.stringify(opportunity)).not.toContain(image.storageKey);
+    expect(opportunity).not.toHaveProperty('storageKey');
+    expect(opportunity).not.toHaveProperty('bucket');
+
+    const nonOwnerResponse = await request(app.getHttpServer())
+      .get('/provider/opportunities')
+      .set('Authorization', nonOwner.authorization)
+      .expect(200);
+    expect(
+      (nonOwnerResponse.body as Record<string, unknown>[]).some(
+        (item) => item.requestId === requestId,
+      ),
+    ).toBe(false);
+    expect(signedRequestImageKeys).toEqual([image.storageKey]);
+
+    await request(app.getHttpServer())
+      .delete(
+        `/service-requests/${requestId}/opportunities/${owner.providerId}`,
+      )
+      .set('Authorization', dispatcherAuthorization)
+      .expect(200);
+    const terminalResponse = await request(app.getHttpServer())
+      .get('/provider/opportunities')
+      .set('Authorization', owner.authorization)
+      .expect(200);
+    const terminal = (terminalResponse.body as Record<string, unknown>[]).find(
+      (item) => item.requestId === requestId,
+    );
+    expect(terminal).toBeDefined();
+    expect(terminal).not.toHaveProperty('images');
+    expect(JSON.stringify(terminal)).not.toContain(image.storageKey);
+    expect(JSON.stringify(terminal)).not.toContain('signed.example.test');
+    expect(signedRequestImageKeys).toEqual([image.storageKey]);
   });
 
   it('auto-invites eligible verified/available providers when a customer creates a request', async () => {
@@ -1139,14 +1308,34 @@ describe('AppController (e2e)', () => {
       serviceId: 'ac-cleaning',
       opportunityStatus: 'invited',
     });
-    // Pre-quote product contract (Slice 3): the eligible provider sees the
-    // job address and details to estimate cost/travel — but no customer
-    // identity, phone, or session data is exposed.
+    // Automatic invitation uses the same Phase 1 pre-quote projection.
+    expect(Object.keys(body[0]).sort()).toEqual([
+      'details',
+      'images',
+      'opportunityStatus',
+      'requestId',
+      'serviceId',
+      'timing',
+    ]);
+    expect(body[0]).toMatchObject({
+      details: 'معلومات حساسة للخصوصية',
+      images: [],
+    });
     const serialized = JSON.stringify(body);
-    expect(serialized).toContain('حي الصفراء');
+    expect(serialized).not.toContain('حي الصفراء');
+    expect(serialized).not.toContain('26.359123');
+    expect(serialized).not.toContain('43.981988');
     expect(serialized).toContain('معلومات حساسة');
     expect(serialized).not.toContain('CUS-');
     expect(serialized).not.toContain('+966');
+    expect(body[0]).not.toHaveProperty('address');
+    expect(body[0]).not.toHaveProperty('location');
+    expect(body[0]).not.toHaveProperty('latitude');
+    expect(body[0]).not.toHaveProperty('longitude');
+    expect(body[0]).not.toHaveProperty('customerId');
+    expect(body[0]).not.toHaveProperty('customerName');
+    expect(body[0]).not.toHaveProperty('phone');
+    expect(body[0]).not.toHaveProperty('email');
   });
 
   it('excludes unverified, unavailable, and non-matching providers from automatic invitations', async () => {

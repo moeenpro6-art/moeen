@@ -387,8 +387,8 @@ export class AppController {
       limits: {
         fileSize: MAX_REQUEST_IMAGE_BYTES,
         files: MAX_REQUEST_IMAGES,
-        fields: 4,
-        parts: MAX_REQUEST_IMAGES + 10,
+        fields: 5,
+        parts: MAX_REQUEST_IMAGES + 5,
       },
     }),
   )
@@ -408,24 +408,33 @@ export class AppController {
     // so CustomerSessionGuard authenticates and rejects missing/invalid/
     // expired sessions BEFORE the bounded Multer parsing below. Only after
     // the guard passes can multipart parts reach this handler; the
-    // interceptor's Multer limits (5 files, 5 MiB per file, 4 fields,
-    // 9 parts) bound the parsed stream, and the aggregate 20 MiB check runs
+    // interceptor's Multer limits (5 files, 5 MiB per file, 5 fields,
+    // 10 parts) bound the parsed stream, and the aggregate 20 MiB check runs
     // here before any image canonicalization/storage work.
     const isMultipart =
       contentType?.split(';')[0]?.trim().toLowerCase() ===
       'multipart/form-data';
     if (!isMultipart) {
-      return this.appService.createAuthenticatedServiceRequest(
-        request.customer,
-        body,
-      );
+      const hasLocation =
+        typeof body === 'object' &&
+        body !== null &&
+        !Array.isArray(body) &&
+        Object.prototype.hasOwnProperty.call(body, 'location');
+      return hasLocation
+        ? this.appService.createAuthenticatedServiceRequest(
+            request.customer,
+            body,
+            idempotencyKey,
+          )
+        : this.appService.createAuthenticatedServiceRequest(
+            request.customer,
+            body,
+          );
     }
     const idempotencyKeyValue = parseIdempotencyKey(idempotencyKey);
+    const multipartBody = body as Record<string, unknown> | null;
     const normalized = validateCreateServiceRequestMultipart({
-      serviceId: (body as Record<string, unknown> | null)?.serviceId,
-      address: (body as Record<string, unknown> | null)?.address,
-      details: (body as Record<string, unknown> | null)?.details,
-      timing: (body as Record<string, unknown> | null)?.timing,
+      ...(multipartBody ?? {}),
       images: images ?? [],
     });
     if (

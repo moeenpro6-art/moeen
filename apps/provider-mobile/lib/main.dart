@@ -111,17 +111,20 @@ class ProviderJob {
   const ProviderJob({
     required this.id,
     required this.serviceId,
-    required this.address,
     required this.details,
     required this.timing,
     required this.status,
+    this.address,
     this.quote,
     this.customerPhone,
   });
 
   final String id;
   final String serviceId;
-  final String address;
+
+  /// Exact address is present only while the assigned job is active. The API
+  /// deliberately removes it from terminal history responses.
+  final String? address;
   final String? details;
   final String timing;
   final String status;
@@ -137,7 +140,7 @@ class ProviderJob {
     return ProviderJob(
       id: json['id'] as String,
       serviceId: json['serviceId'] as String,
-      address: json['address'] as String,
+      address: json['address'] as String?,
       details: json['details'] as String?,
       timing: json['timing'] as String,
       status: json['status'] as String,
@@ -1304,8 +1307,10 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
             ),
             const SizedBox(height: 6),
             Text(job.id, style: const TextStyle(color: Color(0xFF66807D))),
-            const SizedBox(height: 4),
-            Text(job.address),
+            if (job.address?.isNotEmpty ?? false) ...[
+              const SizedBox(height: 4),
+              Text(job.address!),
+            ],
             if (job.details?.isNotEmpty ?? false) ...[
               const SizedBox(height: 4),
               Text(job.details!),

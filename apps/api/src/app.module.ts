@@ -40,6 +40,10 @@ import {
   requestImageConfigFromEnvironment,
 } from './request-image.config';
 import type { RequestImageConfig } from './request-image.config';
+import {
+  SERVICE_LOCATION_CONFIG,
+  serviceLocationConfigFromEnvironment,
+} from './service-location.config';
 @Module({
   imports: [],
   controllers: [AppController],
@@ -48,6 +52,10 @@ import type { RequestImageConfig } from './request-image.config';
     CustomerAuthService,
     ProviderAuthService,
     RequestImageService,
+    {
+      provide: SERVICE_LOCATION_CONFIG,
+      useFactory: () => serviceLocationConfigFromEnvironment(process.env),
+    },
     {
       provide: REQUEST_IMAGE_CONFIG,
       useFactory: () => requestImageConfigFromEnvironment(process.env),

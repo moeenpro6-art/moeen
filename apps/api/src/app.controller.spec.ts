@@ -1,4 +1,4 @@
-import { NotFoundException } from '@nestjs/common';
+import { ForbiddenException, NotFoundException } from '@nestjs/common';
 import { AppController } from './app.controller';
 import type { AppService } from './app.service';
 import type { StaffAuditService } from './staff-audit.service';
@@ -431,6 +431,64 @@ describe('AppController staff audit integration', () => {
       ),
     ).resolves.toEqual(events);
     expect(appService.getServiceRequestEvents).toHaveBeenCalledWith('MOE-1048');
+  });
+
+  it.each(['admin', 'dispatcher'] as const)(
+    'returns exact confirmed service location to authorized %s staff',
+    async (role) => {
+      const requests = [
+        {
+          id: 'MOE-1048',
+          serviceId: 'ac-cleaning',
+          address: 'حي الصفراء، بريدة',
+          timing: 'scheduled' as const,
+          status: 'assigned' as const,
+          location: {
+            point: { latitude: 26.359123, longitude: 43.981988 },
+            displayAddress: 'حي الصفراء، بريدة',
+            source: 'map_pin' as const,
+            confirmedAt: '2026-08-21T12:00:00.000Z',
+          },
+          createdAt: '2026-08-21T12:00:00.000Z',
+        },
+      ];
+      const appService = {
+        getServiceRequests: jest.fn().mockResolvedValue(requests),
+      };
+      const staffAuthService = {
+        getCurrentStaff: jest.fn().mockResolvedValue({ ...actor, role }),
+      };
+      const controller = new AppController(
+        appService as unknown as AppService,
+        staffAuthService as unknown as StaffAuthService,
+        {} as StaffAuditService,
+        {} as CustomerAuthService,
+      );
+
+      await expect(
+        controller.getServiceRequests('Bearer staff-session'),
+      ).resolves.toEqual(requests);
+    },
+  );
+
+  it('does not expand broad service-request access to support agents', async () => {
+    const appService = { getServiceRequests: jest.fn() };
+    const staffAuthService = {
+      getCurrentStaff: jest
+        .fn()
+        .mockResolvedValue({ ...actor, role: 'support_agent' as const }),
+    };
+    const controller = new AppController(
+      appService as unknown as AppService,
+      staffAuthService as unknown as StaffAuthService,
+      {} as StaffAuditService,
+      {} as CustomerAuthService,
+    );
+
+    await expect(
+      controller.getServiceRequests('Bearer staff-session'),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+    expect(appService.getServiceRequests).not.toHaveBeenCalled();
   });
 
   it('passes request status audit metadata without a stale pre-read', async () => {

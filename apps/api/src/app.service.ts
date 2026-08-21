@@ -11,15 +11,27 @@ import {
   RequestImageCreateOrchestrator,
   RequestSubmissionConflictError,
   RequestSubmissionReplayError,
+  parseIdempotencyKey,
   type CreateServiceRequestMultipartResult,
   type ServiceRequestMultipartInput,
   type ServiceRequestSubmissionContext,
 } from './request-image-create.contracts';
-import { RequestImageService } from './request-image.service';
+import {
+  RequestImageService,
+  requestSubmissionFingerprint,
+} from './request-image.service';
 import type {
   RequestImageDto,
   StoredRequestImage,
 } from './request-image.types';
+import {
+  SERVICE_LOCATION_CONFIG,
+  type ServiceLocationConfig,
+} from './service-location.config';
+import {
+  resolveServiceLocation,
+  type ServiceLocation,
+} from './service-location.contracts';
 
 export type LaunchService = {
   id: string;
@@ -31,6 +43,7 @@ export type CreateServiceRequest = {
   address: string;
   details?: string;
   timing: 'as-soon-as-possible' | 'scheduled';
+  location?: ServiceLocation;
 };
 
 const launchServiceIds = new Set([
@@ -47,6 +60,8 @@ const requestTimings = new Set<CreateServiceRequest['timing']>([
 
 export function validateCreateServiceRequest(
   input: unknown,
+  locationConfig: ServiceLocationConfig = { mode: 'off' },
+  now: () => Date = () => new Date(),
 ): CreateServiceRequest {
   if (typeof input !== 'object' || input === null || Array.isArray(input)) {
     throw new BadRequestException('Invalid service request');
@@ -57,13 +72,19 @@ export function validateCreateServiceRequest(
   const address = candidate.address;
   const timing = candidate.timing;
   const details = candidate.details;
+  const location = candidate.location;
+  const allowedKeys = new Set([
+    'serviceId',
+    'address',
+    'details',
+    'timing',
+    'location',
+  ]);
 
   if (
+    Object.keys(candidate).some((key) => !allowedKeys.has(key)) ||
     typeof serviceId !== 'string' ||
     !launchServiceIds.has(serviceId) ||
-    typeof address !== 'string' ||
-    address.trim().length < 3 ||
-    address.trim().length > 240 ||
     typeof timing !== 'string' ||
     !requestTimings.has(timing as CreateServiceRequest['timing']) ||
     (details !== undefined &&
@@ -72,12 +93,21 @@ export function validateCreateServiceRequest(
     throw new BadRequestException('Invalid service request');
   }
 
+  const resolvedLocation = resolveServiceLocation(
+    address,
+    location,
+    locationConfig,
+    now,
+  );
   const normalizedDetails = details?.trim();
   return {
     serviceId,
-    address: address.trim(),
+    address: resolvedLocation.address,
     timing: timing as CreateServiceRequest['timing'],
     ...(normalizedDetails ? { details: normalizedDetails } : {}),
+    ...(resolvedLocation.location
+      ? { location: resolvedLocation.location }
+      : {}),
   };
 }
 
@@ -134,13 +164,10 @@ export type ProviderOpportunityStatus =
   'invited' | 'quoted' | 'withdrawn' | 'closed' | 'rejected';
 
 /**
- * Public, pre-assignment-safe provider opportunity projection. `address`,
- * `details` and `images` are present ONLY when the authenticated provider
- * owns the opportunity and it is in an actually eligible/current state
- * (`invited`/`quoted` while the request is still `pending_dispatch`);
- * terminal opportunities (withdrawn/closed/rejected) and non-pending
- * requests never carry them. Customer identity/contact fields are never
- * part of this shape.
+ * Public provider-opportunity projection. Eligible invited/quoted providers
+ * receive the request description and signed image DTOs needed to price the
+ * work, but exact address/coordinates and customer identity/contact data are
+ * never part of this shape.
  */
 export type ProviderOpportunity = {
   requestId: string;
@@ -148,7 +175,6 @@ export type ProviderOpportunity = {
   timing: ServiceRequest['timing'];
   opportunityStatus: ProviderOpportunityStatus;
   myQuote?: ServiceQuote;
-  address?: string;
   details?: string;
   images?: RequestImageDto[];
 };
@@ -221,6 +247,40 @@ export type ServiceRequest = CreateServiceRequest & {
   customerPhone?: string;
   createdAt: string;
 };
+
+const ACTIVE_PROVIDER_LOCATION_STATUSES = new Set<ServiceRequestStatus>([
+  'assigned',
+  'on_the_way',
+  'in_progress',
+]);
+
+/**
+ * Explicit provider projection for assigned jobs. Exact address, details,
+ * customer contact, images and confirmed coordinates exist only while the
+ * assignment is active; terminal history is rebuilt from a safe whitelist.
+ */
+export function projectServiceRequestForProvider(
+  request: ServiceRequest,
+):
+  | ServiceRequest
+  | Omit<
+      ServiceRequest,
+      'address' | 'details' | 'images' | 'customerPhone' | 'location'
+    > {
+  if (ACTIVE_PROVIDER_LOCATION_STATUSES.has(request.status)) return request;
+  return {
+    id: request.id,
+    serviceId: request.serviceId,
+    timing: request.timing,
+    status: request.status,
+    assignedProvider: request.assignedProvider,
+    quote: request.quote,
+    payment: request.payment,
+    rating: request.rating,
+    ratingComment: request.ratingComment,
+    createdAt: request.createdAt,
+  };
+}
 
 export type Provider = {
   id: string;
@@ -402,6 +462,10 @@ export class AppService {
     @Inject(ServiceRequestRepository)
     private readonly serviceRequestStore: ServiceRequestStore,
     private readonly requestImageService: RequestImageService = undefined as never,
+    @Inject(SERVICE_LOCATION_CONFIG)
+    private readonly serviceLocationConfig: ServiceLocationConfig = {
+      mode: 'off',
+    },
   ) {}
 
   getHello(): string {
@@ -426,14 +490,44 @@ export class AppService {
     return this.createAuthenticatedServiceRequest(customer, input);
   }
 
-  createAuthenticatedServiceRequest(
+  async createAuthenticatedServiceRequest(
     customer: Customer,
     input: unknown,
+    idempotencyKey?: string,
   ): Promise<ServiceRequest> {
-    return this.serviceRequestStore.create(
-      validateCreateServiceRequest(input),
-      customer.id,
+    const request = validateCreateServiceRequest(
+      input,
+      this.serviceLocationConfig,
     );
+    if (!request.location) {
+      return this.serviceRequestStore.create(request, customer.id);
+    }
+
+    const clientSubmissionId = parseIdempotencyKey(idempotencyKey);
+    const submission: ServiceRequestSubmissionContext = {
+      clientSubmissionId,
+      submissionFingerprint: requestSubmissionFingerprint(request, []),
+    };
+    try {
+      return await this.serviceRequestStore.create(
+        request,
+        customer.id,
+        submission,
+      );
+    } catch (error) {
+      if (error instanceof RequestSubmissionReplayError) {
+        const original =
+          await this.serviceRequestStore.findRequestByCustomerSubmission(
+            customer.id,
+            clientSubmissionId,
+          );
+        if (original) return original;
+      }
+      if (error instanceof RequestSubmissionConflictError) {
+        throw new ConflictException(error.message);
+      }
+      throw error;
+    }
   }
 
   /**
@@ -471,13 +565,17 @@ export class AppService {
   ): Promise<ServiceRequest & CreateServiceRequestMultipartResult> {
     const orchestrator = this.imageOrchestrator();
     const canonical = await orchestrator.canonicalizeImages(input.images);
-    const createInput = {
-      serviceId: input.serviceId,
-      address: input.address,
-      details: input.details,
-      timing: input.timing,
-    };
-    const submissionFingerprint = await orchestrator.computeFingerprint(
+    const createInput = validateCreateServiceRequest(
+      {
+        serviceId: input.serviceId,
+        address: input.address,
+        details: input.details,
+        timing: input.timing,
+        location: input.location,
+      },
+      this.serviceLocationConfig,
+    );
+    const submissionFingerprint = orchestrator.computeFingerprint(
       createInput,
       canonical,
     );
@@ -765,10 +863,19 @@ export class AppService {
   ): Promise<ServiceRequest[]> {
     const requests =
       await this.serviceRequestStore.findByProviderId(providerId);
-    return this.attachImagesToRequests(requests);
+    const active = requests.filter((request) =>
+      ACTIVE_PROVIDER_LOCATION_STATUSES.has(request.status),
+    );
+    const withImages = await this.attachImagesToRequests(active);
+    const activeById = new Map(
+      withImages.map((request) => [request.id, request]),
+    );
+    return requests.map((request) =>
+      projectServiceRequestForProvider(activeById.get(request.id) ?? request),
+    ) as ServiceRequest[];
   }
 
-  updateProviderServiceRequestStatus(
+  async updateProviderServiceRequestStatus(
     providerId: string,
     requestId: string,
     status: Extract<
@@ -776,11 +883,12 @@ export class AppService {
       'on_the_way' | 'in_progress' | 'completed'
     >,
   ): Promise<ServiceRequest> {
-    return this.serviceRequestStore.updateStatusForProvider(
+    const updated = await this.serviceRequestStore.updateStatusForProvider(
       requestId,
       providerId,
       status,
     );
+    return projectServiceRequestForProvider(updated) as ServiceRequest;
   }
 
   assignProvider(
@@ -861,11 +969,9 @@ export class AppService {
   ): Promise<ProviderOpportunity[]> {
     const opportunities =
       await this.serviceRequestStore.listProviderOpportunities(providerId);
-    // Authorization derives exclusively from the server-side listing: the
-    // store only returns opportunities owned by `providerId` (which itself
-    // comes from the authenticated principal, never from the client). The
-    // signed image lookup below is restricted to opportunities that are in
-    // an actually eligible/current state.
+    // The repository derives ownership from the authenticated provider id.
+    // Sign images only for opportunities that are still eligible to quote;
+    // terminal/ineligible rows never trigger an image metadata read.
     const eligibleRequestIds = opportunities
       .filter((opportunity) => this.isEligiblePreQuoteOpportunity(opportunity))
       .map((opportunity) => opportunity.requestId);
@@ -966,10 +1072,9 @@ export class AppService {
   }
 
   /**
-   * Pre-quote eligibility uses ONLY the real opportunity state machine:
-   * `invited`/`quoted` opportunities are current while the request is still
-   * `pending_dispatch`; withdrawn/closed/rejected opportunities and requests
-   * that left `pending_dispatch` never retain pre-assignment visibility.
+   * Pre-quote eligibility uses only server-side lifecycle state. Invited or
+   * quoted opportunities remain eligible while the request is pending
+   * dispatch; terminal opportunities and requests that moved on do not.
    */
   private isEligiblePreQuoteOpportunity(
     opportunity: ProviderOpportunityAccess,
@@ -981,11 +1086,10 @@ export class AppService {
   }
 
   /**
-   * Whitelist projection for provider opportunities. Ineligible
-   * opportunities keep ONLY the pre-existing base fields; the protected
-   * pre-assignment fields (address/details/images) are attached exclusively
-   * to eligible opportunities. Customer identity/contact fields are never
-   * present because this shape never carries them.
+   * Fixed whitelist projection for provider opportunities. Eligible owners
+   * receive description/images needed to quote. Exact address/coordinates,
+   * customer identity/contact, auth/session data, and storage metadata are
+   * never copied from the store projection.
    */
   private toProviderOpportunityDto(
     opportunity: ProviderOpportunityAccess,
@@ -1017,7 +1121,6 @@ export class AppService {
     }
     return {
       ...base,
-      address: opportunity.address,
       details: opportunity.details,
       images: signedImagesByRequest.get(opportunity.requestId) ?? [],
     };

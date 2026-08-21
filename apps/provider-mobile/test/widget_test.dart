@@ -62,16 +62,54 @@ void main() {
     expect(job.customerPhone, '+966****0012');
   });
 
-  test('provider job parsing yields no customer phone when the API omits it', () {
+  test('provider job parsing accepts terminal history without private fields', () {
     final job = ProviderJob.fromJson({
       'id': 'MOE-1004',
       'serviceId': 'ac-cleaning',
-      'address': 'حي الصفراء، بريدة',
       'timing': 'as-soon-as-possible',
       'status': 'completed',
     });
 
+    expect(job.address, isNull);
     expect(job.customerPhone, isNull);
+  });
+
+  test('provider api parses a terminal job in the assigned-job list', () async {
+    final api = ProviderApi(
+      baseUrl: 'https://api.example.test',
+      client: MockClient(
+        (_) async => http.Response(
+          '[{"id":"MOE-1005","serviceId":"ac-cleaning",'
+          '"timing":"as-soon-as-possible","status":"completed"}]',
+          200,
+          headers: _jsonUtf8,
+        ),
+      ),
+    );
+
+    final jobs = await api.jobs('provider-token');
+
+    expect(jobs, hasLength(1));
+    expect(jobs.single.status, 'completed');
+    expect(jobs.single.address, isNull);
+  });
+
+  test('provider api parses an address-redacted completed PATCH response', () async {
+    final api = ProviderApi(
+      baseUrl: 'https://api.example.test',
+      client: MockClient(
+        (_) async => http.Response(_jobCompletedJson, 200, headers: _jsonUtf8),
+      ),
+    );
+
+    final job = await api.updateJobStatus(
+      'provider-token',
+      'MOE-2003',
+      'completed',
+    );
+
+    expect(job.status, 'completed');
+    expect(job.address, isNull);
   });
 
   test('provider api reports a 401 as an unauthorized exception', () async {
@@ -268,8 +306,7 @@ void main() {
         if (path == '/provider/service-requests') {
           return http.Response(
             '[{"id":"MOE-1001","serviceId":"ac-cleaning",'
-            '"address":"حي الصفراء، بريدة","timing":"as-soon-as-possible",'
-            '"status":"completed"}]',
+            '"timing":"as-soon-as-possible","status":"completed"}]',
             200,
             headers: _jsonUtf8,
           );
@@ -931,13 +968,12 @@ void main() {
     expect(find.text('إخفاء من قائمتي'), findsOneWidget);
   });
 
-  test('ProviderOpportunity parses pre-quote address, details and images', () {
+  test('ProviderOpportunity parses pre-quote details and images', () {
     final opp = ProviderOpportunity.fromJson({
       'requestId': 'MOE-30',
       'serviceId': 'ac-cleaning',
       'timing': 'scheduled',
       'opportunityStatus': 'invited',
-      'address': 'حي الصفراء، بريدة',
       'details': 'مكيف سبليت لا يبرد',
       'images': [
         {
@@ -958,7 +994,7 @@ void main() {
       ],
     } as Map<String, dynamic>);
 
-    expect(opp.address, 'حي الصفراء، بريدة');
+    expect(opp.address, isNull);
     expect(opp.details, 'مكيف سبليت لا يبرد');
     expect(opp.images, hasLength(2));
     // Server sort order is preserved exactly as returned.
@@ -1004,8 +1040,8 @@ void main() {
   });
 
   testWidgets(
-    'an invited opportunity renders service, timing, address, details and '
-    'image thumbnails before quoting',
+    'an invited opportunity renders service, timing, details and image '
+    'thumbnails without an exact address before quoting',
     (tester) async {
       final store = _MemorySessionStore()..token = 'stale-token';
       final api = ProviderApi(
@@ -1030,7 +1066,7 @@ void main() {
 
       expect(find.text('تنظيف المكيفات'), findsOneWidget);
       expect(find.text('موعد محدد · مدعو'), findsOneWidget);
-      expect(find.text('حي الصفراء، بريدة'), findsOneWidget);
+      expect(find.text('حي الصفراء، بريدة'), findsNothing);
       expect(find.text('مكيف سبليت لا يبرد'), findsOneWidget);
       // Network images fail in the test environment; the failure state tile
       // proves the thumbnail gallery rendered with a safe fallback.
@@ -1113,7 +1149,7 @@ const _opportunitiesInvitedJson =
 const _opportunitiesInvitedWithImagesJson =
     '[{"requestId":"MOE-30","serviceId":"ac-cleaning",'
     '"timing":"scheduled","opportunityStatus":"invited",'
-    '"address":"حي الصفراء، بريدة","details":"مكيف سبليت لا يبرد",'
+    '"details":"مكيف سبليت لا يبرد",'
     '"images":['
     '{"id":"img-1","mimeType":"image/jpeg","byteSize":1024,"sortOrder":0,'
     '"url":"https://signed.example.test/img-1?sig=a",'
@@ -1179,8 +1215,7 @@ const _jobInProgressJson =
 
 const _jobCompletedJson =
     '{"id":"MOE-2003","serviceId":"ac-cleaning",'
-    '"address":"حي الصفراء، بريدة","timing":"as-soon-as-possible",'
-    '"status":"completed"}';
+    '"timing":"as-soon-as-possible","status":"completed"}';
 
 MockClient _dashboardMockClient({
   required Future<http.Response> Function(http.Request) opportunitiesHandler,

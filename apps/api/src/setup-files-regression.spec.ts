@@ -75,6 +75,36 @@ describe('setupFiles regression (Jest 30.4.1)', () => {
       expect(marker.rows).toHaveLength(1);
       expect(marker.rows[0].run_id).toBe(runId);
       expect(marker.rows[0].owner_token_hash).toBe(expectedHash);
+
+      // 4) The worker bootstrap must apply the same ordered migration manifest
+      //    used by the application before any repository initializes. This is
+      //    the regression boundary for new migrations: a worker schema may not
+      //    silently stop at an older hand-maintained repository schema.
+      const history = await pool.query<{ version: string }>(
+        'SELECT version FROM moeen_schema_migrations ORDER BY version',
+      );
+      expect(history.rows).toEqual([
+        { version: '0001' },
+        { version: '0002' },
+        { version: '0003' },
+        { version: '0004' },
+        { version: '0005' },
+      ]);
+
+      const locationColumns = await pool.query<{ column_name: string }>(
+        `SELECT column_name
+           FROM information_schema.columns
+          WHERE table_schema = current_schema()
+            AND table_name = 'service_requests'
+            AND column_name LIKE 'location_%'
+          ORDER BY column_name`,
+      );
+      expect(locationColumns.rows).toEqual([
+        { column_name: 'location_confirmed_at' },
+        { column_name: 'location_latitude' },
+        { column_name: 'location_longitude' },
+        { column_name: 'location_source' },
+      ]);
     } finally {
       await pool.end();
     }
