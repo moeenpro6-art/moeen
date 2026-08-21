@@ -5,8 +5,16 @@ import {
   ConflictException,
   UnauthorizedException,
 } from '@nestjs/common';
-import { ServiceRequestRepository } from './service-request.repository';
+import {
+  ServiceRequestRepository,
+  type ProviderCurrentPosition,
+  type ProviderLocationSubmissionResult,
+} from './service-request.repository';
 import type { StaffAuditSpec } from './staff-auth.repository';
+import {
+  validateProviderLocationSample,
+  type ProviderLocationSample,
+} from './provider-tracking';
 import {
   RequestImageCreateOrchestrator,
   RequestSubmissionConflictError,
@@ -391,6 +399,23 @@ export interface ServiceRequestStore {
       'on_the_way' | 'in_progress' | 'completed'
     >,
   ): Promise<ServiceRequest>;
+  submitProviderLocationSample(
+    requestId: string,
+    providerId: string,
+    sample: ProviderLocationSample,
+  ): Promise<ProviderLocationSubmissionResult>;
+  findCurrentProviderPositionForProvider(
+    requestId: string,
+    providerId: string,
+  ): Promise<ProviderCurrentPosition | undefined>;
+  findCurrentProviderPositionForCustomer(
+    requestId: string,
+    customerId: string,
+  ): Promise<ProviderCurrentPosition | undefined>;
+  findCurrentProviderPositionForOperations(
+    requestId: string,
+  ): Promise<ProviderCurrentPosition | undefined>;
+  stopProviderTrackingForOperations(requestId: string): Promise<void>;
   proposeQuote(
     requestId: string,
     amountHalalas: number,
@@ -889,6 +914,53 @@ export class AppService {
       status,
     );
     return projectServiceRequestForProvider(updated) as ServiceRequest;
+  }
+
+  submitProviderLocationSample(
+    providerId: string,
+    requestId: string,
+    input: unknown,
+  ): Promise<ProviderLocationSubmissionResult> {
+    return this.serviceRequestStore.submitProviderLocationSample(
+      requestId,
+      providerId,
+      validateProviderLocationSample(input),
+    );
+  }
+
+  getProviderCurrentPosition(
+    providerId: string,
+    requestId: string,
+  ): Promise<ProviderCurrentPosition | undefined> {
+    return this.serviceRequestStore.findCurrentProviderPositionForProvider(
+      requestId,
+      providerId,
+    );
+  }
+
+  async getMyProviderCurrentPosition(
+    token: string,
+    requestId: string,
+  ): Promise<ProviderCurrentPosition | undefined> {
+    const customer = await this.getCustomerForToken(token);
+    return this.serviceRequestStore.findCurrentProviderPositionForCustomer(
+      requestId,
+      customer.id,
+    );
+  }
+
+  getOperationsProviderCurrentPosition(
+    requestId: string,
+  ): Promise<ProviderCurrentPosition | undefined> {
+    return this.serviceRequestStore.findCurrentProviderPositionForOperations(
+      requestId,
+    );
+  }
+
+  stopProviderTrackingForOperations(requestId: string): Promise<void> {
+    return this.serviceRequestStore.stopProviderTrackingForOperations(
+      requestId,
+    );
   }
 
   assignProvider(

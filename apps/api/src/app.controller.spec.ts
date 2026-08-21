@@ -1,4 +1,9 @@
-import { ForbiddenException, NotFoundException } from '@nestjs/common';
+import {
+  ConflictException,
+  ForbiddenException,
+  NotFoundException,
+  UnauthorizedException,
+} from '@nestjs/common';
 import { AppController } from './app.controller';
 import type { AppService } from './app.service';
 import type { StaffAuditService } from './staff-audit.service';
@@ -6,6 +11,135 @@ import type { StaffAuthService } from './staff-auth.service';
 import type { CustomerAuthService } from './customer-auth.service';
 import type { ProviderAuthService } from './provider-auth.service';
 import { ProviderUnavailableForApprovalError } from './service-request.repository';
+
+describe('AppController provider tracking authorization', () => {
+  const position = {
+    requestId: 'MOE-1001',
+    latitude: 26.359123,
+    longitude: 43.981988,
+    accuracyMeters: 10,
+    capturedAt: '2026-08-21T12:00:00.000Z',
+    receivedAt: '2026-08-21T12:00:01.000Z',
+    arrivalObserved: false,
+  };
+
+  it('derives provider authority from the session and never accepts providerId in the body', async () => {
+    const appService = {
+      submitProviderLocationSample: jest.fn().mockResolvedValue({
+        ...position,
+        duplicate: false,
+      }),
+    };
+    const providerAuthService = {
+      getCurrentProvider: jest.fn().mockResolvedValue({ id: 'provider-owner' }),
+    };
+    const controller = createTrackingController(
+      appService,
+      {},
+      providerAuthService,
+    );
+
+    await controller.submitMyProviderLocation(
+      'Bearer provider-session',
+      position.requestId,
+      {
+        latitude: position.latitude,
+        longitude: position.longitude,
+        accuracyMeters: position.accuracyMeters,
+        capturedAt: position.capturedAt,
+      },
+    );
+
+    expect(appService.submitProviderLocationSample).toHaveBeenCalledWith(
+      'provider-owner',
+      position.requestId,
+      expect.objectContaining({ latitude: position.latitude }),
+    );
+  });
+
+  it('permits admin/dispatcher operations reads and denies support', async () => {
+    const appService = {
+      getOperationsProviderCurrentPosition: jest
+        .fn()
+        .mockResolvedValue(position),
+    };
+    const staffAuthService = {
+      getCurrentStaff: jest
+        .fn()
+        .mockResolvedValueOnce({ ...actor, role: 'dispatcher' })
+        .mockResolvedValueOnce({ ...actor, role: 'support_agent' }),
+    };
+    const controller = createTrackingController(
+      appService,
+      staffAuthService,
+      {},
+    );
+
+    await expect(
+      controller.getOperationsProviderCurrentPosition(
+        'Bearer dispatcher-session',
+        position.requestId,
+      ),
+    ).resolves.toEqual(position);
+    await expect(
+      controller.getOperationsProviderCurrentPosition(
+        'Bearer support-session',
+        position.requestId,
+      ),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+  });
+
+  it('denies an unauthenticated provider current-position read', async () => {
+    const providerAuthService = {
+      getCurrentProvider: jest
+        .fn()
+        .mockRejectedValue(new UnauthorizedException('Unauthorized')),
+    };
+    const controller = createTrackingController({}, {}, providerAuthService);
+
+    await expect(
+      controller.getMyProviderCurrentPosition(undefined, position.requestId),
+    ).rejects.toBeInstanceOf(UnauthorizedException);
+  });
+
+  it('maps staff attempts to start tracking to a deliberate conflict', async () => {
+    const appService = {
+      updateStatus: jest
+        .fn()
+        .mockRejectedValue(
+          new Error('Provider must start tracking through the provider action'),
+        ),
+    };
+    const staffAuthService = {
+      getCurrentStaff: jest.fn().mockResolvedValue(actor),
+    };
+    const controller = createTrackingController(
+      appService,
+      staffAuthService,
+      {},
+    );
+
+    await expect(
+      controller.updateStatus('Bearer dispatcher-session', position.requestId, {
+        status: 'on_the_way',
+      }),
+    ).rejects.toBeInstanceOf(ConflictException);
+  });
+
+  function createTrackingController(
+    appService: object,
+    staffAuthService: object,
+    providerAuthService: object,
+  ): AppController {
+    return new AppController(
+      appService as AppService,
+      staffAuthService as StaffAuthService,
+      {} as StaffAuditService,
+      {} as CustomerAuthService,
+      providerAuthService as ProviderAuthService,
+    );
+  }
+});
 
 const actor = {
   id: 'STF-1001',

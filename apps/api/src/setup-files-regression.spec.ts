@@ -89,6 +89,7 @@ describe('setupFiles regression (Jest 30.4.1)', () => {
         { version: '0003' },
         { version: '0004' },
         { version: '0005' },
+        { version: '0006' },
       ]);
 
       const locationColumns = await pool.query<{ column_name: string }>(

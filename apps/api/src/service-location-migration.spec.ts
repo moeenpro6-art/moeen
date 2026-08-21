@@ -8,8 +8,12 @@ import {
 describe('service request location migration', () => {
   it('ships 0005 after the immutable 0001-0004 history', async () => {
     const migrations = await loadMigrations(defaultMigrationsDirectory());
-    expect(migrations.at(-1)).toMatchObject({
-      version: '0005',
+    expect(migrations.map((migration) => migration.version)).toEqual(
+      expect.arrayContaining(['0001', '0002', '0003', '0004', '0005']),
+    );
+    expect(
+      migrations.find((migration) => migration.version === '0005'),
+    ).toMatchObject({
       filename: '0005_service_request_locations.sql',
     });
   });

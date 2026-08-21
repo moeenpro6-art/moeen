@@ -11,6 +11,8 @@
     "migrate": "node dist/database-migrate.js",
     "migrate:dev": "node -r ts-node/register src/database-migrate.ts",
     "reconcile:request-images": "node -r ts-node/register scripts/reconcile-request-images.ts",
+    "retention:provider-tracking": "node dist/scripts/prune-provider-tracking.js",
+    "retention:provider-tracking:dev": "node -r ts-node/register scripts/prune-provider-tracking.ts",
     "start": "nest start",
     "start:dev": "nest start --watch",
     "start:debug": "nest start --debug --watch",

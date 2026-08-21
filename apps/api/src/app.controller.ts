@@ -190,14 +190,71 @@ export class AppController {
       }
       if (
         error instanceof Error &&
-        ['Invalid status transition', 'Quote approval required'].includes(
-          error.message,
-        )
+        [
+          'Invalid status transition',
+          'Quote approval required',
+          'Provider is not eligible for tracking',
+        ].includes(error.message)
       ) {
         throw new ConflictException(error.message);
       }
       throw error;
     }
+  }
+
+  @Post('provider/service-requests/:id/location')
+  async submitMyProviderLocation(
+    @Headers('authorization') authorization: string | undefined,
+    @Param('id') requestId: string,
+    @Body() body: unknown,
+  ): Promise<
+    import('./service-request.repository').ProviderLocationSubmissionResult
+  > {
+    const provider = await this.providerAuthService.getCurrentProvider(
+      this.extractBearerToken(authorization),
+    );
+    try {
+      return await this.appService.submitProviderLocationSample(
+        provider.id,
+        requestId,
+        body,
+      );
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        error.message === 'Active provider tracking request not found'
+      ) {
+        throw new NotFoundException(error.message);
+      }
+      if (
+        error instanceof Error &&
+        [
+          'Provider tracking is not enabled',
+          'Provider location sample is out of order',
+          'Provider location sample predates tracking activation',
+          'Provider location sample conflicts with existing data',
+        ].includes(error.message)
+      ) {
+        throw new ConflictException(error.message);
+      }
+      throw error;
+    }
+  }
+
+  @Get('provider/service-requests/:id/location')
+  async getMyProviderCurrentPosition(
+    @Headers('authorization') authorization: string | undefined,
+    @Param('id') requestId: string,
+  ): Promise<import('./service-request.repository').ProviderCurrentPosition> {
+    const provider = await this.providerAuthService.getCurrentProvider(
+      this.extractBearerToken(authorization),
+    );
+    const position = await this.appService.getProviderCurrentPosition(
+      provider.id,
+      requestId,
+    );
+    if (!position) throw new NotFoundException('Provider location not found');
+    return position;
   }
 
   @Post('admin/auth/login')
@@ -469,6 +526,19 @@ export class AppController {
       this.extractBearerToken(authorization),
       requestId,
     );
+  }
+
+  @Get('my/service-requests/:id/provider-location')
+  async getMyServiceRequestProviderPosition(
+    @Headers('authorization') authorization: string | undefined,
+    @Param('id') requestId: string,
+  ): Promise<import('./service-request.repository').ProviderCurrentPosition> {
+    const position = await this.appService.getMyProviderCurrentPosition(
+      this.extractBearerToken(authorization),
+      requestId,
+    );
+    if (!position) throw new NotFoundException('Provider location not found');
+    return position;
   }
 
   @Post('my/service-requests/:id/quotes/:quoteId/decision')
@@ -853,9 +923,11 @@ export class AppController {
     } catch (error) {
       if (
         error instanceof Error &&
-        ['Invalid status transition', 'Quote approval required'].includes(
-          error.message,
-        )
+        [
+          'Invalid status transition',
+          'Quote approval required',
+          'Provider must start tracking through the provider action',
+        ].includes(error.message)
       ) {
         throw new ConflictException(error.message);
       }
@@ -870,6 +942,44 @@ export class AppController {
   ): Promise<import('./app.service').ServiceRequestEvent[]> {
     await this.requireStaff(authorization, ['admin', 'dispatcher']);
     return this.appService.getServiceRequestEvents(requestId);
+  }
+
+  @Get('service-requests/:id/provider-location')
+  async getOperationsProviderCurrentPosition(
+    @Headers('authorization') authorization: string | undefined,
+    @Param('id') requestId: string,
+  ): Promise<import('./service-request.repository').ProviderCurrentPosition> {
+    await this.requireStaff(authorization, ['admin', 'dispatcher']);
+    const position =
+      await this.appService.getOperationsProviderCurrentPosition(requestId);
+    if (!position) throw new NotFoundException('Provider location not found');
+    return position;
+  }
+
+  @Post('service-requests/:id/provider-location/stop')
+  async stopOperationsProviderTracking(
+    @Headers('authorization') authorization: string | undefined,
+    @Param('id') requestId: string,
+  ): Promise<{ stopped: true }> {
+    await this.requireStaff(authorization, ['admin']);
+    try {
+      await this.appService.stopProviderTrackingForOperations(requestId);
+      return { stopped: true };
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        error.message === 'Service request not found'
+      ) {
+        throw new NotFoundException(error.message);
+      }
+      if (
+        error instanceof Error &&
+        error.message === 'Provider tracking is not enabled'
+      ) {
+        throw new ConflictException(error.message);
+      }
+      throw error;
+    }
   }
 
   @Get('service-requests')

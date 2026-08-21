@@ -44,6 +44,10 @@ import {
   SERVICE_LOCATION_CONFIG,
   serviceLocationConfigFromEnvironment,
 } from './service-location.config';
+import {
+  PROVIDER_TRACKING_CONFIG,
+  providerTrackingConfigFromEnvironment,
+} from './provider-tracking.config';
 @Module({
   imports: [],
   controllers: [AppController],
@@ -55,6 +59,10 @@ import {
     {
       provide: SERVICE_LOCATION_CONFIG,
       useFactory: () => serviceLocationConfigFromEnvironment(process.env),
+    },
+    {
+      provide: PROVIDER_TRACKING_CONFIG,
+      useFactory: () => providerTrackingConfigFromEnvironment(process.env),
     },
     {
       provide: REQUEST_IMAGE_CONFIG,

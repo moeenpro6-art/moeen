@@ -104,9 +104,18 @@ async function createProviderAuthorization(
     .post('/provider/auth/login')
     .send({ accessCode })
     .expect(201);
+  const authorization = `Bearer ${requiredString(login.body, 'token')}`;
+  // Device-registration tests do not need marketplace availability. Keeping
+  // these shared-worker providers unavailable prevents unrelated legacy-flow
+  // requests from being auto-invited to them.
+  await request(app.getHttpServer())
+    .patch('/provider/availability')
+    .set('Authorization', authorization)
+    .send({ available: false })
+    .expect(200);
   return {
     providerId,
-    authorization: `Bearer ${requiredString(login.body, 'token')}`,
+    authorization,
   };
 }
 
