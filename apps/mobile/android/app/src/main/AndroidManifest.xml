@@ -3,6 +3,9 @@
     <!-- Android 13+ runtime notification permission (FCM). Safe no-op on
          older Android versions. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <!-- Requested only after the customer explicitly asks to use current location. -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
     <application
         android:label="moeen_mobile"
         android:name="${applicationName}"

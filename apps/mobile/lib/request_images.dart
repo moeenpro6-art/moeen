@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
 
@@ -5,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:http_parser/http_parser.dart' show MediaType;
 import 'package:image_picker/image_picker.dart' show ImagePicker;
+import 'service_location.dart';
 
 /// Client-side limits mirror the API contract
 /// (`apps/api/src/request-image.service.ts`):
@@ -172,8 +174,9 @@ String generateUuidV4() {
 /// Lifecycle:
 /// - [keyFor] returns the stored key while the payload snapshot is unchanged,
 ///   and mints a fresh UUID v4 key whenever any request-defining input
-///   changed (service id, address, details, timing, or the ORDERED image
-///   bytes — the same inputs the API folds into its submission fingerprint).
+/// changed (service id, address, details, timing, confirmed service location,
+/// or the ORDERED image bytes — the same inputs the API folds into its
+/// submission fingerprint).
 /// - [clear] drops the stored key. Callers clear after a confirmed 201
 ///   Created (the booking is committed and the key is spent) and after a 409
 ///   idempotency conflict (the server permanently bound that key to
@@ -189,6 +192,7 @@ class BookingSubmissionIdentity {
   String? _address;
   String? _details;
   String? _timing;
+  String? _serviceLocationFingerprint;
   List<Uint8List>? _orderedImageBytes;
 
   String keyFor({
@@ -196,6 +200,7 @@ class BookingSubmissionIdentity {
     required String address,
     required String timing,
     String? details,
+    String? serviceLocationFingerprint,
     required List<Uint8List> orderedImageBytes,
   }) {
     final storedKey = _key;
@@ -205,6 +210,7 @@ class BookingSubmissionIdentity {
         _address == address &&
         _details == details &&
         _timing == timing &&
+        _serviceLocationFingerprint == serviceLocationFingerprint &&
         _imageBytesMatch(_orderedImageBytes!, orderedImageBytes);
     if (!unchanged) {
       _key = generateUuidV4();
@@ -212,6 +218,7 @@ class BookingSubmissionIdentity {
       _address = address;
       _details = details;
       _timing = timing;
+      _serviceLocationFingerprint = serviceLocationFingerprint;
       _orderedImageBytes = List.of(orderedImageBytes);
     }
     return _key!;
@@ -225,6 +232,7 @@ class BookingSubmissionIdentity {
     _address = null;
     _details = null;
     _timing = null;
+    _serviceLocationFingerprint = null;
     _orderedImageBytes = null;
   }
 
@@ -297,8 +305,8 @@ class ImagePickerRequestImagePicker implements RequestImagePicker {
 }
 
 /// Submits a service request with images using the multipart contract:
-/// fields `serviceId`, `address`, `details`, `timing`, files under `images`,
-/// and a UUID v4 `Idempotency-Key` header.
+/// fields `serviceId`, `address`, `details`, `timing`, optional JSON-encoded
+/// `location`, files under `images`, and a UUID v4 `Idempotency-Key` header.
 Future<http.Response> submitServiceRequestWithImages({
   required http.Client client,
   required Uri endpoint,
@@ -308,6 +316,7 @@ Future<http.Response> submitServiceRequestWithImages({
   required String timing,
   String? details,
   required List<SelectedRequestImage> images,
+  ServiceLocationInput? location,
   String? idempotencyKey,
 }) async {
   final multipart = http.MultipartRequest('POST', endpoint)
@@ -319,6 +328,9 @@ Future<http.Response> submitServiceRequestWithImages({
   final normalizedDetails = details?.trim() ?? '';
   if (normalizedDetails.isNotEmpty) {
     multipart.fields['details'] = normalizedDetails;
+  }
+  if (location != null) {
+    multipart.fields['location'] = jsonEncode(location.toJson());
   }
   for (final image in images) {
     multipart.files.add(
