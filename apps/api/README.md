@@ -57,6 +57,28 @@ $ npm run test:e2e
 $ npm run test:cov
 ```
 
+## Provider tracking retention
+
+After `npm run build`, run one bounded production retention batch from
+`apps/api` (this path requires production dependencies only):
+
+```bash
+npm run retention:provider-tracking
+# equivalent: node dist/scripts/prune-provider-tracking.js
+```
+
+For local source-only development, use
+`npm run retention:provider-tracking:dev`.
+
+The production command enforces the approved retention windows: raw location samples
+older than 30 days and stopped derived/session evidence older than 180 days.
+It processes at most 1,000 rows from each class per invocation, uses locked
+bounded batches, and prints counts only. Schedule it repeatedly in production
+(hourly is suitable); when `moreWorkLikely` is true, another scheduled run will
+continue the backlog. Operators may set
+`MOEEN_PROVIDER_TRACKING_RETENTION_BATCH_SIZE` to an integer from 1 through
+10,000 to tune the bounded batch without changing retention ages.
+
 ## Deployment
 
 When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.

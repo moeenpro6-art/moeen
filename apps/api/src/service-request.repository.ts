@@ -58,6 +58,18 @@ import {
   toRequestPublicId,
   type FcmNotificationType,
 } from './notification-templates';
+import {
+  arrivalSampleQualifies,
+  canonicalizeProviderLocationSample,
+  evaluateObservedArrival,
+  haversineDistanceMeters,
+  type ProviderLocationSample,
+} from './provider-tracking';
+import {
+  PROVIDER_TRACKING_CONFIG,
+  providerTrackingConfigFromEnvironment,
+  type ProviderTrackingConfig,
+} from './provider-tracking.config';
 
 type ServiceRequestImageRow = {
   id: string;
@@ -121,6 +133,30 @@ type ServiceRequestEventRow = {
   type: ServiceRequestEventType;
   status: ServiceRequest['status'];
   created_at: Date;
+};
+
+export type ProviderCurrentPosition = {
+  requestId: string;
+  latitude: number;
+  longitude: number;
+  accuracyMeters: number;
+  capturedAt: string;
+  receivedAt: string;
+  arrivalObserved: boolean;
+};
+
+export type ProviderLocationSubmissionResult = ProviderCurrentPosition & {
+  duplicate: boolean;
+};
+
+type CurrentPositionRow = {
+  service_request_id: string;
+  latitude: string | number;
+  longitude: string | number;
+  accuracy_meters: string | number;
+  captured_at: Date;
+  received_at: Date;
+  arrival_observed_at: Date | null;
 };
 
 type ServiceQuoteRow = {
@@ -216,11 +252,15 @@ export class ServiceRequestRepository
   });
 
   private readonly notificationOutbox: NotificationOutboxWriter;
+  private readonly providerTrackingConfig: ProviderTrackingConfig;
 
   constructor(
     @Optional()
     @Inject(NotificationOutboxWriter)
     notificationOutbox?: NotificationOutboxWriter,
+    @Optional()
+    @Inject(PROVIDER_TRACKING_CONFIG)
+    providerTrackingConfig?: ProviderTrackingConfig,
   ) {
     // AppModule injects the shared, fully configured writer. Direct repository
     // construction in focused tests remains supported and follows the same
@@ -228,6 +268,9 @@ export class ServiceRequestRepository
     this.notificationOutbox =
       notificationOutbox ??
       new NotificationOutboxWriter(fcmConfigFromEnvironment(process.env));
+    this.providerTrackingConfig =
+      providerTrackingConfig ??
+      providerTrackingConfigFromEnvironment(process.env);
   }
 
   /**
@@ -1733,6 +1776,32 @@ export class ServiceRequestRepository
       );
       const row = result.rows[0];
       if (!row) throw new Error('Pilot provider not found');
+      if (
+        verificationStatus !== 'verified' &&
+        this.providerTrackingConfig.enabled
+      ) {
+        const activeRequests = await client.query<{
+          service_request_id: number;
+        }>(
+          `UPDATE provider_tracking_sessions
+              SET state = 'stopped', stopped_at = NOW(),
+                  stop_reason = 'provider_suspended'
+            WHERE provider_id = $1 AND state = 'active'
+            RETURNING service_request_id`,
+          [providerId],
+        );
+        if (activeRequests.rows.length > 0) {
+          await client.query(
+            `DELETE FROM provider_current_positions
+              WHERE provider_id = $1
+                AND service_request_id = ANY($2::bigint[])`,
+            [
+              providerId,
+              activeRequests.rows.map((active) => active.service_request_id),
+            ],
+          );
+        }
+      }
       if (audit) {
         await this.insertStaffAuditEvent(
           client,
@@ -1928,6 +1997,62 @@ export class ServiceRequestRepository
     }
   }
 
+  private async startProviderTracking(
+    client: PoolClient,
+    databaseId: number,
+    providerId: string,
+  ): Promise<void> {
+    await client.query(
+      `INSERT INTO provider_tracking_sessions
+         (service_request_id, provider_id, state, started_at)
+       VALUES ($1, $2, 'active', clock_timestamp())
+       ON CONFLICT (service_request_id) DO NOTHING`,
+      [databaseId, providerId],
+    );
+    const active = await client.query<{ provider_id: string; state: string }>(
+      `SELECT provider_id, state
+         FROM provider_tracking_sessions
+        WHERE service_request_id = $1`,
+      [databaseId],
+    );
+    if (
+      active.rows[0]?.provider_id !== providerId ||
+      active.rows[0]?.state !== 'active'
+    ) {
+      throw new Error('Provider tracking could not be started');
+    }
+  }
+
+  private async stopProviderTracking(
+    client: PoolClient,
+    databaseId: number,
+    reason:
+      'completed' | 'cancelled' | 'provider_suspended' | 'operations_emergency',
+  ): Promise<void> {
+    await client.query(
+      `UPDATE provider_tracking_sessions
+          SET state = 'stopped',
+              stopped_at = CASE
+                WHEN state = 'active' THEN NOW()
+                ELSE stopped_at
+              END,
+              stop_reason = $2
+        WHERE service_request_id = $1
+          AND (
+            state = 'active'
+            OR (
+              $2 IN ('completed', 'cancelled')
+              AND stop_reason IN ('provider_suspended', 'operations_emergency')
+            )
+          )`,
+      [databaseId, reason],
+    );
+    await client.query(
+      'DELETE FROM provider_current_positions WHERE service_request_id = $1',
+      [databaseId],
+    );
+  }
+
   async updateStatus(
     requestId: string,
     status: ServiceRequest['status'],
@@ -1961,6 +2086,11 @@ export class ServiceRequestRepository
       if (!currentStatus || !previousStatuses.includes(currentStatus)) {
         throw new Error('Invalid status transition');
       }
+      if (status === 'on_the_way' && this.providerTrackingConfig.enabled) {
+        throw new Error(
+          'Provider must start tracking through the provider action',
+        );
+      }
       if (status === 'in_progress') {
         await this.assertServiceMayStart(client, databaseId);
       }
@@ -1973,6 +2103,9 @@ export class ServiceRequestRepository
          VALUES ($1, 'status_updated', $2)`,
         [databaseId, status],
       );
+      if (status === 'completed' || status === 'cancelled') {
+        await this.stopProviderTracking(client, databaseId, status);
+      }
       // C4-C7 status notifications -> customer (required). Cancellation is
       // only reachable through the staff updateStatus path.
       const notificationType = customerStatusNotificationType(status);
@@ -2048,6 +2181,26 @@ export class ServiceRequestRepository
       if (!previousStatuses.includes(currentStatus)) {
         throw new Error('Invalid status transition');
       }
+      if (status === 'on_the_way' && this.providerTrackingConfig.enabled) {
+        const provider = await client.query<{
+          verification_status: PilotProviderVerificationStatus;
+          available: boolean;
+        }>(
+          `SELECT verification_status, available
+             FROM providers
+            WHERE id = $1
+            FOR UPDATE`,
+          [providerId],
+        );
+        const providerRow = provider.rows[0];
+        if (
+          !providerRow ||
+          providerRow.verification_status !== 'verified' ||
+          !providerRow.available
+        ) {
+          throw new Error('Provider is not eligible for tracking');
+        }
+      }
       if (status === 'in_progress') {
         await this.assertServiceMayStart(client, databaseId);
       }
@@ -2060,6 +2213,12 @@ export class ServiceRequestRepository
          VALUES ($1, 'status_updated', $2)`,
         [databaseId, status],
       );
+      if (status === 'on_the_way' && this.providerTrackingConfig.enabled) {
+        await this.startProviderTracking(client, databaseId, providerId);
+      }
+      if (status === 'completed') {
+        await this.stopProviderTracking(client, databaseId, status);
+      }
       // C4-C6 provider-driven status notifications -> customer (required).
       const notificationType = customerStatusNotificationType(status);
       if (notificationType) {
@@ -2083,6 +2242,416 @@ export class ServiceRequestRepository
     );
     if (!request) throw new Error('Assigned provider request not found');
     return request;
+  }
+
+  async submitProviderLocationSample(
+    requestId: string,
+    providerId: string,
+    sample: ProviderLocationSample,
+    receivedAt = new Date(),
+  ): Promise<ProviderLocationSubmissionResult> {
+    if (!this.providerTrackingConfig.enabled) {
+      throw new Error('Provider tracking is not enabled');
+    }
+    const canonicalSample = canonicalizeProviderLocationSample(sample);
+    const databaseId = this.toRequestDatabaseId(requestId);
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const request = await client.query<{
+        status: ServiceRequest['status'];
+        assigned_provider_id: string | null;
+        location_latitude: string | number | null;
+        location_longitude: string | number | null;
+      }>(
+        `SELECT status, assigned_provider_id,
+                location_latitude, location_longitude
+           FROM service_requests
+          WHERE id = $1
+          FOR UPDATE`,
+        [databaseId],
+      );
+      const row = request.rows[0];
+      if (
+        !row ||
+        row.assigned_provider_id !== providerId ||
+        !['on_the_way', 'in_progress'].includes(row.status)
+      ) {
+        throw new Error('Active provider tracking request not found');
+      }
+      const tracking = await client.query<{
+        state: string;
+        started_at: Date;
+        arrival_observed_at: Date | null;
+        arrival_first_qualifying_at: Date | null;
+        arrival_last_qualifying_at: Date | null;
+        arrival_qualifying_sample_count: number;
+      }>(
+        `SELECT state, started_at, arrival_observed_at,
+                arrival_first_qualifying_at, arrival_last_qualifying_at,
+                arrival_qualifying_sample_count
+           FROM provider_tracking_sessions
+          WHERE service_request_id = $1 AND provider_id = $2
+          FOR UPDATE`,
+        [databaseId, providerId],
+      );
+      const trackingRow = tracking.rows[0];
+      if (!trackingRow || trackingRow.state !== 'active') {
+        throw new Error('Active provider tracking request not found');
+      }
+      if (
+        canonicalSample.capturedAt.getTime() < trackingRow.started_at.getTime()
+      ) {
+        throw new Error(
+          'Provider location sample predates tracking activation',
+        );
+      }
+
+      const current = await client.query<CurrentPositionRow>(
+        `SELECT current_position.service_request_id::text,
+                current_position.latitude, current_position.longitude,
+                current_position.accuracy_meters,
+                current_position.captured_at, current_position.received_at,
+                tracking_session.arrival_observed_at
+           FROM provider_current_positions current_position
+           JOIN provider_tracking_sessions tracking_session
+             ON tracking_session.service_request_id = current_position.service_request_id
+            AND tracking_session.provider_id = current_position.provider_id
+          WHERE current_position.service_request_id = $1
+            AND current_position.provider_id = $2`,
+        [databaseId, providerId],
+      );
+      const currentRow = current.rows[0];
+      if (currentRow) {
+        const currentCapturedAt = currentRow.captured_at.getTime();
+        if (currentCapturedAt === canonicalSample.capturedAt.getTime()) {
+          if (
+            Number(currentRow.latitude) !== canonicalSample.latitude ||
+            Number(currentRow.longitude) !== canonicalSample.longitude ||
+            Number(currentRow.accuracy_meters) !==
+              canonicalSample.accuracyMeters
+          ) {
+            throw new Error(
+              'Provider location sample conflicts with existing data',
+            );
+          }
+          await client.query('COMMIT');
+          client.release();
+          return {
+            ...this.toProviderCurrentPosition(currentRow),
+            duplicate: true,
+          };
+        }
+        if (currentCapturedAt > canonicalSample.capturedAt.getTime()) {
+          const duplicate = await client.query<{
+            latitude: string | number;
+            longitude: string | number;
+            accuracy_meters: string | number;
+          }>(
+            `SELECT latitude, longitude, accuracy_meters
+               FROM provider_location_samples
+              WHERE service_request_id = $1
+                AND provider_id = $2
+                AND captured_at = $3`,
+            [databaseId, providerId, canonicalSample.capturedAt],
+          );
+          const duplicateRow = duplicate.rows[0];
+          if (duplicateRow) {
+            if (
+              Number(duplicateRow.latitude) !== canonicalSample.latitude ||
+              Number(duplicateRow.longitude) !== canonicalSample.longitude ||
+              Number(duplicateRow.accuracy_meters) !==
+                canonicalSample.accuracyMeters
+            ) {
+              throw new Error(
+                'Provider location sample conflicts with existing data',
+              );
+            }
+            await client.query('COMMIT');
+            client.release();
+            return {
+              ...this.toProviderCurrentPosition(currentRow),
+              duplicate: true,
+            };
+          }
+          throw new Error('Provider location sample is out of order');
+        }
+      }
+
+      const hasConfirmedLocation =
+        row.location_latitude !== null && row.location_longitude !== null;
+      const distanceMeters = hasConfirmedLocation
+        ? haversineDistanceMeters(
+            {
+              latitude: canonicalSample.latitude,
+              longitude: canonicalSample.longitude,
+            },
+            {
+              latitude: Number(row.location_latitude),
+              longitude: Number(row.location_longitude),
+            },
+          )
+        : null;
+      const qualifies =
+        distanceMeters !== null &&
+        arrivalSampleQualifies(distanceMeters, canonicalSample.accuracyMeters);
+      let qualifyingSampleCount = trackingRow.arrival_qualifying_sample_count;
+      let firstQualifyingCapturedAt = trackingRow.arrival_first_qualifying_at;
+      let lastQualifyingCapturedAt = trackingRow.arrival_last_qualifying_at;
+      let arrivalObservedAt = trackingRow.arrival_observed_at;
+      if (qualifies) {
+        qualifyingSampleCount += 1;
+        firstQualifyingCapturedAt ??= canonicalSample.capturedAt;
+        lastQualifyingCapturedAt = canonicalSample.capturedAt;
+        if (
+          !arrivalObservedAt &&
+          evaluateObservedArrival({
+            qualifyingSampleCount,
+            firstQualifyingCapturedAt,
+            lastQualifyingCapturedAt,
+          })
+        ) {
+          arrivalObservedAt = receivedAt;
+        }
+      }
+
+      await client.query(
+        `INSERT INTO provider_location_samples
+           (service_request_id, provider_id, latitude, longitude,
+            accuracy_meters, captured_at, received_at, distance_meters,
+            arrival_qualifying)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [
+          databaseId,
+          providerId,
+          canonicalSample.latitude,
+          canonicalSample.longitude,
+          canonicalSample.accuracyMeters,
+          canonicalSample.capturedAt,
+          receivedAt,
+          distanceMeters,
+          qualifies,
+        ],
+      );
+      await client.query(
+        `UPDATE provider_tracking_sessions
+            SET arrival_qualifying_sample_count = $3,
+                arrival_first_qualifying_at = $4,
+                arrival_last_qualifying_at = $5,
+                arrival_observed_at = $6
+          WHERE service_request_id = $1 AND provider_id = $2 AND state = 'active'`,
+        [
+          databaseId,
+          providerId,
+          qualifyingSampleCount,
+          firstQualifyingCapturedAt,
+          lastQualifyingCapturedAt,
+          arrivalObservedAt,
+        ],
+      );
+      await client.query(
+        `INSERT INTO provider_current_positions
+           (service_request_id, provider_id, latitude, longitude,
+            accuracy_meters, captured_at, received_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         ON CONFLICT (service_request_id) DO UPDATE
+           SET provider_id = EXCLUDED.provider_id,
+               latitude = EXCLUDED.latitude,
+               longitude = EXCLUDED.longitude,
+               accuracy_meters = EXCLUDED.accuracy_meters,
+               captured_at = EXCLUDED.captured_at,
+               received_at = EXCLUDED.received_at`,
+        [
+          databaseId,
+          providerId,
+          canonicalSample.latitude,
+          canonicalSample.longitude,
+          canonicalSample.accuracyMeters,
+          canonicalSample.capturedAt,
+          receivedAt,
+        ],
+      );
+      await client.query('COMMIT');
+      client.release();
+      return {
+        requestId,
+        latitude: canonicalSample.latitude,
+        longitude: canonicalSample.longitude,
+        accuracyMeters: canonicalSample.accuracyMeters,
+        capturedAt: canonicalSample.capturedAt.toISOString(),
+        receivedAt: receivedAt.toISOString(),
+        arrivalObserved: arrivalObservedAt !== null,
+        duplicate: false,
+      };
+    } catch (error) {
+      await this.rollbackAndRelease(client);
+      throw error;
+    }
+  }
+
+  async findCurrentProviderPositionForProvider(
+    requestId: string,
+    providerId: string,
+  ): Promise<ProviderCurrentPosition | undefined> {
+    if (!this.providerTrackingConfig.enabled) return undefined;
+    return this.findCurrentProviderPosition(
+      requestId,
+      'request.assigned_provider_id = $2',
+      providerId,
+    );
+  }
+
+  async findCurrentProviderPositionForCustomer(
+    requestId: string,
+    customerId: string,
+  ): Promise<ProviderCurrentPosition | undefined> {
+    if (!this.providerTrackingConfig.enabled) return undefined;
+    return this.findCurrentProviderPosition(
+      requestId,
+      'request.customer_id = $2',
+      this.toCustomerDatabaseId(customerId),
+    );
+  }
+
+  async findCurrentProviderPositionForOperations(
+    requestId: string,
+  ): Promise<ProviderCurrentPosition | undefined> {
+    if (!this.providerTrackingConfig.enabled) return undefined;
+    return this.findCurrentProviderPosition(requestId, 'TRUE', undefined);
+  }
+
+  async stopProviderTrackingForOperations(requestId: string): Promise<void> {
+    if (!this.providerTrackingConfig.enabled) {
+      throw new Error('Provider tracking is not enabled');
+    }
+    const databaseId = this.toRequestDatabaseId(requestId);
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const request = await client.query(
+        'SELECT id FROM service_requests WHERE id = $1 FOR UPDATE',
+        [databaseId],
+      );
+      if (!request.rows[0]) throw new Error('Service request not found');
+      await this.stopProviderTracking(
+        client,
+        databaseId,
+        'operations_emergency',
+      );
+      await client.query('COMMIT');
+      client.release();
+    } catch (error) {
+      await this.rollbackAndRelease(client);
+      throw error;
+    }
+  }
+
+  async pruneProviderTrackingData(
+    rawSamplesBefore: Date,
+    derivedEvidenceBefore: Date,
+    batchSize = 1000,
+  ): Promise<{ rawSamplesDeleted: number; sessionsDeleted: number }> {
+    if (
+      !Number.isSafeInteger(batchSize) ||
+      batchSize < 1 ||
+      batchSize > 10_000
+    ) {
+      throw new Error('Provider tracking retention batch size is invalid');
+    }
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const rawSamples = await client.query(
+        `WITH selected AS (
+           SELECT id
+             FROM provider_location_samples
+            WHERE received_at < $1
+            ORDER BY received_at, id
+            LIMIT $2
+            FOR UPDATE SKIP LOCKED
+         )
+         DELETE FROM provider_location_samples samples
+          USING selected
+          WHERE samples.id = selected.id`,
+        [rawSamplesBefore, batchSize],
+      );
+      const sessions = await client.query(
+        `WITH selected AS (
+           SELECT session.service_request_id
+             FROM provider_tracking_sessions session
+            WHERE session.state = 'stopped'
+              AND session.stopped_at < $1
+              AND NOT EXISTS (
+                SELECT 1
+                  FROM provider_location_samples sample
+                 WHERE sample.service_request_id = session.service_request_id
+                   AND sample.provider_id = session.provider_id
+              )
+            ORDER BY session.stopped_at, session.service_request_id
+            LIMIT $2
+            FOR UPDATE OF session SKIP LOCKED
+         )
+         DELETE FROM provider_tracking_sessions session
+          USING selected
+          WHERE session.service_request_id = selected.service_request_id`,
+        [derivedEvidenceBefore, batchSize],
+      );
+      await client.query('COMMIT');
+      client.release();
+      return {
+        rawSamplesDeleted: rawSamples.rowCount ?? 0,
+        sessionsDeleted: sessions.rowCount ?? 0,
+      };
+    } catch (error) {
+      await this.rollbackAndRelease(client);
+      throw error;
+    }
+  }
+
+  private async findCurrentProviderPosition(
+    requestId: string,
+    authorizationPredicate: string,
+    authorizationValue: string | number | undefined,
+  ): Promise<ProviderCurrentPosition | undefined> {
+    const databaseId = this.toRequestDatabaseId(requestId);
+    const parameters =
+      authorizationValue === undefined
+        ? [databaseId]
+        : [databaseId, authorizationValue];
+    const result = await this.pool.query<CurrentPositionRow>(
+      `SELECT current_position.service_request_id::text,
+              current_position.latitude, current_position.longitude,
+              current_position.accuracy_meters,
+              current_position.captured_at, current_position.received_at,
+              tracking_session.arrival_observed_at
+         FROM provider_current_positions current_position
+         JOIN provider_tracking_sessions tracking_session
+           ON tracking_session.service_request_id = current_position.service_request_id
+          AND tracking_session.provider_id = current_position.provider_id
+         JOIN service_requests request
+           ON request.id = current_position.service_request_id
+        WHERE current_position.service_request_id = $1
+          AND tracking_session.state = 'active'
+          AND request.status IN ('on_the_way', 'in_progress')
+          AND ${authorizationPredicate}`,
+      parameters,
+    );
+    const row = result.rows[0];
+    return row ? this.toProviderCurrentPosition(row) : undefined;
+  }
+
+  private toProviderCurrentPosition(
+    row: CurrentPositionRow,
+  ): ProviderCurrentPosition {
+    return {
+      requestId: `MOE-${1000 + Number(row.service_request_id)}`,
+      latitude: Number(row.latitude),
+      longitude: Number(row.longitude),
+      accuracyMeters: Number(row.accuracy_meters),
+      capturedAt: row.captured_at.toISOString(),
+      receivedAt: row.received_at.toISOString(),
+      arrivalObserved: row.arrival_observed_at !== null,
+    };
   }
 
   async proposeQuote(

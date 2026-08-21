@@ -17,6 +17,8 @@ import {
   REQUEST_IMAGE_STORAGE,
   type RequestImageStorage,
 } from './../src/request-image.storage';
+import { PROVIDER_TRACKING_CONFIG } from './../src/provider-tracking.config';
+import { SERVICE_LOCATION_CONFIG } from './../src/service-location.config';
 
 function responseObject(value: unknown): Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
@@ -140,8 +142,10 @@ async function createProviderAuthorization(
  * Removes ONLY the providers this suite registered (exact ids) plus their
  * dependent rows, in FK-safe order (bottom-up per the actual constraints:
  * service_payments → service_request_events → request_provider_opportunities
- * → service_quotes → support_tickets → service_requests → provider_sessions
- * → provider_access_credentials → providers). Runs inside one transaction;
+ * → service_quotes → support_tickets → provider_current_positions
+ * → provider_location_samples → provider_tracking_sessions → service_requests
+ * → provider_sessions → provider_access_credentials → providers). Runs inside
+ * one transaction;
  * on any error it ROLLBACKs and rethrows. The registered ids are dropped
  * from the set ONLY after COMMIT, so repeated calls are idempotent no-ops.
  * No wildcard or prefix scans, no broad subqueries, no unregistered
@@ -192,6 +196,21 @@ async function removeCreatedProvidersForLegacyFlow(): Promise<void> {
        WHERE service_request_id IN (
          SELECT id FROM service_requests WHERE assigned_provider_id = ANY($1::text[])
        )`,
+      [ids],
+    );
+    await client.query(
+      `DELETE FROM provider_current_positions
+       WHERE provider_id = ANY($1::text[])`,
+      [ids],
+    );
+    await client.query(
+      `DELETE FROM provider_location_samples
+       WHERE provider_id = ANY($1::text[])`,
+      [ids],
+    );
+    await client.query(
+      `DELETE FROM provider_tracking_sessions
+       WHERE provider_id = ANY($1::text[])`,
       [ids],
     );
     await client.query(
@@ -386,6 +405,18 @@ describe('AppController (e2e)', () => {
       .useValue(otpProvider)
       .overrideProvider(REQUEST_IMAGE_STORAGE)
       .useValue(deterministicRequestImageStorage(signedRequestImageKeys))
+      .overrideProvider(PROVIDER_TRACKING_CONFIG)
+      .useValue({ enabled: true })
+      .overrideProvider(SERVICE_LOCATION_CONFIG)
+      .useValue({
+        mode: 'optional',
+        bounds: {
+          minimumLatitude: 25,
+          maximumLatitude: 27,
+          minimumLongitude: 42,
+          maximumLongitude: 45,
+        },
+      })
       .compile();
 
     app = moduleFixture.createNestApplication<NestExpressApplication>();
@@ -402,6 +433,142 @@ describe('AppController (e2e)', () => {
     });
     configureApiSecurity(app);
     await app.init();
+  });
+
+  it('tracks only the assigned active request and hides the position after completion', async () => {
+    const customerChallenge = await request(app.getHttpServer())
+      .post('/auth/request-otp')
+      .send({ phone: uniqueTestPhone() })
+      .expect(201);
+    const customerLogin = await request(app.getHttpServer())
+      .post('/auth/verify-otp')
+      .send({
+        challengeId: requiredString(customerChallenge.body, 'challengeId'),
+        otp: '123456',
+      })
+      .expect(201);
+    const customerAuthorization = `Bearer ${requiredString(customerLogin.body, 'token')}`;
+    const provider = await createProviderAuthorization(app, ['plumbing']);
+    const adminAuthorization = await createStaffAuthorization(app, 'admin');
+    const created = await request(app.getHttpServer())
+      .post('/service-requests')
+      .set('Authorization', customerAuthorization)
+      .set('Idempotency-Key', randomUUID())
+      .send({
+        serviceId: 'plumbing',
+        address: 'حي الريان، بريدة',
+        timing: 'as-soon-as-possible',
+        location: {
+          point: {
+            latitude: 26.359123,
+            longitude: 43.981988,
+          },
+          displayAddress: 'حي الريان، بريدة',
+          source: 'current_location',
+          confirmed: true,
+        },
+      })
+      .expect(201);
+    const requestId = requiredString(created.body, 'id');
+    await request(app.getHttpServer())
+      .patch(`/service-requests/${requestId}/assignment`)
+      .set('Authorization', adminAuthorization)
+      .send({ providerId: provider.providerId })
+      .expect(200);
+
+    const sampleCoordinates = {
+      latitude: 26.35913,
+      longitude: 43.98198,
+      accuracyMeters: 10,
+    };
+    const preStartLocationSample = {
+      ...sampleCoordinates,
+      capturedAt: new Date().toISOString(),
+    };
+    await request(app.getHttpServer())
+      .post(`/provider/service-requests/${requestId}/location`)
+      .send(preStartLocationSample)
+      .expect(401);
+    await request(app.getHttpServer())
+      .post(`/provider/service-requests/${requestId}/location`)
+      .set('Authorization', provider.authorization)
+      .send(preStartLocationSample)
+      .expect(404);
+    await request(app.getHttpServer())
+      .patch(`/provider/service-requests/${requestId}/status`)
+      .set('Authorization', provider.authorization)
+      .send({ status: 'on_the_way' })
+      .expect(200);
+
+    const capturedAt = new Date().toISOString();
+    await request(app.getHttpServer())
+      .post(`/provider/service-requests/${requestId}/location`)
+      .set('Authorization', provider.authorization)
+      .send({ ...sampleCoordinates, capturedAt })
+      .expect(201)
+      .expect(({ body }: { body: unknown }) => {
+        expect(responseObject(body)).toEqual(
+          expect.objectContaining({ requestId, duplicate: false }),
+        );
+        expect(responseObject(body)).not.toHaveProperty('providerId');
+      });
+    await request(app.getHttpServer())
+      .get(`/my/service-requests/${requestId}/provider-location`)
+      .set('Authorization', customerAuthorization)
+      .expect(200)
+      .expect(({ body }: { body: unknown }) => {
+        expect(responseObject(body)).toEqual(
+          expect.objectContaining({ requestId, capturedAt }),
+        );
+        expect(responseObject(body)).not.toHaveProperty('providerId');
+      });
+    const unrelatedChallenge = await request(app.getHttpServer())
+      .post('/auth/request-otp')
+      .send({ phone: uniqueTestPhone() })
+      .expect(201);
+    const unrelatedLogin = await request(app.getHttpServer())
+      .post('/auth/verify-otp')
+      .send({
+        challengeId: requiredString(unrelatedChallenge.body, 'challengeId'),
+        otp: '123456',
+      })
+      .expect(201);
+    await request(app.getHttpServer())
+      .get(`/my/service-requests/${requestId}/provider-location`)
+      .set(
+        'Authorization',
+        `Bearer ${requiredString(unrelatedLogin.body, 'token')}`,
+      )
+      .expect(404);
+    await request(app.getHttpServer())
+      .get(`/service-requests/${requestId}/provider-location`)
+      .set('Authorization', adminAuthorization)
+      .expect(200);
+    const dispatcherAuthorization = await createStaffAuthorization(
+      app,
+      'dispatcher',
+    );
+    await request(app.getHttpServer())
+      .get(`/service-requests/${requestId}/provider-location`)
+      .set('Authorization', dispatcherAuthorization)
+      .expect(200);
+    const supportAuthorization = await createStaffAuthorization(
+      app,
+      'support_agent',
+    );
+    await request(app.getHttpServer())
+      .get(`/service-requests/${requestId}/provider-location`)
+      .set('Authorization', supportAuthorization)
+      .expect(403);
+    await request(app.getHttpServer())
+      .patch(`/service-requests/${requestId}/status`)
+      .set('Authorization', adminAuthorization)
+      .send({ status: 'cancelled' })
+      .expect(200);
+    await request(app.getHttpServer())
+      .get(`/my/service-requests/${requestId}/provider-location`)
+      .set('Authorization', customerAuthorization)
+      .expect(404);
   });
 
   it('/ (GET)', () => {
@@ -550,6 +717,11 @@ describe('AppController (e2e)', () => {
       .expect(201);
     const authorization = `Bearer ${requiredString(verified.body, 'token')}`;
 
+    // Create an assigned provider after this request exists, so the lifecycle
+    // exercise uses the provider-authoritative tracking start without adding a
+    // marketplace opportunity to the request.
+    await makeSeededProviderUnavailable(app, 'provider-1');
+    await removeCreatedProvidersForLegacyFlow();
     const created = await request(app.getHttpServer())
       .post('/service-requests')
       .set('Authorization', authorization)
@@ -560,6 +732,9 @@ describe('AppController (e2e)', () => {
         timing: 'as-soon-as-possible',
       })
       .expect(201);
+    const lifecycleProvider = await createProviderAuthorization(app, [
+      'ac-cleaning',
+    ]);
 
     await request(app.getHttpServer())
       .post(
@@ -583,15 +758,23 @@ describe('AppController (e2e)', () => {
     await request(app.getHttpServer())
       .patch(`/service-requests/${requestId}/assignment`)
       .set('Authorization', staffAuthorization)
-      .send({ providerId: 'provider-1' })
+      .send({ providerId: lifecycleProvider.providerId })
       .expect(200);
-    for (const status of ['on_the_way', 'in_progress', 'completed']) {
-      await request(app.getHttpServer())
-        .patch(`/service-requests/${requestId}/status`)
-        .set('Authorization', staffAuthorization)
-        .send({ status })
-        .expect(200);
-    }
+    await request(app.getHttpServer())
+      .patch(`/provider/service-requests/${requestId}/status`)
+      .set('Authorization', lifecycleProvider.authorization)
+      .send({ status: 'on_the_way' })
+      .expect(200);
+    await request(app.getHttpServer())
+      .patch(`/provider/service-requests/${requestId}/status`)
+      .set('Authorization', lifecycleProvider.authorization)
+      .send({ status: 'in_progress' })
+      .expect(200);
+    await request(app.getHttpServer())
+      .patch(`/service-requests/${requestId}/status`)
+      .set('Authorization', staffAuthorization)
+      .send({ status: 'completed' })
+      .expect(200);
 
     await request(app.getHttpServer())
       .get('/admin/audit-events')
@@ -679,8 +862,8 @@ describe('AppController (e2e)', () => {
       .send({ providerId: legacyProvider.providerId })
       .expect(200);
     await request(app.getHttpServer())
-      .patch(`/service-requests/${requestId}/status`)
-      .set('Authorization', staffAuthorization)
+      .patch(`/provider/service-requests/${requestId}/status`)
+      .set('Authorization', legacyProvider.authorization)
       .send({ status: 'on_the_way' })
       .expect(200);
     const proposed = await request(app.getHttpServer())
@@ -772,8 +955,8 @@ describe('AppController (e2e)', () => {
       .send({ providerId: legacyProvider.providerId })
       .expect(200);
     await request(app.getHttpServer())
-      .patch(`/service-requests/${requestId}/status`)
-      .set('Authorization', dispatcherAuthorization)
+      .patch(`/provider/service-requests/${requestId}/status`)
+      .set('Authorization', legacyProvider.authorization)
       .send({ status: 'on_the_way' })
       .expect(200);
     const proposed = await request(app.getHttpServer())
@@ -1527,8 +1710,8 @@ describe('AppController (e2e)', () => {
       .send({ providerId: eligible.providerId })
       .expect(200);
     await request(app.getHttpServer())
-      .patch(`/service-requests/${requestId}/status`)
-      .set('Authorization', staffAuthorization)
+      .patch(`/provider/service-requests/${requestId}/status`)
+      .set('Authorization', eligible.authorization)
       .send({ status: 'on_the_way' })
       .expect(200);
 

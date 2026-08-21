@@ -32,7 +32,10 @@ const CURRENT_TABLES = [
   'fcm_devices',
   'notification_outbox',
   'provider_access_credentials',
+  'provider_current_positions',
+  'provider_location_samples',
   'provider_sessions',
+  'provider_tracking_sessions',
   'providers',
   'public_auth_rate_limits',
   'request_provider_opportunities',
@@ -115,7 +118,7 @@ describe('database migration discovery', () => {
     );
   });
 
-  it('ships customer service location as 0005 after the immutable 0001-0004 history', async () => {
+  it('ships provider tracking as 0006 after the immutable 0001-0005 history', async () => {
     const migrations = await loadMigrations(defaultMigrationsDirectory());
 
     expect(
@@ -126,6 +129,7 @@ describe('database migration discovery', () => {
       { version: '0003', filename: '0003_fcm_notifications.sql' },
       { version: '0004', filename: '0004_fcm_notification_types.sql' },
       { version: '0005', filename: '0005_service_request_locations.sql' },
+      { version: '0006', filename: '0006_provider_tracking.sql' },
     ]);
   });
 });
@@ -219,13 +223,13 @@ describe('versioned PostgreSQL migrations', () => {
     await rootPool?.end();
   });
 
-  it('migrates an empty schema through v1-v5 and is then idempotent', async () => {
+  it('migrates an empty schema through v1-v6 and is then idempotent', async () => {
     const first = await runDatabaseMigrations(
       pool,
       defaultMigrationsDirectory(),
     );
     expect(first).toEqual({
-      applied: ['0001', '0002', '0003', '0004', '0005'],
+      applied: ['0001', '0002', '0003', '0004', '0005', '0006'],
       baselined: [],
     });
 
@@ -255,6 +259,7 @@ describe('versioned PostgreSQL migrations', () => {
       { version: '0003' },
       { version: '0004' },
       { version: '0005' },
+      { version: '0006' },
     ]);
 
     const historyRelation = `${quoteIdent(schema)}.${quoteIdent(
@@ -263,10 +268,10 @@ describe('versioned PostgreSQL migrations', () => {
     const historyCount = await rootPool.query<{ count: number }>(
       `SELECT count(*)::int AS count FROM ${historyRelation}`,
     );
-    expect(historyCount.rows[0].count).toBe(5);
+    expect(historyCount.rows[0].count).toBe(6);
   });
 
-  it('applies only 0003-0005 to a database already migrated through 0002', async () => {
+  it('applies only 0003-0006 to a database already migrated through 0002', async () => {
     const { schema: v2Schema, pool: v2Pool } =
       await createIsolatedSchemaPool('b1_v2_only');
     const v2Directory = await mkdtemp(join(tmpdir(), 'moeen-v2-migrations-'));
@@ -276,7 +281,7 @@ describe('versioned PostgreSQL migrations', () => {
         migrations
           .filter(
             (migration) =>
-              !['0003', '0004', '0005'].includes(migration.version),
+              !['0003', '0004', '0005', '0006'].includes(migration.version),
           )
           .map((migration) =>
             writeFile(join(v2Directory, migration.filename), migration.sql),
@@ -287,7 +292,7 @@ describe('versioned PostgreSQL migrations', () => {
       );
 
       await expect(runDatabaseMigrations(v2Pool)).resolves.toEqual({
-        applied: ['0003', '0004', '0005'],
+        applied: ['0003', '0004', '0005', '0006'],
         baselined: [],
       });
 
@@ -303,6 +308,7 @@ describe('versioned PostgreSQL migrations', () => {
         { version: '0003', execution_mode: 'applied' },
         { version: '0004', execution_mode: 'applied' },
         { version: '0005', execution_mode: 'applied' },
+        { version: '0006', execution_mode: 'applied' },
       ]);
     } finally {
       await rm(v2Directory, { recursive: true, force: true });
@@ -310,7 +316,7 @@ describe('versioned PostgreSQL migrations', () => {
     }
   });
 
-  it('applies only 0005 to a v4 schema without fabricating legacy locations', async () => {
+  it('applies 0005-0006 to a v4 schema without fabricating legacy locations', async () => {
     const { schema: v4Schema, pool: v4Pool } =
       await createIsolatedSchemaPool('b1_v4_only');
     const v4Directory = await mkdtemp(join(tmpdir(), 'moeen-v4-migrations-'));
@@ -318,7 +324,7 @@ describe('versioned PostgreSQL migrations', () => {
       const migrations = await loadMigrations(defaultMigrationsDirectory());
       await Promise.all(
         migrations
-          .filter((migration) => migration.version !== '0005')
+          .filter((migration) => !['0005', '0006'].includes(migration.version))
           .map((migration) =>
             writeFile(join(v4Directory, migration.filename), migration.sql),
           ),
@@ -333,7 +339,7 @@ describe('versioned PostgreSQL migrations', () => {
       );
 
       await expect(runDatabaseMigrations(v4Pool)).resolves.toEqual({
-        applied: ['0005'],
+        applied: ['0005', '0006'],
         baselined: [],
       });
       const shape = await v4Pool.query<{
@@ -405,6 +411,77 @@ describe('versioned PostgreSQL migrations', () => {
     }
   });
 
+  it('upgrades a valid 0005 schema through 0006 and then no-ops', async () => {
+    const { schema: v5Schema, pool: v5Pool } =
+      await createIsolatedSchemaPool('b1_v5_to_v6');
+    const v5Directory = await mkdtemp(join(tmpdir(), 'moeen-v5-migrations-'));
+    try {
+      const migrations = await loadMigrations(defaultMigrationsDirectory());
+      await Promise.all(
+        migrations
+          .filter((migration) => migration.version !== '0006')
+          .map((migration) =>
+            writeFile(join(v5Directory, migration.filename), migration.sql),
+          ),
+      );
+      await expect(runDatabaseMigrations(v5Pool, v5Directory)).resolves.toEqual(
+        {
+          applied: ['0001', '0002', '0003', '0004', '0005'],
+          baselined: [],
+        },
+      );
+
+      await expect(runDatabaseMigrations(v5Pool)).resolves.toEqual({
+        applied: ['0006'],
+        baselined: [],
+      });
+      const trackingTables = await v5Pool.query<{ table_name: string }>(
+        `SELECT table_name
+           FROM information_schema.tables
+          WHERE table_schema = current_schema()
+            AND table_name = ANY($1::text[])
+          ORDER BY table_name`,
+        [
+          [
+            'provider_current_positions',
+            'provider_location_samples',
+            'provider_tracking_sessions',
+          ],
+        ],
+      );
+      expect(trackingTables.rows.map((row) => row.table_name)).toEqual([
+        'provider_current_positions',
+        'provider_location_samples',
+        'provider_tracking_sessions',
+      ]);
+      const ownershipConstraint = await v5Pool.query<{ definition: string }>(
+        `SELECT pg_get_constraintdef(constraint_record.oid) AS definition
+           FROM pg_constraint constraint_record
+          WHERE constraint_record.connamespace = current_schema()::regnamespace
+            AND constraint_record.conname =
+              'provider_tracking_sessions_request_provider_fkey'`,
+      );
+      expect(ownershipConstraint.rows).toEqual([
+        {
+          definition:
+            'FOREIGN KEY (service_request_id, provider_id) REFERENCES service_requests(id, assigned_provider_id)',
+        },
+      ]);
+      const v6Migration = (
+        await loadMigrations(defaultMigrationsDirectory())
+      ).find((migration) => migration.version === '0006');
+      expect(v6Migration?.sql).toContain("SET LOCAL lock_timeout = '5s'");
+      expect(v6Migration?.sql).toContain("SET LOCAL statement_timeout = '30s'");
+      await expect(runDatabaseMigrations(v5Pool)).resolves.toEqual({
+        applied: [],
+        baselined: [],
+      });
+    } finally {
+      await rm(v5Directory, { recursive: true, force: true });
+      await dropIsolatedSchema(v5Pool, v5Schema);
+    }
+  });
+
   it('rolls back 0005 when a partial location column already exists', async () => {
     const { schema: partialSchema, pool: partialPool } =
       await createIsolatedSchemaPool('b1_v5_partial');
@@ -413,7 +490,7 @@ describe('versioned PostgreSQL migrations', () => {
       const migrations = await loadMigrations(defaultMigrationsDirectory());
       await Promise.all(
         migrations
-          .filter((migration) => migration.version !== '0005')
+          .filter((migration) => !['0005', '0006'].includes(migration.version))
           .map((migration) =>
             writeFile(join(v4Directory, migration.filename), migration.sql),
           ),
@@ -445,7 +522,57 @@ describe('versioned PostgreSQL migrations', () => {
     }
   });
 
-  it('baselines an exact legacy v1 schema and applies only v2-v5', async () => {
+  it.each([
+    [
+      'observed arrival with fewer than three samples',
+      `UPDATE provider_tracking_sessions
+          SET arrival_qualifying_sample_count = 1,
+              arrival_first_qualifying_at = NOW() - INTERVAL '30 seconds',
+              arrival_last_qualifying_at = NOW(),
+              arrival_observed_at = NOW()`,
+    ],
+    [
+      'observed arrival with less than thirty seconds of evidence',
+      `UPDATE provider_tracking_sessions
+          SET arrival_qualifying_sample_count = 3,
+              arrival_first_qualifying_at = NOW() - INTERVAL '29 seconds',
+              arrival_last_qualifying_at = NOW(),
+              arrival_observed_at = NOW()`,
+    ],
+  ])('database rejects %s', async (_case, invalidUpdateSql) => {
+    const { schema: invariantSchema, pool: invariantPool } =
+      await createIsolatedSchemaPool('b1_v6_arrival_invariant');
+    try {
+      await runDatabaseMigrations(invariantPool);
+      await invariantPool.query(
+        `INSERT INTO providers
+           (id, name, specialties, available, service_zone, verification_status)
+         VALUES ('v6-arrival-provider', 'V6 arrival provider', ARRAY['cleaning'],
+                 TRUE, 'بريدة', 'verified')`,
+      );
+      const request = await invariantPool.query<{ id: string }>(
+        `INSERT INTO service_requests
+           (service_id, address, timing, status, assigned_provider_id)
+         VALUES ('cleaning', 'بريدة', 'as-soon-as-possible', 'on_the_way',
+                 'v6-arrival-provider')
+         RETURNING id::text`,
+      );
+      await invariantPool.query(
+        `INSERT INTO provider_tracking_sessions
+           (service_request_id, provider_id, state, started_at)
+         VALUES ($1, 'v6-arrival-provider', 'active', NOW())`,
+        [request.rows[0].id],
+      );
+
+      await expect(invariantPool.query(invalidUpdateSql)).rejects.toMatchObject(
+        { code: '23514' },
+      );
+    } finally {
+      await dropIsolatedSchema(invariantPool, invariantSchema);
+    }
+  });
+
+  it('baselines an exact legacy v1 schema and applies only v2-v6', async () => {
     const { schema: legacySchema, pool: legacyPool } =
       await createIsolatedSchemaPool('b1_legacy_v1');
     const v1Directory = await mkdtemp(join(tmpdir(), 'moeen-v1-migrations-'));
@@ -456,7 +583,7 @@ describe('versioned PostgreSQL migrations', () => {
       await legacyPool.query('DROP TABLE moeen_schema_migrations');
 
       await expect(runDatabaseMigrations(legacyPool)).resolves.toEqual({
-        applied: ['0002', '0003', '0004', '0005'],
+        applied: ['0002', '0003', '0004', '0005', '0006'],
         baselined: ['0001'],
       });
       const history = await legacyPool.query<{
@@ -471,6 +598,7 @@ describe('versioned PostgreSQL migrations', () => {
         { version: '0003', execution_mode: 'applied' },
         { version: '0004', execution_mode: 'applied' },
         { version: '0005', execution_mode: 'applied' },
+        { version: '0006', execution_mode: 'applied' },
       ]);
     } finally {
       await rm(v1Directory, { recursive: true, force: true });
@@ -478,7 +606,7 @@ describe('versioned PostgreSQL migrations', () => {
     }
   });
 
-  it('applies v2-v5 to a database with valid v1 history', async () => {
+  it('applies v2-v6 to a database with valid v1 history', async () => {
     const { schema: v1Schema, pool: v1Pool } =
       await createIsolatedSchemaPool('b1_v1_history');
     const v1Directory = await mkdtemp(join(tmpdir(), 'moeen-v1-history-'));
@@ -488,7 +616,7 @@ describe('versioned PostgreSQL migrations', () => {
       await runDatabaseMigrations(v1Pool, v1Directory);
 
       await expect(runDatabaseMigrations(v1Pool)).resolves.toEqual({
-        applied: ['0002', '0003', '0004', '0005'],
+        applied: ['0002', '0003', '0004', '0005', '0006'],
         baselined: [],
       });
     } finally {
@@ -575,7 +703,7 @@ describe('versioned PostgreSQL migrations', () => {
         migrations
           .filter(
             (migration) =>
-              !['0003', '0004', '0005'].includes(migration.version),
+              !['0003', '0004', '0005', '0006'].includes(migration.version),
           )
           .map((migration) =>
             writeFile(join(v2Directory, migration.filename), migration.sql),
@@ -605,7 +733,7 @@ describe('versioned PostgreSQL migrations', () => {
         migrations
           .filter(
             (migration) =>
-              !['0003', '0004', '0005'].includes(migration.version),
+              !['0003', '0004', '0005', '0006'].includes(migration.version),
           )
           .map((migration) =>
             writeFile(join(v2Directory, migration.filename), migration.sql),
@@ -635,7 +763,7 @@ describe('versioned PostgreSQL migrations', () => {
       );
 
       await expect(runDatabaseMigrations(driftPool)).rejects.toThrow(
-        "Database schema does not satisfy applied migration '0005'",
+        "Database schema does not satisfy applied migration '0006'",
       );
     } finally {
       await dropIsolatedSchema(driftPool, driftSchema);
@@ -652,7 +780,7 @@ describe('versioned PostgreSQL migrations', () => {
       );
 
       await expect(runDatabaseMigrations(driftPool)).rejects.toThrow(
-        "Database schema does not satisfy applied migration '0005'",
+        "Database schema does not satisfy applied migration '0006'",
       );
     } finally {
       await dropIsolatedSchema(driftPool, driftSchema);
@@ -686,7 +814,7 @@ describe('versioned PostgreSQL migrations', () => {
       );
 
       await expect(runDatabaseMigrations(driftPool)).rejects.toThrow(
-        "Database schema does not satisfy applied migration '0005'",
+        "Database schema does not satisfy applied migration '0006'",
       );
     } finally {
       await dropIsolatedSchema(driftPool, driftSchema);
@@ -714,7 +842,7 @@ describe('versioned PostgreSQL migrations', () => {
       await driftPool.query(driftSql);
 
       await expect(runDatabaseMigrations(driftPool)).rejects.toThrow(
-        "Database schema does not satisfy applied migration '0005'",
+        "Database schema does not satisfy applied migration '0006'",
       );
     } finally {
       await dropIsolatedSchema(driftPool, driftSchema);
@@ -731,12 +859,116 @@ describe('versioned PostgreSQL migrations', () => {
       );
 
       await expect(runDatabaseMigrations(driftPool)).rejects.toThrow(
-        "Database schema does not satisfy applied migration '0005'",
+        "Database schema does not satisfy applied migration '0006'",
       );
     } finally {
       await dropIsolatedSchema(driftPool, driftSchema);
     }
   });
+
+  it.each([
+    {
+      caseName: 'session state widening',
+      table: 'provider_tracking_sessions',
+      constraint: 'provider_tracking_sessions_state_check',
+      definition: `CHECK (
+        ((state = 'active' AND stopped_at IS NULL AND stop_reason IS NULL)
+          OR (state = 'stopped' AND stopped_at IS NOT NULL AND stop_reason IS NOT NULL))
+        OR TRUE
+      )`,
+    },
+    {
+      caseName: 'arrival evidence widening',
+      table: 'provider_tracking_sessions',
+      constraint: 'provider_tracking_sessions_arrival_check',
+      definition: `CHECK (
+        (arrival_qualifying_sample_count = 0
+          AND arrival_first_qualifying_at IS NULL
+          AND arrival_last_qualifying_at IS NULL
+          AND arrival_observed_at IS NULL)
+        OR (arrival_qualifying_sample_count > 0
+          AND arrival_first_qualifying_at IS NOT NULL
+          AND arrival_last_qualifying_at IS NOT NULL
+          AND arrival_last_qualifying_at >= arrival_first_qualifying_at
+          AND (arrival_observed_at IS NULL
+            OR (arrival_qualifying_sample_count >= 3
+              AND arrival_last_qualifying_at - arrival_first_qualifying_at
+                >= INTERVAL '30 seconds')))
+        OR TRUE
+      )`,
+    },
+    {
+      caseName: 'arrival count widening',
+      table: 'provider_tracking_sessions',
+      constraint: 'provider_tracking_sessions_arrival_count_check',
+      definition: 'CHECK (arrival_qualifying_sample_count >= -1)',
+    },
+    {
+      caseName: 'stop reason widening',
+      table: 'provider_tracking_sessions',
+      constraint: 'provider_tracking_sessions_stop_reason_check',
+      definition: `CHECK (stop_reason IS NULL OR stop_reason IN (
+        'completed', 'cancelled', 'provider_suspended',
+        'operations_emergency', 'other'
+      ))`,
+    },
+    {
+      caseName: 'sample latitude widening',
+      table: 'provider_location_samples',
+      constraint: 'provider_location_samples_latitude_check',
+      definition: 'CHECK (latitude BETWEEN -91 AND 90)',
+    },
+    {
+      caseName: 'sample longitude widening',
+      table: 'provider_location_samples',
+      constraint: 'provider_location_samples_longitude_check',
+      definition: 'CHECK (longitude BETWEEN -181 AND 180)',
+    },
+    {
+      caseName: 'sample accuracy widening',
+      table: 'provider_location_samples',
+      constraint: 'provider_location_samples_accuracy_meters_check',
+      definition: 'CHECK (accuracy_meters >= -1)',
+    },
+    {
+      caseName: 'current latitude widening',
+      table: 'provider_current_positions',
+      constraint: 'provider_current_positions_latitude_check',
+      definition: 'CHECK (latitude BETWEEN -91 AND 90)',
+    },
+    {
+      caseName: 'current longitude widening',
+      table: 'provider_current_positions',
+      constraint: 'provider_current_positions_longitude_check',
+      definition: 'CHECK (longitude BETWEEN -181 AND 180)',
+    },
+    {
+      caseName: 'current accuracy widening',
+      table: 'provider_current_positions',
+      constraint: 'provider_current_positions_accuracy_meters_check',
+      definition: 'CHECK (accuracy_meters >= -1)',
+    },
+  ])(
+    'refuses 0006 exact CHECK drift: $caseName',
+    async ({ table, constraint, definition }) => {
+      const { schema: driftSchema, pool: driftPool } =
+        await createIsolatedSchemaPool('b1_v6_exact_check_drift');
+      try {
+        await runDatabaseMigrations(driftPool);
+        await driftPool.query(
+          `ALTER TABLE ${table}
+             DROP CONSTRAINT ${constraint},
+             ADD CONSTRAINT ${constraint} ${definition}`,
+        );
+
+        await expect(runDatabaseMigrations(driftPool)).rejects.toThrow(
+          "Database schema does not satisfy applied migration '0006'",
+        );
+      } finally {
+        await dropIsolatedSchema(driftPool, driftSchema);
+      }
+    },
+  );
 
   it('refuses a non-empty partial schema before replaying the initial migration', async () => {
     const { schema: partialSchema, pool: partialPool } =
@@ -1271,10 +1503,10 @@ describe('versioned PostgreSQL migrations', () => {
       await historyPool.query(
         `INSERT INTO moeen_schema_migrations
            (version, name, checksum, execution_mode)
-         VALUES ('0006', 'unknown', repeat('1', 64), 'applied')`,
+         VALUES ('0007', 'unknown', repeat('1', 64), 'applied')`,
       );
       await expect(runDatabaseMigrations(historyPool)).rejects.toThrow(
-        "Database migration '0006' is applied but missing from this release",
+        "Database migration '0007' is applied but missing from this release",
       );
     } finally {
       await dropIsolatedSchema(historyPool, historySchema);
@@ -1300,7 +1532,7 @@ describe('versioned PostgreSQL migrations', () => {
     }
   });
 
-  it('applies a pending migration when valid v5 history already exists', async () => {
+  it('applies a pending migration when valid v6 history already exists', async () => {
     const { schema: repairSchema, pool: repairPool } =
       await createIsolatedSchemaPool('b1_repair');
     const repairDirectory = await mkdtemp(
@@ -1315,13 +1547,13 @@ describe('versioned PostgreSQL migrations', () => {
         ),
       );
       await writeFile(
-        join(repairDirectory, '0006_add_valid_history_probe.sql'),
+        join(repairDirectory, '0007_add_valid_history_probe.sql'),
         'CREATE TABLE valid_history_probe (id INTEGER PRIMARY KEY);',
       );
 
       await expect(
         runDatabaseMigrations(repairPool, repairDirectory),
-      ).resolves.toEqual({ applied: ['0006'], baselined: [] });
+      ).resolves.toEqual({ applied: ['0007'], baselined: [] });
     } finally {
       await rm(repairDirectory, { recursive: true, force: true });
       await dropIsolatedSchema(repairPool, repairSchema);

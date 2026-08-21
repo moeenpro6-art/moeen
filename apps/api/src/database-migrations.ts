@@ -490,6 +490,7 @@ type SchemaContract = {
   keyConstraints: readonly string[];
   foreignKeys: readonly ForeignKeyContract[];
   constraintTokens: Readonly<Record<string, readonly string[]>>;
+  exactConstraintDefinitions?: Readonly<Record<string, string>>;
 };
 
 // Migration 0001 is immutable. Keep its exact contract independent from the
@@ -815,6 +816,216 @@ const V5_SCHEMA_CONTRACT: SchemaContract = {
       'current_location',
       'map_pin',
     ],
+  },
+};
+
+/**
+ * Migration 0006 adds request-scoped provider tracking. Exact raw/current
+ * points are kept in dedicated tables so they never leak into broad request,
+ * event, notification, or audit projections and can be retained separately.
+ */
+const V6_SCHEMA_CONTRACT: SchemaContract = {
+  ...V5_SCHEMA_CONTRACT,
+  columnTypes: {
+    ...V5_SCHEMA_CONTRACT.columnTypes,
+    provider_tracking_sessions: {
+      service_request_id: 'bigint!',
+      provider_id: 'text!',
+      state: 'text!',
+      started_at: 'timestamp with time zone!',
+      stopped_at: 'timestamp with time zone',
+      stop_reason: 'text',
+      arrival_observed_at: 'timestamp with time zone',
+      arrival_first_qualifying_at: 'timestamp with time zone',
+      arrival_last_qualifying_at: 'timestamp with time zone',
+      arrival_qualifying_sample_count: 'integer!',
+      created_at: 'timestamp with time zone!',
+    },
+    provider_location_samples: {
+      id: 'bigint!',
+      service_request_id: 'bigint!',
+      provider_id: 'text!',
+      latitude: 'numeric(9,6)!',
+      longitude: 'numeric(10,6)!',
+      accuracy_meters: 'numeric(10,3)!',
+      captured_at: 'timestamp with time zone!',
+      received_at: 'timestamp with time zone!',
+      distance_meters: 'numeric(12,3)',
+      arrival_qualifying: 'boolean!',
+    },
+    provider_current_positions: {
+      service_request_id: 'bigint!',
+      provider_id: 'text!',
+      latitude: 'numeric(9,6)!',
+      longitude: 'numeric(10,6)!',
+      accuracy_meters: 'numeric(10,3)!',
+      captured_at: 'timestamp with time zone!',
+      received_at: 'timestamp with time zone!',
+    },
+  },
+  columnDefaults: {
+    ...V5_SCHEMA_CONTRACT.columnDefaults,
+    'provider_tracking_sessions.arrival_qualifying_sample_count': '0',
+    'provider_tracking_sessions.created_at': 'now()',
+    'provider_location_samples.id':
+      "nextval('provider_location_samples_id_seq'::regclass)",
+  },
+  serialColumns: {
+    ...V5_SCHEMA_CONTRACT.serialColumns,
+    'provider_location_samples.id': BIGSERIAL_SEQUENCE_CONTRACT,
+  },
+  indexTokens: {
+    ...V5_SCHEMA_CONTRACT.indexTokens,
+    provider_tracking_sessions_provider_state_idx: [
+      'provider_tracking_sessions',
+      '(provider_id, state)',
+    ],
+    provider_tracking_sessions_stopped_at_idx: [
+      'provider_tracking_sessions',
+      '(stopped_at)',
+      'stopped_at IS NOT NULL',
+    ],
+    provider_location_samples_retention_idx: [
+      'provider_location_samples',
+      '(received_at)',
+    ],
+    provider_location_samples_request_captured_idx: [
+      'provider_location_samples',
+      '(service_request_id, captured_at DESC)',
+    ],
+    provider_current_positions_provider_idx: [
+      'provider_current_positions',
+      '(provider_id)',
+    ],
+  },
+  keyConstraints: [
+    ...V5_SCHEMA_CONTRACT.keyConstraints,
+    'service_requests:u:id,assigned_provider_id',
+    'provider_tracking_sessions:p:service_request_id',
+    'provider_tracking_sessions:u:service_request_id,provider_id',
+    'provider_location_samples:p:id',
+    'provider_location_samples:u:service_request_id,provider_id,captured_at',
+    'provider_current_positions:p:service_request_id',
+  ],
+  foreignKeys: [
+    ...V5_SCHEMA_CONTRACT.foreignKeys,
+    currentSchemaForeignKey(
+      'provider_tracking_sessions',
+      ['service_request_id'],
+      'service_requests',
+      ['id'],
+    ),
+    currentSchemaForeignKey(
+      'provider_tracking_sessions',
+      ['provider_id'],
+      'providers',
+      ['id'],
+    ),
+    currentSchemaForeignKey(
+      'provider_tracking_sessions',
+      ['service_request_id', 'provider_id'],
+      'service_requests',
+      ['id', 'assigned_provider_id'],
+    ),
+    currentSchemaForeignKey(
+      'provider_location_samples',
+      ['service_request_id', 'provider_id'],
+      'provider_tracking_sessions',
+      ['service_request_id', 'provider_id'],
+    ),
+    currentSchemaForeignKey(
+      'provider_current_positions',
+      ['service_request_id', 'provider_id'],
+      'provider_tracking_sessions',
+      ['service_request_id', 'provider_id'],
+    ),
+  ],
+  constraintTokens: {
+    ...V5_SCHEMA_CONTRACT.constraintTokens,
+    provider_tracking_sessions_state_check: [
+      'state',
+      'active',
+      'stopped',
+      'stopped_at',
+      'stop_reason',
+    ],
+    provider_tracking_sessions_arrival_check: [
+      'arrival_qualifying_sample_count',
+      'arrival_first_qualifying_at',
+      'arrival_last_qualifying_at',
+      'arrival_observed_at',
+    ],
+    provider_tracking_sessions_arrival_count_check: [
+      'arrival_qualifying_sample_count',
+      '>= 0',
+    ],
+    provider_tracking_sessions_stop_reason_check: [
+      'stop_reason',
+      'completed',
+      'cancelled',
+      'provider_suspended',
+      'operations_emergency',
+    ],
+    provider_location_samples_latitude_check: [
+      'latitude',
+      '>=',
+      '-90',
+      '<=',
+      '90',
+    ],
+    provider_location_samples_longitude_check: [
+      'longitude',
+      '>=',
+      '-180',
+      '<=',
+      '180',
+    ],
+    provider_location_samples_accuracy_meters_check: [
+      'accuracy_meters',
+      '>=',
+      '0',
+    ],
+    provider_current_positions_latitude_check: [
+      'latitude',
+      '>=',
+      '-90',
+      '<=',
+      '90',
+    ],
+    provider_current_positions_longitude_check: [
+      'longitude',
+      '>=',
+      '-180',
+      '<=',
+      '180',
+    ],
+    provider_current_positions_accuracy_meters_check: [
+      'accuracy_meters',
+      '>=',
+      '0',
+    ],
+  },
+  exactConstraintDefinitions: {
+    provider_tracking_sessions_state_check:
+      "CHECK ((((state = 'active'::text) AND (stopped_at IS NULL) AND (stop_reason IS NULL)) OR ((state = 'stopped'::text) AND (stopped_at IS NOT NULL) AND (stop_reason IS NOT NULL))))",
+    provider_tracking_sessions_arrival_check:
+      "CHECK ((((arrival_qualifying_sample_count = 0) AND (arrival_first_qualifying_at IS NULL) AND (arrival_last_qualifying_at IS NULL) AND (arrival_observed_at IS NULL)) OR ((arrival_qualifying_sample_count > 0) AND (arrival_first_qualifying_at IS NOT NULL) AND (arrival_last_qualifying_at IS NOT NULL) AND (arrival_last_qualifying_at >= arrival_first_qualifying_at) AND ((arrival_observed_at IS NULL) OR ((arrival_qualifying_sample_count >= 3) AND ((arrival_last_qualifying_at - arrival_first_qualifying_at) >= '00:00:30'::interval))))))",
+    provider_tracking_sessions_arrival_count_check:
+      'CHECK ((arrival_qualifying_sample_count >= 0))',
+    provider_tracking_sessions_stop_reason_check:
+      "CHECK (((stop_reason IS NULL) OR (stop_reason = ANY (ARRAY['completed'::text, 'cancelled'::text, 'provider_suspended'::text, 'operations_emergency'::text]))))",
+    provider_location_samples_latitude_check:
+      "CHECK (((latitude >= ('-90'::integer)::numeric) AND (latitude <= (90)::numeric)))",
+    provider_location_samples_longitude_check:
+      "CHECK (((longitude >= ('-180'::integer)::numeric) AND (longitude <= (180)::numeric)))",
+    provider_location_samples_accuracy_meters_check:
+      'CHECK ((accuracy_meters >= (0)::numeric))',
+    provider_current_positions_latitude_check:
+      "CHECK (((latitude >= ('-90'::integer)::numeric) AND (latitude <= (90)::numeric)))",
+    provider_current_positions_longitude_check:
+      "CHECK (((longitude >= ('-180'::integer)::numeric) AND (longitude <= (180)::numeric)))",
+    provider_current_positions_accuracy_meters_check:
+      'CHECK ((accuracy_meters >= (0)::numeric))',
   },
 };
 
@@ -1333,7 +1544,23 @@ async function schemaMatchesContract(
       return false;
     }
   }
+  for (const [constraint, expectedDefinition] of Object.entries(
+    contract.exactConstraintDefinitions ?? {},
+  )) {
+    const definition = definitions.get(constraint);
+    if (
+      !definition ||
+      normalizeConstraintDefinition(definition) !==
+        normalizeConstraintDefinition(expectedDefinition)
+    ) {
+      return false;
+    }
+  }
   return true;
+}
+
+function normalizeConstraintDefinition(definition: string): string {
+  return definition.replace(/\s+/g, ' ').trim();
 }
 
 async function initialSchemaHasUserObjects(
@@ -1406,6 +1633,9 @@ function contractForMigration(
     migration.name === 'service_request_locations'
   ) {
     return V5_SCHEMA_CONTRACT;
+  }
+  if (migration?.version === '0006' && migration.name === 'provider_tracking') {
+    return V6_SCHEMA_CONTRACT;
   }
   return undefined;
 }
