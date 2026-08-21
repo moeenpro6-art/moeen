@@ -8,6 +8,7 @@ import 'api_config.dart';
 import 'customer_session.dart';
 import 'customer_notifications.dart';
 import 'request_images.dart';
+import 'service_location.dart';
 import 'moeen_ui.dart';
 
 void main() {
@@ -357,6 +358,8 @@ class BookingPage extends StatefulWidget {
     this.sessionManager,
     this.httpClient,
     this.apiConfig,
+    this.serviceLocationMode,
+    this.locationPlatform,
   });
 
   final ServiceOption service;
@@ -371,6 +374,12 @@ class BookingPage extends StatefulWidget {
   /// Test seam: overrides the API origin configuration.
   final MoeenApiConfig? apiConfig;
 
+  /// Compile-time mode by default; injected in tests only.
+  final ServiceLocationMode? serviceLocationMode;
+
+  /// Test seam: prevents widget tests from invoking platform location APIs.
+  final CustomerLocationPlatform? locationPlatform;
+
   @override
   State<BookingPage> createState() => _BookingPageState();
 }
@@ -384,6 +393,7 @@ class _BookingPageState extends State<BookingPage> {
   bool _pickingImages = false;
   String? _imageError;
   List<SelectedRequestImage> _selectedImages = [];
+  late final ServiceLocationController _serviceLocationController;
 
   /// One Idempotency-Key per booking payload. Reused verbatim on every
   /// retry of the unchanged payload and invalidated when the payload
@@ -401,10 +411,29 @@ class _BookingPageState extends State<BookingPage> {
 
   MoeenApiConfig get _apiConfig => widget.apiConfig ?? moeenApi;
 
+  ServiceLocationMode get _serviceLocationMode =>
+      widget.serviceLocationMode ?? CustomerServiceLocationConfig.mode;
+
+  @override
+  void initState() {
+    super.initState();
+    _serviceLocationController = ServiceLocationController(
+      platform: widget.locationPlatform ??
+          const GeolocatorCustomerLocationPlatform(),
+    );
+    _addressController.addListener(_onAddressChanged);
+  }
+
+  void _onAddressChanged() {
+    _serviceLocationController.updateDisplayAddress(_addressController.text);
+  }
+
   @override
   void dispose() {
+    _addressController.removeListener(_onAddressChanged);
     _addressController.dispose();
     _detailsController.dispose();
+    _serviceLocationController.dispose();
     super.dispose();
   }
 
@@ -505,6 +534,19 @@ class _BookingPageState extends State<BookingPage> {
       return;
     }
     if (!_formKey.currentState!.validate()) return;
+    final locationError = validateLocationForSubmission(
+      mode: _serviceLocationMode,
+      selection: _serviceLocationController.selection,
+    );
+    if (locationError != null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(locationError),
+          backgroundColor: const Color(0xFF9B2C2C),
+        ),
+      );
+      return;
+    }
     final imageError = validateRequestImageSelection(_selectedImages);
     if (imageError != null) {
       setState(() => _imageError = imageError);
@@ -521,22 +563,41 @@ class _BookingPageState extends State<BookingPage> {
       final timing = _timing == 'في أقرب وقت'
           ? 'as-soon-as-possible'
           : 'scheduled';
+      final location = locationForSubmission(
+        mode: _serviceLocationMode,
+        selection: _serviceLocationController.selection,
+      );
       if (_selectedImages.isEmpty) {
-        // Legacy zero-image flow: plain JSON body, no Idempotency-Key.
-        // The API's JSON create path has no idempotency contract, so no key
-        // is sent here (adding one would invent a backend contract).
+        // Legacy zero-image flow remains keyless. A confirmed location uses
+        // the Phase 1 JSON idempotency contract, matching its server-side
+        // fingerprint and safely replaying a lost-response retry.
+        final idempotencyKey = location == null
+            ? null
+            : _submissionIdentity.keyFor(
+                serviceId: widget.service.id,
+                address: address,
+                details: details.isEmpty ? null : details,
+                timing: timing,
+                serviceLocationFingerprint: location.fingerprint,
+                orderedImageBytes: const [],
+              );
+        final headers = <String, String>{
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ${session.token}',
+        };
+        _addIdempotencyHeader(headers, idempotencyKey);
         response = await _httpClient.post(
           _apiConfig.endpoint('/service-requests'),
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': 'Bearer ${session.token}',
-          },
-          body: jsonEncode({
-            'serviceId': widget.service.id,
-            'address': address,
-            'details': details,
-            'timing': timing,
-          }),
+          headers: headers,
+          body: jsonEncode(
+            buildServiceRequestPayload(
+              serviceId: widget.service.id,
+              address: address,
+              details: details,
+              timing: timing,
+              location: location,
+            ),
+          ),
         );
       } else {
         // Multipart contract: `images` file parts plus a UUID v4
@@ -549,6 +610,7 @@ class _BookingPageState extends State<BookingPage> {
           address: address,
           details: details.isEmpty ? null : details,
           timing: timing,
+          serviceLocationFingerprint: location?.fingerprint,
           orderedImageBytes: [for (final image in _selectedImages) image.bytes],
         );
         response = await submitServiceRequestWithImages(
@@ -560,6 +622,7 @@ class _BookingPageState extends State<BookingPage> {
           details: details.isEmpty ? null : details,
           timing: timing,
           images: _selectedImages,
+          location: location,
           idempotencyKey: idempotencyKey,
         );
       }
@@ -608,6 +671,11 @@ class _BookingPageState extends State<BookingPage> {
     } finally {
       if (mounted) setState(() => _isSubmitting = false);
     }
+  }
+
+  void _addIdempotencyHeader(Map<String, String> headers, String? key) {
+    if (key == null) return;
+    headers['Idempotency-Key'] = key;
   }
 
   String _imageAwareFailureMessage(http.Response response) {
@@ -659,6 +727,21 @@ class _BookingPageState extends State<BookingPage> {
                     validator: (value) => value == null || value.trim().isEmpty
                         ? 'أدخل عنوان الخدمة'
                         : null,
+                  ),
+                  ServiceLocationPicker(
+                    controller: _serviceLocationController,
+                    mode: _serviceLocationMode,
+                    addressController: _addressController,
+                    onConfirmWithoutAddress: () {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(
+                          content: Text(
+                            'أدخل عنوان الخدمة أو معلماً قريباً ثم أكّد الموقع.',
+                          ),
+                          backgroundColor: Color(0xFF9B2C2C),
+                        ),
+                      );
+                    },
                   ),
                   const SizedBox(height: 24),
                   Text(
