@@ -54,6 +54,11 @@ describe('actor-specific service location projections', () => {
         ...request,
         status: 'completed',
       }),
+      findProviderTrackingAuthority: jest.fn().mockResolvedValue({
+        requestId: request.id,
+        status: 'completed',
+        trackingSessionState: 'stopped',
+      }),
     };
     const service = new AppService(store as unknown as ServiceRequestStore);
 
@@ -67,5 +72,6 @@ describe('actor-specific service location projections', () => {
     expect(projected).not.toHaveProperty('location');
     expect(projected).not.toHaveProperty('details');
     expect(projected).not.toHaveProperty('customerPhone');
+    expect(projected.tracking.active).toBe(false);
   });
 });

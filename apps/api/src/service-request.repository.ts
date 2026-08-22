@@ -63,6 +63,7 @@ import {
   canonicalizeProviderLocationSample,
   evaluateObservedArrival,
   haversineDistanceMeters,
+  type ProviderTrackingAuthorityRecord,
   type ProviderLocationSample,
 } from './provider-tracking';
 import {
@@ -1510,6 +1511,38 @@ export class ServiceRequestRepository
       [providerId],
     );
     return result.rows.map((row) => this.toServiceRequest(row));
+  }
+
+  async findProviderTrackingAuthority(
+    requestId: string,
+    providerId: string,
+  ): Promise<ProviderTrackingAuthorityRecord | undefined> {
+    const databaseId = this.requestDatabaseIdOrUndefined(requestId);
+    if (databaseId === undefined) return undefined;
+    const result = await this.pool.query<{
+      request_id: string;
+      status: ProviderTrackingAuthorityRecord['status'];
+      tracking_session_state: ProviderTrackingAuthorityRecord['trackingSessionState'];
+    }>(
+      `SELECT request.id::text AS request_id,
+              request.status,
+              tracking_session.state AS tracking_session_state
+         FROM service_requests request
+         LEFT JOIN provider_tracking_sessions tracking_session
+           ON tracking_session.service_request_id = request.id
+          AND tracking_session.provider_id = request.assigned_provider_id
+        WHERE request.id = $1
+          AND request.assigned_provider_id = $2`,
+      [databaseId, providerId],
+    );
+    const row = result.rows[0];
+    return row
+      ? {
+          requestId: `MOE-${1000 + Number(row.request_id)}`,
+          status: row.status,
+          trackingSessionState: row.tracking_session_state,
+        }
+      : undefined;
   }
 
   async findRequestEvents(requestId: string): Promise<ServiceRequestEvent[]> {
@@ -3740,10 +3773,20 @@ export class ServiceRequestRepository
     return value === null || value === undefined ? null : Number(value);
   }
 
+  private requestDatabaseIdOrUndefined(requestId: string): number | undefined {
+    const match = /^MOE-([1-9]\d{0,15})$/.exec(requestId);
+    if (!match) return undefined;
+    const publicId = Number(match[1]);
+    if (!Number.isSafeInteger(publicId) || publicId <= 1000) {
+      return undefined;
+    }
+    return publicId - 1000;
+  }
+
   private toRequestDatabaseId(requestId: string): number {
-    const match = /^MOE-(\d+)$/.exec(requestId);
-    if (!match) throw new Error('Invalid request id');
-    return Number(match[1]) - 1000;
+    const databaseId = this.requestDatabaseIdOrUndefined(requestId);
+    if (databaseId === undefined) throw new Error('Invalid request id');
+    return databaseId;
   }
 
   private toQuoteDatabaseId(quoteId: string): number {

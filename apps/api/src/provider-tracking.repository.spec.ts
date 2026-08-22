@@ -4,10 +4,151 @@ import { Pool } from 'pg';
 import { ServiceRequestRepository } from './service-request.repository';
 
 describe('request-scoped provider tracking repository', () => {
-  const repository = new ServiceRequestRepository(undefined, { enabled: true });
+  const repository = new ServiceRequestRepository(undefined, {
+    enabled: true,
+    onTheWayCadenceMs: 15_000,
+    inProgressCadenceMs: 60_000,
+  });
 
   beforeAll(async () => repository.initialize());
   afterAll(async () => repository.close());
+
+  it('reads owned assigned authority without creating a tracking session', async () => {
+    const fixture = await createAssignedTrackingRequest();
+    const pool = new Pool({ connectionString: process.env.TEST_DATABASE_URL });
+    try {
+      const before = await pool.query<{ count: number }>(
+        `SELECT count(*)::int AS count
+           FROM provider_tracking_sessions
+          WHERE service_request_id = $1`,
+        [requestDatabaseId(fixture.requestId)],
+      );
+
+      await expect(
+        repository.findProviderTrackingAuthority(
+          fixture.requestId,
+          fixture.providerId,
+        ),
+      ).resolves.toEqual({
+        requestId: fixture.requestId,
+        status: 'assigned',
+        trackingSessionState: null,
+      });
+
+      const after = await pool.query<{ count: number }>(
+        `SELECT count(*)::int AS count
+           FROM provider_tracking_sessions
+          WHERE service_request_id = $1`,
+        [requestDatabaseId(fixture.requestId)],
+      );
+      expect(after.rows).toEqual(before.rows);
+    } finally {
+      await pool.end();
+    }
+  });
+
+  it('reads active authority through on_the_way and in_progress, then fails closed after emergency stop', async () => {
+    const fixture = await createAssignedTrackingRequest();
+    await repository.updateStatusForProvider(
+      fixture.requestId,
+      fixture.providerId,
+      'on_the_way',
+    );
+    await expect(
+      repository.findProviderTrackingAuthority(
+        fixture.requestId,
+        fixture.providerId,
+      ),
+    ).resolves.toEqual({
+      requestId: fixture.requestId,
+      status: 'on_the_way',
+      trackingSessionState: 'active',
+    });
+
+    await repository.updateStatusForProvider(
+      fixture.requestId,
+      fixture.providerId,
+      'in_progress',
+    );
+    await expect(
+      repository.findProviderTrackingAuthority(
+        fixture.requestId,
+        fixture.providerId,
+      ),
+    ).resolves.toEqual({
+      requestId: fixture.requestId,
+      status: 'in_progress',
+      trackingSessionState: 'active',
+    });
+
+    await repository.stopProviderTrackingForOperations(fixture.requestId);
+    await expect(
+      repository.findProviderTrackingAuthority(
+        fixture.requestId,
+        fixture.providerId,
+      ),
+    ).resolves.toEqual({
+      requestId: fixture.requestId,
+      status: 'in_progress',
+      trackingSessionState: 'stopped',
+    });
+  });
+
+  it('returns no authority for nonexistent, unrelated, or former owners', async () => {
+    const fixture = await createAssignedTrackingRequest();
+    await expect(
+      repository.findProviderTrackingAuthority(
+        'MOE-999999',
+        fixture.providerId,
+      ),
+    ).resolves.toBeUndefined();
+    await expect(
+      repository.findProviderTrackingAuthority(fixture.requestId, 'provider-1'),
+    ).resolves.toBeUndefined();
+
+    const pool = new Pool({ connectionString: process.env.TEST_DATABASE_URL });
+    try {
+      await pool.query(
+        `UPDATE service_requests
+            SET assigned_provider_id = 'provider-1'
+          WHERE id = $1`,
+        [requestDatabaseId(fixture.requestId)],
+      );
+    } finally {
+      await pool.end();
+    }
+    await expect(
+      repository.findProviderTrackingAuthority(
+        fixture.requestId,
+        fixture.providerId,
+      ),
+    ).resolves.toBeUndefined();
+  });
+
+  it.each([
+    ['malformed', 'not-a-request-id'],
+    ['zero', 'MOE-0'],
+    ['negative', 'MOE--1'],
+    ['mapping to a negative database id', 'MOE-999'],
+    ['below the first public request id', 'MOE-1000'],
+    ['non-canonical', 'MOE-001001'],
+    ['non-safe', 'MOE-9007199254740992'],
+    ['oversized', `MOE-${'9'.repeat(400)}`],
+  ])(
+    'returns no authority for a %s request id before querying PostgreSQL',
+    async (_caseName, requestId) => {
+      const pool = (repository as unknown as { pool: Pool }).pool;
+      const query = jest.spyOn(pool, 'query');
+      try {
+        await expect(
+          repository.findProviderTrackingAuthority(requestId, 'provider-1'),
+        ).resolves.toBeUndefined();
+        expect(query).not.toHaveBeenCalled();
+      } finally {
+        query.mockRestore();
+      }
+    },
+  );
 
   it('starts only on assigned -> on_the_way and accepts active owner samples', async () => {
     const fixture = await createAssignedTrackingRequest();
@@ -54,9 +195,32 @@ describe('request-scoped provider tracking repository', () => {
   it('keeps the rollout default fail-closed', async () => {
     const disabledRepository = new ServiceRequestRepository(undefined, {
       enabled: false,
+      onTheWayCadenceMs: 15_000,
+      inProgressCadenceMs: 60_000,
     });
     await disabledRepository.initialize();
     try {
+      const fixture = await createAssignedTrackingRequest();
+      await expect(
+        disabledRepository.updateStatusForProvider(
+          fixture.requestId,
+          fixture.providerId,
+          'on_the_way',
+        ),
+      ).resolves.toMatchObject({
+        id: fixture.requestId,
+        status: 'on_the_way',
+      });
+      await expect(
+        disabledRepository.findProviderTrackingAuthority(
+          fixture.requestId,
+          fixture.providerId,
+        ),
+      ).resolves.toEqual({
+        requestId: fixture.requestId,
+        status: 'on_the_way',
+        trackingSessionState: null,
+      });
       const capturedAt = activeSampleTime();
       await expect(
         disabledRepository.submitProviderLocationSample(

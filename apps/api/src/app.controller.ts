@@ -160,6 +160,23 @@ export class AppController {
     return this.appService.getProviderServiceRequests(provider.id);
   }
 
+  @Get('provider/service-requests/:id/tracking')
+  async getMyProviderTrackingStatus(
+    @Headers('authorization') authorization: string | undefined,
+    @Param('id') requestId: string,
+  ): Promise<import('./provider-tracking').ProviderTrackingStatusResponseDto> {
+    const provider = await this.providerAuthService.getCurrentProvider(
+      this.extractBearerToken(authorization),
+    );
+    const status = await this.appService.getProviderTrackingStatus(
+      provider.id,
+      requestId,
+    );
+    if (!status)
+      throw new NotFoundException('Provider tracking request not found');
+    return status;
+  }
+
   @Patch('provider/service-requests/:id/status')
   async updateMyProviderServiceRequestStatus(
     @Headers('authorization') authorization: string | undefined,
@@ -171,7 +188,7 @@ export class AppController {
         'on_the_way' | 'in_progress' | 'completed'
       >;
     },
-  ): Promise<ServiceRequest> {
+  ): Promise<import('./app.service').ProviderStatusTransitionResponseDto> {
     const provider = await this.providerAuthService.getCurrentProvider(
       this.extractBearerToken(authorization),
     );

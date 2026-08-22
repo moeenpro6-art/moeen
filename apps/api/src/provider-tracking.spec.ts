@@ -4,7 +4,68 @@ import {
   evaluateObservedArrival,
   haversineDistanceMeters,
   validateProviderLocationSample,
+  projectProviderTrackingStatus,
+  type ProviderTrackingAuthorityRecord,
 } from './provider-tracking';
+import type { ProviderTrackingConfig } from './provider-tracking.config';
+
+describe('provider tracking authority projection', () => {
+  const enabled: ProviderTrackingConfig = {
+    enabled: true,
+    onTheWayCadenceMs: 15_000,
+    inProgressCadenceMs: 60_000,
+  };
+
+  it.each([
+    ['assigned', 'active', false],
+    ['on_the_way', 'active', true],
+    ['in_progress', 'active', true],
+    ['completed', 'active', false],
+    ['cancelled', 'active', false],
+    ['on_the_way', 'stopped', false],
+    ['on_the_way', null, false],
+  ] as const)(
+    'projects %s with session %s as active=%s',
+    (status, trackingSessionState, active) => {
+      const record: ProviderTrackingAuthorityRecord = {
+        requestId: 'MOE-1042',
+        status,
+        trackingSessionState,
+      };
+
+      expect(projectProviderTrackingStatus(record, enabled)).toEqual({
+        tracking: {
+          active,
+          requestId: 'MOE-1042',
+          status,
+          onTheWayCadenceMs: 15_000,
+          inProgressCadenceMs: 60_000,
+        },
+      });
+    },
+  );
+
+  it('fails closed when rollout is off despite an active database session', () => {
+    expect(
+      projectProviderTrackingStatus(
+        {
+          requestId: 'MOE-1042',
+          status: 'on_the_way',
+          trackingSessionState: 'active',
+        },
+        { ...enabled, enabled: false },
+      ),
+    ).toEqual({
+      tracking: {
+        active: false,
+        requestId: 'MOE-1042',
+        status: 'on_the_way',
+        onTheWayCadenceMs: 15_000,
+        inProgressCadenceMs: 60_000,
+      },
+    });
+  });
+});
 
 describe('provider tracking arrival engine', () => {
   it('calculates Haversine distance deterministically', () => {

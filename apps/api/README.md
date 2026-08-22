@@ -57,6 +57,19 @@ $ npm run test:e2e
 $ npm run test:cov
 ```
 
+## Provider tracking authority and cadence
+
+Provider coordinate collection is disabled by default with
+`MOEEN_PROVIDER_TRACKING_MODE=off`. When the approved rollout is enabled, the
+server remains the authority: providers reconcile through
+`GET /provider/service-requests/:id/tracking`; request status by itself does not
+authorize collection. The default server-provided cadences are 15,000 ms for
+`on_the_way` and 60,000 ms for `in_progress`. They can be overridden with
+`MOEEN_PROVIDER_TRACKING_ON_THE_WAY_CADENCE_MS` (10,000..60,000) and
+`MOEEN_PROVIDER_TRACKING_IN_PROGRESS_CADENCE_MS` (30,000..300,000), with the
+in-progress cadence no shorter than the on-the-way cadence. Invalid values fail
+startup.
+
 ## Provider tracking retention
 
 After `npm run build`, run one bounded production retention batch from

@@ -12,9 +12,17 @@ import {
 } from './service-request.repository';
 import type { StaffAuditSpec } from './staff-auth.repository';
 import {
+  projectProviderTrackingStatus,
   validateProviderLocationSample,
   type ProviderLocationSample,
+  type ProviderTrackingAuthorityRecord,
+  type ProviderTrackingStatusResponseDto,
 } from './provider-tracking';
+import {
+  DEFAULT_PROVIDER_TRACKING_CONFIG,
+  PROVIDER_TRACKING_CONFIG,
+  type ProviderTrackingConfig,
+} from './provider-tracking.config';
 import {
   RequestImageCreateOrchestrator,
   RequestSubmissionConflictError,
@@ -256,6 +264,9 @@ export type ServiceRequest = CreateServiceRequest & {
   createdAt: string;
 };
 
+export type ProviderStatusTransitionResponseDto = ServiceRequest &
+  ProviderTrackingStatusResponseDto;
+
 const ACTIVE_PROVIDER_LOCATION_STATUSES = new Set<ServiceRequestStatus>([
   'assigned',
   'on_the_way',
@@ -351,6 +362,10 @@ export interface ServiceRequestStore {
   findAll(): Promise<ServiceRequest[]>;
   findByCustomerId(customerId: string): Promise<ServiceRequest[]>;
   findByProviderId(providerId: string): Promise<ServiceRequest[]>;
+  findProviderTrackingAuthority(
+    requestId: string,
+    providerId: string,
+  ): Promise<ProviderTrackingAuthorityRecord | undefined>;
   findRequestEvents(requestId: string): Promise<ServiceRequestEvent[]>;
   findCustomerBySession(token: string): Promise<Customer | undefined>;
   findProviderByAccessCode(
@@ -491,6 +506,8 @@ export class AppService {
     private readonly serviceLocationConfig: ServiceLocationConfig = {
       mode: 'off',
     },
+    @Inject(PROVIDER_TRACKING_CONFIG)
+    private readonly providerTrackingConfig: ProviderTrackingConfig = DEFAULT_PROVIDER_TRACKING_CONFIG,
   ) {}
 
   getHello(): string {
@@ -907,13 +924,34 @@ export class AppService {
       ServiceRequestStatus,
       'on_the_way' | 'in_progress' | 'completed'
     >,
-  ): Promise<ServiceRequest> {
+  ): Promise<ProviderStatusTransitionResponseDto> {
     const updated = await this.serviceRequestStore.updateStatusForProvider(
       requestId,
       providerId,
       status,
     );
-    return projectServiceRequestForProvider(updated) as ServiceRequest;
+    const projected = projectServiceRequestForProvider(
+      updated,
+    ) as ServiceRequest;
+    const statusResponse = await this.getProviderTrackingStatus(
+      providerId,
+      requestId,
+    );
+    if (!statusResponse) throw new Error('Assigned provider request not found');
+    return { ...projected, ...statusResponse };
+  }
+
+  async getProviderTrackingStatus(
+    providerId: string,
+    requestId: string,
+  ): Promise<ProviderTrackingStatusResponseDto | undefined> {
+    const record = await this.serviceRequestStore.findProviderTrackingAuthority(
+      requestId,
+      providerId,
+    );
+    return record
+      ? projectProviderTrackingStatus(record, this.providerTrackingConfig)
+      : undefined;
   }
 
   submitProviderLocationSample(
