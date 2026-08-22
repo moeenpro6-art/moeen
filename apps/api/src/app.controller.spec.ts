@@ -102,6 +102,83 @@ describe('AppController provider tracking authorization', () => {
     ).rejects.toBeInstanceOf(UnauthorizedException);
   });
 
+  it('derives tracking-authority ownership only from the bearer provider session', async () => {
+    const tracking = {
+      tracking: {
+        active: true,
+        requestId: position.requestId,
+        status: 'on_the_way' as const,
+        onTheWayCadenceMs: 15_000,
+        inProgressCadenceMs: 60_000,
+      },
+    };
+    const appService = {
+      getProviderTrackingStatus: jest.fn().mockResolvedValue(tracking),
+    };
+    const providerAuthService = {
+      getCurrentProvider: jest.fn().mockResolvedValue({ id: 'provider-owner' }),
+    };
+    const controller = createTrackingController(
+      appService,
+      {},
+      providerAuthService,
+    );
+
+    await expect(
+      controller.getMyProviderTrackingStatus(
+        'Bearer provider-session',
+        position.requestId,
+      ),
+    ).resolves.toEqual(tracking);
+    expect(providerAuthService.getCurrentProvider).toHaveBeenCalledWith(
+      'provider-session',
+    );
+    expect(appService.getProviderTrackingStatus).toHaveBeenCalledWith(
+      'provider-owner',
+      position.requestId,
+    );
+  });
+
+  it('returns the same non-enumerating 404 for tracking authority outside provider ownership', async () => {
+    const appService = {
+      getProviderTrackingStatus: jest.fn().mockResolvedValue(undefined),
+    };
+    const providerAuthService = {
+      getCurrentProvider: jest.fn().mockResolvedValue({ id: 'provider-owner' }),
+    };
+    const controller = createTrackingController(
+      appService,
+      {},
+      providerAuthService,
+    );
+
+    await expect(
+      controller.getMyProviderTrackingStatus(
+        'Bearer provider-session',
+        position.requestId,
+      ),
+    ).rejects.toBeInstanceOf(NotFoundException);
+  });
+
+  it('fails tracking authority with 401 before querying ownership for invalid provider auth', async () => {
+    const appService = { getProviderTrackingStatus: jest.fn() };
+    const providerAuthService = {
+      getCurrentProvider: jest
+        .fn()
+        .mockRejectedValue(new UnauthorizedException('Unauthorized')),
+    };
+    const controller = createTrackingController(
+      appService,
+      {},
+      providerAuthService,
+    );
+
+    await expect(
+      controller.getMyProviderTrackingStatus(undefined, position.requestId),
+    ).rejects.toBeInstanceOf(UnauthorizedException);
+    expect(appService.getProviderTrackingStatus).not.toHaveBeenCalled();
+  });
+
   it('maps staff attempts to start tracking to a deliberate conflict', async () => {
     const appService = {
       updateStatus: jest

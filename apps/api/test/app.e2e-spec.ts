@@ -406,7 +406,11 @@ describe('AppController (e2e)', () => {
       .overrideProvider(REQUEST_IMAGE_STORAGE)
       .useValue(deterministicRequestImageStorage(signedRequestImageKeys))
       .overrideProvider(PROVIDER_TRACKING_CONFIG)
-      .useValue({ enabled: true })
+      .useValue({
+        enabled: true,
+        onTheWayCadenceMs: 15_000,
+        inProgressCadenceMs: 60_000,
+      })
       .overrideProvider(SERVICE_LOCATION_CONFIG)
       .useValue({
         mode: 'optional',
@@ -476,6 +480,61 @@ describe('AppController (e2e)', () => {
       .send({ providerId: provider.providerId })
       .expect(200);
 
+    const unrelatedProvider = await createProviderAuthorization(app, [
+      'tank-cleaning',
+    ]);
+    await request(app.getHttpServer())
+      .get(`/provider/service-requests/${requestId}/tracking`)
+      .expect(401);
+    const nonexistentTracking = await request(app.getHttpServer())
+      .get('/provider/service-requests/MOE-999999/tracking')
+      .set('Authorization', provider.authorization)
+      .expect(404);
+    for (const invalidRequestId of [
+      'not-a-request-id',
+      'MOE-0',
+      'MOE--1',
+      'MOE-999',
+      'MOE-1000',
+      'MOE-9007199254740992',
+      `MOE-${'9'.repeat(400)}`,
+    ]) {
+      const invalidTracking = await request(app.getHttpServer())
+        .get(`/provider/service-requests/${invalidRequestId}/tracking`)
+        .set('Authorization', provider.authorization)
+        .expect(404);
+      expect(invalidTracking.body).toEqual(nonexistentTracking.body);
+    }
+    const unrelatedTracking = await request(app.getHttpServer())
+      .get(`/provider/service-requests/${requestId}/tracking`)
+      .set('Authorization', unrelatedProvider.authorization)
+      .expect(404);
+    expect(unrelatedTracking.body).toEqual(nonexistentTracking.body);
+    await request(app.getHttpServer())
+      .get(`/provider/service-requests/${requestId}/tracking`)
+      .set('Authorization', provider.authorization)
+      .expect('Cache-Control', 'no-store, private')
+      .expect(200)
+      .expect(({ body }: { body: unknown }) => {
+        const root = responseObject(body);
+        expect(Object.keys(root)).toEqual(['tracking']);
+        const tracking = responseObject(root.tracking);
+        expect(Object.keys(tracking).sort()).toEqual([
+          'active',
+          'inProgressCadenceMs',
+          'onTheWayCadenceMs',
+          'requestId',
+          'status',
+        ]);
+        expect(tracking).toEqual({
+          active: false,
+          requestId,
+          status: 'assigned',
+          onTheWayCadenceMs: 15_000,
+          inProgressCadenceMs: 60_000,
+        });
+      });
+
     const sampleCoordinates = {
       latitude: 26.35913,
       longitude: 43.98198,
@@ -498,7 +557,39 @@ describe('AppController (e2e)', () => {
       .patch(`/provider/service-requests/${requestId}/status`)
       .set('Authorization', provider.authorization)
       .send({ status: 'on_the_way' })
-      .expect(200);
+      .expect(200)
+      .expect(({ body }: { body: unknown }) => {
+        const root = responseObject(body);
+        expect(root).toEqual(
+          expect.objectContaining({
+            id: requestId,
+            serviceId: 'plumbing',
+            status: 'on_the_way',
+          }),
+        );
+        expect(responseObject(root.tracking)).toEqual({
+          active: true,
+          requestId,
+          status: 'on_the_way',
+          onTheWayCadenceMs: 15_000,
+          inProgressCadenceMs: 60_000,
+        });
+      });
+    await request(app.getHttpServer())
+      .get(`/provider/service-requests/${requestId}/tracking`)
+      .set('Authorization', provider.authorization)
+      .expect(200)
+      .expect(({ body }: { body: unknown }) => {
+        expect(responseObject(body)).toEqual({
+          tracking: {
+            active: true,
+            requestId,
+            status: 'on_the_way',
+            onTheWayCadenceMs: 15_000,
+            inProgressCadenceMs: 60_000,
+          },
+        });
+      });
 
     const capturedAt = new Date().toISOString();
     await request(app.getHttpServer())
@@ -561,14 +652,59 @@ describe('AppController (e2e)', () => {
       .set('Authorization', supportAuthorization)
       .expect(403);
     await request(app.getHttpServer())
+      .post(`/service-requests/${requestId}/provider-location/stop`)
+      .set('Authorization', adminAuthorization)
+      .expect(201);
+    await request(app.getHttpServer())
+      .get(`/provider/service-requests/${requestId}/tracking`)
+      .set('Authorization', provider.authorization)
+      .expect(200)
+      .expect(({ body }: { body: unknown }) => {
+        expect(responseObject(body)).toEqual({
+          tracking: {
+            active: false,
+            requestId,
+            status: 'on_the_way',
+            onTheWayCadenceMs: 15_000,
+            inProgressCadenceMs: 60_000,
+          },
+        });
+      });
+    await request(app.getHttpServer())
       .patch(`/service-requests/${requestId}/status`)
       .set('Authorization', adminAuthorization)
       .send({ status: 'cancelled' })
-      .expect(200);
+      .expect(200)
+      .expect(({ body }: { body: unknown }) => {
+        expect(responseObject(body)).not.toHaveProperty('tracking');
+      });
+    await request(app.getHttpServer())
+      .get(`/provider/service-requests/${requestId}/tracking`)
+      .set('Authorization', provider.authorization)
+      .expect(200)
+      .expect(({ body }: { body: unknown }) => {
+        expect(responseObject(body)).toEqual({
+          tracking: {
+            active: false,
+            requestId,
+            status: 'cancelled',
+            onTheWayCadenceMs: 15_000,
+            inProgressCadenceMs: 60_000,
+          },
+        });
+      });
     await request(app.getHttpServer())
       .get(`/my/service-requests/${requestId}/provider-location`)
       .set('Authorization', customerAuthorization)
       .expect(404);
+    await request(app.getHttpServer())
+      .patch(`/providers/${provider.providerId}/suspension`)
+      .set('Authorization', adminAuthorization)
+      .expect(200);
+    await request(app.getHttpServer())
+      .get(`/provider/service-requests/${requestId}/tracking`)
+      .set('Authorization', provider.authorization)
+      .expect(401);
   });
 
   it('/ (GET)', () => {

@@ -1,4 +1,5 @@
 import { BadRequestException } from '@nestjs/common';
+import type { ProviderTrackingConfig } from './provider-tracking.config';
 
 export const ARRIVAL_DISTANCE_METERS = 100;
 export const ARRIVAL_MAXIMUM_ACCURACY_METERS = 50;
@@ -6,6 +7,48 @@ export const ARRIVAL_REQUIRED_SAMPLE_COUNT = 3;
 export const ARRIVAL_REQUIRED_SPAN_MILLISECONDS = 30_000;
 export const SAMPLE_MAXIMUM_AGE_MILLISECONDS = 5 * 60_000;
 export const SAMPLE_MAXIMUM_FUTURE_SKEW_MILLISECONDS = 60_000;
+
+export type ProviderTrackingRequestStatus =
+  'assigned' | 'on_the_way' | 'in_progress' | 'completed' | 'cancelled';
+
+export type ProviderTrackingAuthorityRecord = {
+  requestId: string;
+  status: ProviderTrackingRequestStatus;
+  trackingSessionState: 'active' | 'stopped' | null;
+};
+
+export type ProviderTrackingStatusResponseDto = {
+  tracking: {
+    active: boolean;
+    requestId: string;
+    status: ProviderTrackingRequestStatus;
+    onTheWayCadenceMs: number;
+    inProgressCadenceMs: number;
+  };
+};
+
+const TRACKABLE_REQUEST_STATUSES = new Set<ProviderTrackingRequestStatus>([
+  'on_the_way',
+  'in_progress',
+]);
+
+export function projectProviderTrackingStatus(
+  record: ProviderTrackingAuthorityRecord,
+  config: ProviderTrackingConfig,
+): ProviderTrackingStatusResponseDto {
+  return {
+    tracking: {
+      active:
+        config.enabled &&
+        TRACKABLE_REQUEST_STATUSES.has(record.status) &&
+        record.trackingSessionState === 'active',
+      requestId: record.requestId,
+      status: record.status,
+      onTheWayCadenceMs: config.onTheWayCadenceMs,
+      inProgressCadenceMs: config.inProgressCadenceMs,
+    },
+  };
+}
 
 export type GeographicPoint = {
   latitude: number;
