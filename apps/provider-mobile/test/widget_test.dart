@@ -29,8 +29,10 @@ void main() {
   });
 
   test(
-    'provider cannot start a job while the customer quote is unresolved',
+    'provider still sees the start-service control while a quote is unresolved',
     () {
+      // The button is derived from the CURRENT request status only; the
+      // backend remains the authority and refuses unapproved staff quotes.
       final job = ProviderJob.fromJson({
         'id': 'MOE-1002',
         'serviceId': 'plumbing',
@@ -45,8 +47,47 @@ void main() {
         },
       });
 
-      expect(nextProviderStatus(job), isNull);
-      expect(providerActionLabel(job), 'بانتظار قرار العميل على عرض السعر');
+      expect(nextProviderStatus(job), 'in_progress');
+      expect(providerActionLabel(job), 'بدء الخدمة');
+    },
+  );
+
+  test(
+    'a stale rejected marketplace quote does not suppress provider controls '
+    '(admin reassignment regression)',
+    () {
+      // Production bug t_c15d4ef2: a provider whose offer was rejected can
+      // later be manually assigned by an admin; operational actions must
+      // derive from the current assignment + status, never from the
+      // historical rejected quote.
+      Map<String, dynamic> jobWithRejectedQuote(String status) => {
+        'id': 'MOE-2001',
+        'serviceId': 'ac-cleaning',
+        'address': 'حي الصفراء، بريدة',
+        'timing': 'as-soon-as-possible',
+        'status': status,
+        'quote': {
+          'id': 'QTE-3',
+          'amountHalalas': 15000,
+          'scope': 'تنظيف مكيف',
+          'status': 'rejected',
+        },
+      };
+
+      final assignedJob = ProviderJob.fromJson(jobWithRejectedQuote('assigned'));
+      final onTheWayJob = ProviderJob.fromJson(
+        jobWithRejectedQuote('on_the_way'),
+      );
+      final inProgressJob = ProviderJob.fromJson(
+        jobWithRejectedQuote('in_progress'),
+      );
+
+      expect(nextProviderStatus(assignedJob), 'on_the_way');
+      expect(providerActionLabel(assignedJob), 'بدء التوجه');
+      expect(nextProviderStatus(onTheWayJob), 'in_progress');
+      expect(providerActionLabel(onTheWayJob), 'بدء الخدمة');
+      expect(nextProviderStatus(inProgressJob), 'completed');
+      expect(providerActionLabel(inProgressJob), 'إنهاء الخدمة');
     },
   );
 

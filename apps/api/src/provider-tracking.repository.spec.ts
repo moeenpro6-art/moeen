@@ -1118,6 +1118,103 @@ describe('request-scoped provider tracking repository', () => {
     }
   });
 
+  it('keeps tracking authority bound to the current assignment across a rejected-offer reassignment and stops it atomically on completion (t_c15d4ef2)', async () => {
+    const serviceId = `reassign-${randomUUID()}`;
+    const provider = await repository.createPilotProvider({
+      name: `Reassigned provider ${randomUUID().slice(0, 8)}`,
+      specialties: [serviceId],
+      serviceZone: 'بريدة',
+    });
+    await repository.updatePilotProviderVerification(provider.id, 'verified');
+    const customer = await repository.upsertCustomer(
+      `reassign-${randomUUID()}`,
+    );
+    const request = await repository.create(
+      {
+        serviceId,
+        address: 'حي الصفراء، بريدة',
+        timing: 'as-soon-as-possible',
+      },
+      customer.id,
+    );
+    // Marketplace offer from the same provider is rejected by the customer.
+    await repository.inviteProvidersToRequest(request.id, [provider.id]);
+    const quote = await repository.submitProviderQuote(
+      request.id,
+      provider.id,
+      15_000,
+      'عرض مرفوض ثم إعادة تعيين',
+    );
+    await repository.decideQuote(request.id, customer.id, quote.id, 'rejected');
+
+    // Admin manually reassigns the SAME previously-rejected provider.
+    await expect(
+      repository.assignProvider(request.id, provider.id),
+    ).resolves.toMatchObject({
+      status: 'assigned',
+      assignedProvider: { id: provider.id },
+    });
+    // Authority derives from the CURRENT assignment, not the stale rejection.
+    await expect(
+      repository.findProviderTrackingAuthority(request.id, provider.id),
+    ).resolves.toMatchObject({
+      requestId: request.id,
+      status: 'assigned',
+      trackingSessionState: null,
+    });
+
+    // Start heading starts tracking; in_progress keeps it active.
+    await repository.updateStatusForProvider(
+      request.id,
+      provider.id,
+      'on_the_way',
+    );
+    await expect(
+      repository.submitProviderLocationSample(
+        request.id,
+        provider.id,
+        sample(activeSampleTime()),
+        new Date(),
+      ),
+    ).resolves.toMatchObject({ duplicate: false });
+    await repository.updateStatusForProvider(
+      request.id,
+      provider.id,
+      'in_progress',
+    );
+    await expect(
+      repository.findProviderTrackingAuthority(request.id, provider.id),
+    ).resolves.toMatchObject({
+      requestId: request.id,
+      status: 'in_progress',
+      trackingSessionState: 'active',
+    });
+
+    // Completion terminates tracking ATOMICALLY with the status change.
+    await repository.updateStatusForProvider(
+      request.id,
+      provider.id,
+      'completed',
+    );
+    await expect(
+      repository.findProviderTrackingAuthority(request.id, provider.id),
+    ).resolves.toMatchObject({
+      requestId: request.id,
+      status: 'completed',
+      trackingSessionState: 'stopped',
+    });
+
+    // No late location sample can be accepted after completion (fail-closed).
+    await expect(
+      repository.submitProviderLocationSample(
+        request.id,
+        provider.id,
+        sample(activeSampleTime()),
+        new Date(),
+      ),
+    ).rejects.toThrow('Active provider tracking request not found');
+  });
+
   async function waitForDatabaseCondition(
     pool: Pool,
     sql: string,

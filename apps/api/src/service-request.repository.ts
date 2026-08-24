@@ -1911,7 +1911,10 @@ export class ServiceRequestRepository
       // Reconcile any active marketplace state atomically so the manually
       // selected provider is the single authoritative provider: every active
       // provider quote is rejected and every open opportunity is closed,
-      // mirroring the closing behavior of a quote approval.
+      // mirroring the closing behavior of a quote approval. Quotes already
+      // decided by the customer keep their historical status (audit data) —
+      // their opportunities are closed below regardless, so no phantom-open
+      // marketplace state can survive an administrative assignment.
       const closedQuotes = await client.query<{
         id: string;
         provider_id: string | null;
@@ -2001,13 +2004,22 @@ export class ServiceRequestRepository
   }
 
   /**
-   * Quote gating for entering in_progress. A request with no quotes may
-   * start, and a request with at least one approved quote may start. Any
-   * other combination (only proposed / rejected / withdrawn quotes) is
-   * refused with the existing 'Quote approval required' error. The verdict
-   * aggregates across ALL quotes: a newer rejected or withdrawn quote must
-   * never invalidate an earlier approval, so the rule deliberately does not
-   * inspect only the newest quote.
+   * Quote gating for entering in_progress.
+   *
+   * Only STAFF quotes (provider_id IS NULL) carry a pending customer-approval
+   * obligation that must block service start: a request with no staff quotes
+   * may start, and one with at least one approved staff quote may start. Any
+   * other staff-quote combination is refused with the existing
+   * 'Quote approval required' error.
+   *
+   * Provider-originated quotes are deliberately NOT counted here. They belong
+   * to the pre-dispatch marketplace flow; once an administrative (or approved)
+   * assignment exists it is the single authoritative provider decision, and a
+   * stale rejected/withdrawn marketplace quote must never block operational
+   * transitions of the CURRENT assignment (production bug t_c15d4ef2). The
+   * verdict aggregates across all matching quotes: a newer rejected or
+   * withdrawn staff quote must never invalidate an earlier approval, so the
+   * rule deliberately does not inspect only the newest quote.
    */
   private async assertServiceMayStart(
     client: PoolClient,
@@ -2018,8 +2030,10 @@ export class ServiceRequestRepository
       total_count: number;
     }>(
       `SELECT
-         COUNT(*) FILTER (WHERE status = 'approved')::int AS approved_count,
-         COUNT(*)::int AS total_count
+         COUNT(*) FILTER (
+           WHERE status = 'approved' AND provider_id IS NULL
+         )::int AS approved_count,
+         COUNT(*) FILTER (WHERE provider_id IS NULL)::int AS total_count
        FROM service_quotes
        WHERE service_request_id = $1`,
       [databaseId],
