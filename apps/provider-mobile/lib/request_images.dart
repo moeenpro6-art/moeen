@@ -37,9 +37,8 @@ class ProviderRequestImage {
     return value
         .whereType<Map<dynamic, dynamic>>()
         .map(
-          (item) => ProviderRequestImage.fromJson(
-            Map<String, dynamic>.from(item),
-          ),
+          (item) =>
+              ProviderRequestImage.fromJson(Map<String, dynamic>.from(item)),
         )
         .toList();
   }
@@ -169,10 +168,7 @@ class _RemoteImageTile extends StatelessWidget {
 }
 
 class _RequestImageViewer extends StatelessWidget {
-  const _RequestImageViewer({
-    required this.images,
-    required this.initialIndex,
-  });
+  const _RequestImageViewer({required this.images, required this.initialIndex});
 
   final List<ProviderRequestImage> images;
   final int initialIndex;

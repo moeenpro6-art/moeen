@@ -1,0 +1,48 @@
+{
+  "project_info": {
+    "project_number": "423808774850",
+    "project_id": "moeen-nonfiction",
+    "storage_bucket": "moeen-nonfiction.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:423808774850:android:4cdedd4deea2f6a2b2c15b",
+        "android_client_info": {
+          "package_name": "com.moeen.moeen_mobile"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBeM0s1WfdEtppG6hsiwuIU0KzMT3ipulY"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:423808774850:android:fae1d4d849effdeeb2c15b",
+        "android_client_info": {
+          "package_name": "com.moeen.moeen_provider"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBeM0s1WfdEtppG6hsiwuIU0KzMT3ipulY"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
