@@ -857,10 +857,13 @@ export default async function Home({ searchParams }: HomeProps) {
                       )}
                     </div>
                   )}
-                  {(job.status === 'تم التعيين' ||
-                    (job.status === 'الفني في الطريق' &&
-                      !['proposed', 'rejected'].includes(job.quote?.status ?? '')) ||
-                    job.status === 'قيد التنفيذ') && (
+                  {/* Operational transitions derive from the CURRENT request
+                      status only. A historical marketplace quote (rejected,
+                      withdrawn, or still proposed) must never hide the
+                      completion path of an active assignment. */}
+                  {['تم التعيين',
+                    'الفني في الطريق',
+                    'قيد التنفيذ'].includes(job.status) && (
                     <form action={updateStatus} className={styles.assignment}>
                       <input name="requestId" type="hidden" value={job.id} />
                       {job.status === 'تم التعيين' && <button name="status" value="on_the_way">في الطريق</button>}

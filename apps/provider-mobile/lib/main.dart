@@ -253,11 +253,15 @@ class ProviderLoginResult {
 }
 
 String? nextProviderStatus(ProviderJob job) {
+  // Operational actions derive from the CURRENT authoritative request state
+  // (assignment + status) only. A historical marketplace quote attached to
+  // the job projection is audit data: after an administrative reassignment a
+  // stale rejected/proposed quote must never suppress the status-transition
+  // buttons (production bug t_c15d4ef2). The backend remains the authority:
+  // it independently refuses invalid transitions and unapproved staff-quote
+  // requests, so this client-side gate only decides which button to show.
   if (job.status == 'assigned') return 'on_the_way';
-  if (job.status == 'on_the_way') {
-    if (job.quote != null && job.quote!.status != 'approved') return null;
-    return 'in_progress';
-  }
+  if (job.status == 'on_the_way') return 'in_progress';
   if (job.status == 'in_progress') return 'completed';
   return null;
 }
@@ -267,11 +271,6 @@ String providerActionLabel(ProviderJob job) {
   if (nextStatus == 'on_the_way') return 'بدء التوجه';
   if (nextStatus == 'in_progress') return 'بدء الخدمة';
   if (nextStatus == 'completed') return 'إنهاء الخدمة';
-  if (job.status == 'on_the_way' && job.quote != null) {
-    return job.quote!.status == 'rejected'
-        ? 'أرسل التشغيل عرضًا بديلًا'
-        : 'بانتظار قرار العميل على عرض السعر';
-  }
   return 'لا يوجد إجراء متاح';
 }
 

@@ -1030,7 +1030,7 @@ describe('ServiceRequestRepository', () => {
       ).rejects.toThrow('Quote approval required');
     });
 
-    it('refuses in_progress while the only quote is rejected', async () => {
+    it('allows in_progress once an admin manually reassigns after the only provider quote was rejected (t_c15d4ef2)', async () => {
       const uniqueServiceId = `start-gate-rejected-${randomUUID()}`;
       const { request, customerId } =
         await createPendingRequest(uniqueServiceId);
@@ -1051,12 +1051,69 @@ describe('ServiceRequestRepository', () => {
       );
       await repository.assignProvider(request.id, manual.id);
       await repository.updateStatus(request.id, 'on_the_way');
+      // A stale REJECTED marketplace quote is historical/audit data only.
+      // The current administrative assignment is authoritative, so the
+      // operational transition must not stay blocked by it (production bug
+      // t_c15d4ef2).
       await expect(
         repository.updateStatus(request.id, 'in_progress'),
-      ).rejects.toThrow('Quote approval required');
+      ).resolves.toMatchObject({ status: 'in_progress' });
     });
 
-    it('refuses in_progress while the only quote is withdrawn', async () => {
+    it('lets a previously-rejected provider complete every transition after being manually reassigned (t_c15d4ef2)', async () => {
+      const uniqueServiceId = `start-gate-resign-${randomUUID()}`;
+      const { request, customerId } =
+        await createPendingRequest(uniqueServiceId);
+      const winner = await createVerifiedProvider([uniqueServiceId]);
+      await repository.inviteProvidersToRequest(request.id, [winner.id]);
+      const quote = await repository.submitProviderQuote(
+        request.id,
+        winner.id,
+        15_000,
+        'عرض السوق المرفوض',
+      );
+      await repository.decideQuote(
+        request.id,
+        customerId,
+        quote.id,
+        'rejected',
+      );
+      // Admin manually assigns THE SAME provider whose offer was rejected.
+      await expect(
+        repository.assignProvider(request.id, winner.id),
+      ).resolves.toMatchObject({
+        status: 'assigned',
+        assignedProvider: { id: winner.id },
+      });
+      // Start heading -> start service -> complete, driven by the provider.
+      await expect(
+        repository.updateStatusForProvider(request.id, winner.id, 'on_the_way'),
+      ).resolves.toMatchObject({ status: 'on_the_way' });
+      await expect(
+        repository.updateStatusForProvider(
+          request.id,
+          winner.id,
+          'in_progress',
+        ),
+      ).resolves.toMatchObject({ status: 'in_progress' });
+      await expect(
+        repository.updateStatusForProvider(request.id, winner.id, 'completed'),
+      ).resolves.toMatchObject({ status: 'completed' });
+      // The stale rejection stays history: the event log records it BEFORE
+      // the reassignment, and every operational step afterwards succeeded.
+      const events = await readEventTypes(request.id);
+      expect(events.indexOf('quote_rejected')).toBeLessThan(
+        events.indexOf('provider_assigned'),
+      );
+      expect(events.slice(events.indexOf('provider_assigned'))).toEqual([
+        'provider_assigned',
+        'status_updated',
+        'status_updated',
+        'status_updated',
+      ]);
+    });
+
+    it('allows in_progress once an admin manually reassigns after the only provider quote was withdrawn (t_c15d4ef2)', async () => {
       const uniqueServiceId = `start-gate-withdrawn-${randomUUID()}`;
       const { request } = await createPendingRequest(uniqueServiceId);
       const quoted = await createVerifiedProvider([uniqueServiceId]);
@@ -1071,9 +1128,11 @@ describe('ServiceRequestRepository', () => {
       await repository.withdrawProviderQuote(quote.id, quoted.id);
       await repository.assignProvider(request.id, manual.id);
       await repository.updateStatus(request.id, 'on_the_way');
+      // Same rule as the rejected-quote case: a withdrawn marketplace quote
+      // is audit data and must not block the current assignment.
       await expect(
         repository.updateStatus(request.id, 'in_progress'),
-      ).rejects.toThrow('Quote approval required');
+      ).resolves.toMatchObject({ status: 'in_progress' });
     });
 
     it('allows in_progress when the only quote is approved', async () => {
