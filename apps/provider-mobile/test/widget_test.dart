@@ -5,6 +5,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:moeen_provider/main.dart';
+import 'package:moeen_provider/provider_tracking.dart' as provider_tracking;
 
 void main() {
   test('provider job parsing preserves a customer-approved quote', () {
@@ -62,17 +63,20 @@ void main() {
     expect(job.customerPhone, '+966****0012');
   });
 
-  test('provider job parsing accepts terminal history without private fields', () {
-    final job = ProviderJob.fromJson({
-      'id': 'MOE-1004',
-      'serviceId': 'ac-cleaning',
-      'timing': 'as-soon-as-possible',
-      'status': 'completed',
-    });
+  test(
+    'provider job parsing accepts terminal history without private fields',
+    () {
+      final job = ProviderJob.fromJson({
+        'id': 'MOE-1004',
+        'serviceId': 'ac-cleaning',
+        'timing': 'as-soon-as-possible',
+        'status': 'completed',
+      });
 
-    expect(job.address, isNull);
-    expect(job.customerPhone, isNull);
-  });
+      expect(job.address, isNull);
+      expect(job.customerPhone, isNull);
+    },
+  );
 
   test('provider api parses a terminal job in the assigned-job list', () async {
     final api = ProviderApi(
@@ -94,23 +98,28 @@ void main() {
     expect(jobs.single.address, isNull);
   });
 
-  test('provider api parses an address-redacted completed PATCH response', () async {
-    final api = ProviderApi(
-      baseUrl: 'https://api.example.test',
-      client: MockClient(
-        (_) async => http.Response(_jobCompletedJson, 200, headers: _jsonUtf8),
-      ),
-    );
+  test(
+    'provider api parses an address-redacted completed PATCH response',
+    () async {
+      final api = ProviderApi(
+        baseUrl: 'https://api.example.test',
+        client: MockClient(
+          (_) async =>
+              http.Response(_completedTransitionJson, 200, headers: _jsonUtf8),
+        ),
+      );
 
-    final job = await api.updateJobStatus(
-      'provider-token',
-      'MOE-2003',
-      'completed',
-    );
+      final transition = await api.updateJobStatus(
+        'provider-token',
+        'MOE-2003',
+        'completed',
+      );
 
-    expect(job.status, 'completed');
-    expect(job.address, isNull);
-  });
+      expect(transition.job.status, 'completed');
+      expect(transition.job.address, isNull);
+      expect(transition.tracking.active, isFalse);
+    },
+  );
 
   test('provider api reports a 401 as an unauthorized exception', () async {
     final api = ProviderApi(
@@ -130,19 +139,22 @@ void main() {
     );
   });
 
-  test('provider api keeps reporting server errors as generic failures', () async {
-    final api = ProviderApi(
-      baseUrl: 'https://api.example.test',
-      client: MockClient(
-        (_) async => http.Response('{"message":"boom"}', 500),
-      ),
-    );
+  test(
+    'provider api keeps reporting server errors as generic failures',
+    () async {
+      final api = ProviderApi(
+        baseUrl: 'https://api.example.test',
+        client: MockClient(
+          (_) async => http.Response('{"message":"boom"}', 500),
+        ),
+      );
 
-    await expectLater(
-      api.jobs('any-token'),
-      throwsA(isA<ProviderApiException>()),
-    );
-  });
+      await expectLater(
+        api.jobs('any-token'),
+        throwsA(isA<ProviderApiException>()),
+      );
+    },
+  );
 
   testWidgets(
     'a 401 while refreshing jobs clears the stored session and returns to '
@@ -171,7 +183,13 @@ void main() {
         }),
       );
 
-      await tester.pumpWidget(MoeenProviderApp(api: api, sessionStore: store, hiddenStore: _MemoryHiddenStore()));
+      await tester.pumpWidget(
+        MoeenProviderApp(
+          api: api,
+          sessionStore: store,
+          hiddenStore: _MemoryHiddenStore(),
+        ),
+      );
       await tester.pumpAndSettle();
 
       // Restored session shows the authenticated dashboard.
@@ -217,7 +235,13 @@ void main() {
         }),
       );
 
-      await tester.pumpWidget(MoeenProviderApp(api: api, sessionStore: store, hiddenStore: _MemoryHiddenStore()));
+      await tester.pumpWidget(
+        MoeenProviderApp(
+          api: api,
+          sessionStore: store,
+          hiddenStore: _MemoryHiddenStore(),
+        ),
+      );
       await tester.pumpAndSettle();
 
       // Authenticated dashboard with the availability switch.
@@ -247,7 +271,13 @@ void main() {
       ),
     );
 
-    await tester.pumpWidget(MoeenProviderApp(api: api, sessionStore: store, hiddenStore: _MemoryHiddenStore()));
+    await tester.pumpWidget(
+      MoeenProviderApp(
+        api: api,
+        sessionStore: store,
+        hiddenStore: _MemoryHiddenStore(),
+      ),
+    );
     await tester.pumpAndSettle();
 
     expect(find.text('فرص العمل المتاحة'), findsOneWidget);
@@ -256,111 +286,28 @@ void main() {
     expect(find.text('تقديم عرض'), findsOneWidget);
   });
 
-
-  testWidgets('shows the customer phone on an assigned job when the API returns it', (tester) async {
-    final store = _MemorySessionStore()..token = 'stale-token';
-    final api = ProviderApi(
-      baseUrl: 'https://api.example.test',
-      client: MockClient((request) async {
-        final path = request.url.path;
-        if (path == '/provider/auth/me') {
-          return http.Response(_providerJson, 200, headers: _jsonUtf8);
-        }
-        if (path == '/provider/service-requests') {
-          return http.Response(
-            '[{"id":"MOE-1001","serviceId":"ac-cleaning",'
-            '"address":"حي الصفراء، بريدة","timing":"as-soon-as-possible",'
-            '"status":"assigned","customerPhone":"+966****0012"}]',
-            200,
-            headers: _jsonUtf8,
-          );
-        }
-        if (path == '/provider/opportunities') {
-          return http.Response('[]', 200);
-        }
-        return http.Response('{}', 404);
-      }),
-    );
-
-    await tester.pumpWidget(
-      MoeenProviderApp(
-        api: api,
-        sessionStore: store,
-        hiddenStore: _MemoryHiddenStore(),
-      ),
-    );
-    await tester.pumpAndSettle();
-
-    expect(find.text('رقم العميل: +966****0012'), findsOneWidget);
-  });
-
-  testWidgets('does not show a customer phone label when the API omits the field', (tester) async {
-    final store = _MemorySessionStore()..token = 'stale-token';
-    final api = ProviderApi(
-      baseUrl: 'https://api.example.test',
-      client: MockClient((request) async {
-        final path = request.url.path;
-        if (path == '/provider/auth/me') {
-          return http.Response(_providerJson, 200, headers: _jsonUtf8);
-        }
-        if (path == '/provider/service-requests') {
-          return http.Response(
-            '[{"id":"MOE-1001","serviceId":"ac-cleaning",'
-            '"timing":"as-soon-as-possible","status":"completed"}]',
-            200,
-            headers: _jsonUtf8,
-          );
-        }
-        if (path == '/provider/opportunities') {
-          return http.Response('[]', 200);
-        }
-        return http.Response('{}', 404);
-      }),
-    );
-
-    await tester.pumpWidget(
-      MoeenProviderApp(
-        api: api,
-        sessionStore: store,
-        hiddenStore: _MemoryHiddenStore(),
-      ),
-    );
-    await tester.pumpAndSettle();
-
-    expect(find.textContaining('رقم العميل'), findsNothing);
-  });
-
   testWidgets(
-    'tapping تأكيد الانطلاق opens the confirmation sheet and confirming '
-    'advances an assigned job to on_the_way',
+    'shows the customer phone on an assigned job when the API returns it',
     (tester) async {
       final store = _MemorySessionStore()..token = 'stale-token';
-      var patchedStatus = '';
-      var jobStatus = 'assigned';
       final api = ProviderApi(
         baseUrl: 'https://api.example.test',
         client: MockClient((request) async {
-          final method = request.method;
           final path = request.url.path;
-          if (method == 'GET' && path == '/provider/auth/me') {
+          if (path == '/provider/auth/me') {
             return http.Response(_providerJson, 200, headers: _jsonUtf8);
           }
-          if (method == 'GET' && path == '/provider/service-requests') {
-            final body = jobStatus == 'on_the_way'
-                ? '[$_jobOnTheWayJson]'
-                : '[$_jobAssignedJson]';
-            return http.Response(body, 200, headers: _jsonUtf8);
+          if (path == '/provider/service-requests') {
+            return http.Response(
+              '[{"id":"MOE-1001","serviceId":"ac-cleaning",'
+              '"address":"حي الصفراء، بريدة","timing":"as-soon-as-possible",'
+              '"status":"assigned","customerPhone":"+966****0012"}]',
+              200,
+              headers: _jsonUtf8,
+            );
           }
-          if (method == 'GET' && path == '/provider/opportunities') {
-            return http.Response('[]', 200, headers: _jsonUtf8);
-          }
-          if (method == 'PATCH' &&
-              path == '/provider/service-requests/MOE-2001/status') {
-            patchedStatus =
-                (jsonDecode(request.body) as Map<String, dynamic>)['status']
-                    as String;
-            jobStatus = 'on_the_way';
-            return http.Response(_jobOnTheWayJson, 200, headers: _jsonUtf8);
+          if (path == '/provider/opportunities') {
+            return http.Response('[]', 200);
           }
           return http.Response('{}', 404);
         }),
@@ -375,29 +322,358 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      expect(find.text('تأكيد الانطلاق'), findsOneWidget);
+      expect(find.text('رقم العميل: +966****0012'), findsOneWidget);
+    },
+  );
 
-      // Opening the sheet from a pre-MaterialApp context throws
-      // "debugCheckHasMaterialLocalizations"; this tap must not crash.
-      await tester.ensureVisible(find.text('تأكيد الانطلاق'));
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('تأكيد الانطلاق'));
+  testWidgets(
+    'does not show a customer phone label when the API omits the field',
+    (tester) async {
+      final store = _MemorySessionStore()..token = 'stale-token';
+      final api = ProviderApi(
+        baseUrl: 'https://api.example.test',
+        client: MockClient((request) async {
+          final path = request.url.path;
+          if (path == '/provider/auth/me') {
+            return http.Response(_providerJson, 200, headers: _jsonUtf8);
+          }
+          if (path == '/provider/service-requests') {
+            return http.Response(
+              '[{"id":"MOE-1001","serviceId":"ac-cleaning",'
+              '"timing":"as-soon-as-possible","status":"completed"}]',
+              200,
+              headers: _jsonUtf8,
+            );
+          }
+          if (path == '/provider/opportunities') {
+            return http.Response('[]', 200);
+          }
+          return http.Response('{}', 404);
+        }),
+      );
+
+      await tester.pumpWidget(
+        MoeenProviderApp(
+          api: api,
+          sessionStore: store,
+          hiddenStore: _MemoryHiddenStore(),
+        ),
+      );
       await tester.pumpAndSettle();
 
-      expect(find.text('تأكيد: تأكيد الانطلاق'), findsOneWidget);
+      expect(find.textContaining('رقم العميل'), findsNothing);
+    },
+  );
+
+  testWidgets('tapping بدء التوجه opens the confirmation sheet and confirming '
+      'advances an assigned job to on_the_way', (tester) async {
+    final store = _MemorySessionStore()..token = 'stale-token';
+    final runtime = _FakeTrackingRuntime();
+    var patchedStatus = '';
+    var jobStatus = 'assigned';
+    final api = ProviderApi(
+      baseUrl: 'https://api.example.test',
+      client: MockClient((request) async {
+        final method = request.method;
+        final path = request.url.path;
+        if (method == 'GET' && path == '/provider/auth/me') {
+          return http.Response(_providerJson, 200, headers: _jsonUtf8);
+        }
+        if (method == 'GET' && path == '/provider/service-requests') {
+          final body = jobStatus == 'on_the_way'
+              ? '[$_jobOnTheWayJson]'
+              : '[$_jobAssignedJson]';
+          return http.Response(body, 200, headers: _jsonUtf8);
+        }
+        if (method == 'GET' && path == '/provider/opportunities') {
+          return http.Response('[]', 200, headers: _jsonUtf8);
+        }
+        if (method == 'PATCH' &&
+            path == '/provider/service-requests/MOE-2001/status') {
+          patchedStatus =
+              (jsonDecode(request.body) as Map<String, dynamic>)['status']
+                  as String;
+          jobStatus = 'on_the_way';
+          return http.Response(
+            _onTheWayTransitionJson,
+            200,
+            headers: _jsonUtf8,
+          );
+        }
+        return http.Response('{}', 404);
+      }),
+    );
+
+    await tester.pumpWidget(
+      MoeenProviderApp(
+        api: api,
+        sessionStore: store,
+        hiddenStore: _MemoryHiddenStore(),
+        trackingRuntime: runtime,
+        trackingPermissionGate: const _GrantedTrackingPermissionGate(),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('بدء التوجه'), findsOneWidget);
+
+    // Opening the sheet from a pre-MaterialApp context throws
+    // "debugCheckHasMaterialLocalizations"; this tap must not crash.
+    await tester.ensureVisible(find.text('بدء التوجه'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('بدء التوجه'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('تأكيد: بدء التوجه'), findsOneWidget);
+    expect(
+      find.text('سيتم إبلاغ العميل بأنك في الطريق. تأكد من استعدادك للمغادرة.'),
+      findsOneWidget,
+    );
+
+    await tester.tap(find.text('تأكيد: بدء التوجه'));
+    await tester.pumpAndSettle();
+
+    expect(patchedStatus, 'on_the_way');
+    expect(find.text('بدء التوجه'), findsNothing);
+    expect(find.text('بدء الخدمة'), findsOneWidget);
+    expect(runtime.started, hasLength(1));
+    expect(runtime.started.single.requestId, 'MOE-2001');
+    expect(runtime.started.single.cadenceMs, 15000);
+  });
+
+  testWidgets(
+    'an inactive transition snapshot updates the job without requesting location permission',
+    (tester) async {
+      final runtime = _FakeTrackingRuntime();
+      final permissionGate = _CountingTrackingPermissionGate();
+      var patchCalls = 0;
+      var jobStatus = 'assigned';
+      final api = ProviderApi(
+        baseUrl: 'https://api.example.test',
+        client: MockClient((request) async {
+          final path = request.url.path;
+          if (request.method == 'GET' && path == '/provider/auth/me') {
+            return http.Response(_providerJson, 200, headers: _jsonUtf8);
+          }
+          if (request.method == 'GET' && path == '/provider/service-requests') {
+            return http.Response(
+              jobStatus == 'assigned'
+                  ? '[$_jobAssignedJson]'
+                  : '[$_jobOnTheWayJson]',
+              200,
+              headers: _jsonUtf8,
+            );
+          }
+          if (request.method == 'GET' && path == '/provider/opportunities') {
+            return http.Response('[]', 200, headers: _jsonUtf8);
+          }
+          if (request.method == 'GET' &&
+              path == '/provider/service-requests/MOE-2001/tracking') {
+            return http.Response(
+              _assignedInactiveTrackingJson,
+              200,
+              headers: _jsonUtf8,
+            );
+          }
+          if (request.method == 'PATCH' &&
+              path == '/provider/service-requests/MOE-2001/status') {
+            patchCalls += 1;
+            jobStatus = 'on_the_way';
+            return http.Response(
+              _onTheWayInactiveTransitionJson,
+              200,
+              headers: _jsonUtf8,
+            );
+          }
+          return http.Response('{}', 404);
+        }),
+      );
+
+      await tester.pumpWidget(
+        MoeenProviderApp(
+          api: api,
+          sessionStore: _MemorySessionStore()..token = 'provider-session',
+          hiddenStore: _MemoryHiddenStore(),
+          trackingRuntime: runtime,
+          trackingPermissionGate: permissionGate,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final startAction = find.text('بدء التوجه');
+      await tester.ensureVisible(startAction);
+      await tester.pump();
+      await tester.tap(startAction);
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('تأكيد: بدء التوجه'));
+      await tester.pumpAndSettle();
+
+      expect(patchCalls, 1);
+      expect(permissionGate.calls, 0);
+      expect(runtime.started, isEmpty);
+      expect(runtime.stopCalls, 2);
+      expect(runtime.clearQueueCalls, 2);
+      expect(find.text('بدء الخدمة'), findsOneWidget);
+    },
+  );
+
+  testWidgets(
+    'an active transition requests permission but never starts tracking when denied',
+    (tester) async {
+      final runtime = _FakeTrackingRuntime();
+      final permissionGate = _DeniedTrackingPermissionGate();
+      var patchCalls = 0;
+      var jobStatus = 'assigned';
+      final api = ProviderApi(
+        baseUrl: 'https://api.example.test',
+        client: MockClient((request) async {
+          final path = request.url.path;
+          if (request.method == 'GET' && path == '/provider/auth/me') {
+            return http.Response(_providerJson, 200, headers: _jsonUtf8);
+          }
+          if (request.method == 'GET' && path == '/provider/service-requests') {
+            return http.Response(
+              jobStatus == 'assigned'
+                  ? '[$_jobAssignedJson]'
+                  : '[$_jobOnTheWayJson]',
+              200,
+              headers: _jsonUtf8,
+            );
+          }
+          if (request.method == 'GET' && path == '/provider/opportunities') {
+            return http.Response('[]', 200, headers: _jsonUtf8);
+          }
+          if (request.method == 'GET' &&
+              path == '/provider/service-requests/MOE-2001/tracking') {
+            return http.Response(
+              _assignedInactiveTrackingJson,
+              200,
+              headers: _jsonUtf8,
+            );
+          }
+          if (request.method == 'PATCH' &&
+              path == '/provider/service-requests/MOE-2001/status') {
+            patchCalls += 1;
+            jobStatus = 'on_the_way';
+            return http.Response(
+              _onTheWayTransitionJson,
+              200,
+              headers: _jsonUtf8,
+            );
+          }
+          return http.Response('{}', 404);
+        }),
+      );
+
+      await tester.pumpWidget(
+        MoeenProviderApp(
+          api: api,
+          sessionStore: _MemorySessionStore()..token = 'provider-session',
+          hiddenStore: _MemoryHiddenStore(),
+          trackingRuntime: runtime,
+          trackingPermissionGate: permissionGate,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final startAction = find.text('بدء التوجه');
+      await tester.ensureVisible(startAction);
+      await tester.pump();
+      await tester.tap(startAction);
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('تأكيد: بدء التوجه'));
+      await tester.pumpAndSettle();
+
+      expect(patchCalls, 1);
+      expect(permissionGate.calls, 1);
+      expect(runtime.started, isEmpty);
       expect(
         find.text(
-          'سيتم إبلاغ العميل بأنك في الطريق. تأكد من استعدادك للمغادرة.',
+          'تم تحديث حالة المهمة، لكن لا يمكن تشغيل تتبع الموقع دون الإذن.',
         ),
         findsOneWidget,
       );
+      expect(find.text('بدء الخدمة'), findsOneWidget);
+    },
+  );
 
-      await tester.tap(find.text('تأكيد: تأكيد الانطلاق'));
+  testWidgets(
+    'an active in-progress transition updates cadence without stopping the tracking runtime',
+    (tester) async {
+      final store = _MemorySessionStore()..token = 'provider-session';
+      final runtime = _FakeTrackingRuntime();
+      var patchedStatus = '';
+      var jobStatus = 'on_the_way';
+      final api = ProviderApi(
+        baseUrl: 'https://api.example.test',
+        client: MockClient((request) async {
+          final path = request.url.path;
+          if (request.method == 'GET' && path == '/provider/auth/me') {
+            return http.Response(_providerJson, 200, headers: _jsonUtf8);
+          }
+          if (request.method == 'GET' && path == '/provider/service-requests') {
+            return http.Response(
+              jobStatus == 'on_the_way'
+                  ? '[$_jobOnTheWayJson]'
+                  : '[$_jobInProgressJson]',
+              200,
+              headers: _jsonUtf8,
+            );
+          }
+          if (request.method == 'GET' && path == '/provider/opportunities') {
+            return http.Response('[]', 200, headers: _jsonUtf8);
+          }
+          if (request.method == 'GET' &&
+              path == '/provider/service-requests/MOE-2002/tracking') {
+            return http.Response(
+              _onTheWayTrackingJson,
+              200,
+              headers: _jsonUtf8,
+            );
+          }
+          if (request.method == 'PATCH' &&
+              path == '/provider/service-requests/MOE-2002/status') {
+            patchedStatus =
+                (jsonDecode(request.body) as Map<String, dynamic>)['status']
+                    as String;
+            jobStatus = 'in_progress';
+            return http.Response(
+              _inProgressTransitionJson,
+              200,
+              headers: _jsonUtf8,
+            );
+          }
+          return http.Response('{}', 404);
+        }),
+      );
+
+      await tester.pumpWidget(
+        MoeenProviderApp(
+          api: api,
+          sessionStore: store,
+          hiddenStore: _MemoryHiddenStore(),
+          trackingRuntime: runtime,
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(runtime.started, hasLength(1));
+      expect(runtime.stopCalls, 0);
+
+      final startServiceAction = find.text('بدء الخدمة');
+      await tester.ensureVisible(startServiceAction);
+      await tester.pump();
+      await tester.tap(startServiceAction);
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('تأكيد: بدء الخدمة'));
       await tester.pumpAndSettle();
 
-      expect(patchedStatus, 'on_the_way');
-      expect(find.text('تأكيد الانطلاق'), findsNothing);
-      expect(find.text('بدء الخدمة'), findsOneWidget);
+      expect(patchedStatus, 'in_progress');
+      expect(runtime.updated, hasLength(1));
+      expect(runtime.updated.single.requestId, 'MOE-2002');
+      expect(runtime.updated.single.cadenceMs, 60000);
+      // Recovery and the authorized cadence transition preserve one runtime.
+      expect(runtime.stopCalls, 0);
+      expect(runtime.clearQueueCalls, 0);
     },
   );
 
@@ -416,7 +692,11 @@ void main() {
             return http.Response(_providerJson, 200, headers: _jsonUtf8);
           }
           if (method == 'GET' && path == '/provider/service-requests') {
-            return http.Response('[$_jobOnTheWayJson]', 200, headers: _jsonUtf8);
+            return http.Response(
+              '[$_jobOnTheWayJson]',
+              200,
+              headers: _jsonUtf8,
+            );
           }
           if (method == 'GET' && path == '/provider/opportunities') {
             return http.Response('[]', 200, headers: _jsonUtf8);
@@ -463,74 +743,75 @@ void main() {
     },
   );
 
-  testWidgets(
-    'tapping إنهاء الخدمة opens the confirmation sheet and confirming '
-    'advances an in-progress job to completed',
-    (tester) async {
-      final store = _MemorySessionStore()..token = 'stale-token';
-      var patchedStatus = '';
-      var jobStatus = 'in_progress';
-      final api = ProviderApi(
-        baseUrl: 'https://api.example.test',
-        client: MockClient((request) async {
-          final method = request.method;
-          final path = request.url.path;
-          if (method == 'GET' && path == '/provider/auth/me') {
-            return http.Response(_providerJson, 200, headers: _jsonUtf8);
-          }
-          if (method == 'GET' && path == '/provider/service-requests') {
-            final body = jobStatus == 'completed'
-                ? '[$_jobCompletedJson]'
-                : '[$_jobInProgressJson]';
-            return http.Response(body, 200, headers: _jsonUtf8);
-          }
-          if (method == 'GET' && path == '/provider/opportunities') {
-            return http.Response('[]', 200, headers: _jsonUtf8);
-          }
-          if (method == 'PATCH' &&
-              path == '/provider/service-requests/MOE-2003/status') {
-            patchedStatus =
-                (jsonDecode(request.body) as Map<String, dynamic>)['status']
-                    as String;
-            jobStatus = 'completed';
-            return http.Response(_jobCompletedJson, 200, headers: _jsonUtf8);
-          }
-          return http.Response('{}', 404);
-        }),
-      );
+  testWidgets('tapping إنهاء الخدمة opens the confirmation sheet and confirming '
+      'advances an in-progress job to completed', (tester) async {
+    final store = _MemorySessionStore()..token = 'stale-token';
+    var patchedStatus = '';
+    var jobStatus = 'in_progress';
+    final api = ProviderApi(
+      baseUrl: 'https://api.example.test',
+      client: MockClient((request) async {
+        final method = request.method;
+        final path = request.url.path;
+        if (method == 'GET' && path == '/provider/auth/me') {
+          return http.Response(_providerJson, 200, headers: _jsonUtf8);
+        }
+        if (method == 'GET' && path == '/provider/service-requests') {
+          final body = jobStatus == 'completed'
+              ? '[$_jobCompletedJson]'
+              : '[$_jobInProgressJson]';
+          return http.Response(body, 200, headers: _jsonUtf8);
+        }
+        if (method == 'GET' && path == '/provider/opportunities') {
+          return http.Response('[]', 200, headers: _jsonUtf8);
+        }
+        if (method == 'PATCH' &&
+            path == '/provider/service-requests/MOE-2003/status') {
+          patchedStatus =
+              (jsonDecode(request.body) as Map<String, dynamic>)['status']
+                  as String;
+          jobStatus = 'completed';
+          return http.Response(
+            _completedTransitionJson,
+            200,
+            headers: _jsonUtf8,
+          );
+        }
+        return http.Response('{}', 404);
+      }),
+    );
 
-      await tester.pumpWidget(
-        MoeenProviderApp(
-          api: api,
-          sessionStore: store,
-          hiddenStore: _MemoryHiddenStore(),
-        ),
-      );
-      await tester.pumpAndSettle();
+    await tester.pumpWidget(
+      MoeenProviderApp(
+        api: api,
+        sessionStore: store,
+        hiddenStore: _MemoryHiddenStore(),
+      ),
+    );
+    await tester.pumpAndSettle();
 
-      expect(find.text('إنهاء الخدمة'), findsOneWidget);
+    expect(find.text('إنهاء الخدمة'), findsOneWidget);
 
-      await tester.ensureVisible(find.text('إنهاء الخدمة'));
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('إنهاء الخدمة'));
-      await tester.pumpAndSettle();
+    await tester.ensureVisible(find.text('إنهاء الخدمة'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('إنهاء الخدمة'));
+    await tester.pumpAndSettle();
 
-      expect(find.text('تأكيد: إنهاء الخدمة'), findsOneWidget);
-      expect(
-        find.text(
-          'سيتم إبلاغ العميل باكتمال الخدمة. تأكد من إنهاء العمل المتفق عليه قبل المتابعة.',
-        ),
-        findsOneWidget,
-      );
+    expect(find.text('تأكيد: إنهاء الخدمة'), findsOneWidget);
+    expect(
+      find.text(
+        'سيتم إبلاغ العميل باكتمال الخدمة. تأكد من إنهاء العمل المتفق عليه قبل المتابعة.',
+      ),
+      findsOneWidget,
+    );
 
-      await tester.tap(find.text('تأكيد: إنهاء الخدمة'));
-      await tester.pumpAndSettle();
+    await tester.tap(find.text('تأكيد: إنهاء الخدمة'));
+    await tester.pumpAndSettle();
 
-      expect(patchedStatus, 'completed');
-      expect(find.text('إنهاء الخدمة'), findsNothing);
-      expect(find.text('لا يوجد إجراء متاح'), findsOneWidget);
-    },
-  );
+    expect(patchedStatus, 'completed');
+    expect(find.text('إنهاء الخدمة'), findsNothing);
+    expect(find.text('لا يوجد إجراء متاح'), findsOneWidget);
+  });
 
   testWidgets('shows the empty state when there are no opportunities', (
     tester,
@@ -543,7 +824,13 @@ void main() {
       ),
     );
 
-    await tester.pumpWidget(MoeenProviderApp(api: api, sessionStore: store, hiddenStore: _MemoryHiddenStore()));
+    await tester.pumpWidget(
+      MoeenProviderApp(
+        api: api,
+        sessionStore: store,
+        hiddenStore: _MemoryHiddenStore(),
+      ),
+    );
     await tester.pumpAndSettle();
 
     expect(find.text('لا توجد فرص متاحة حاليًا.'), findsOneWidget);
@@ -575,17 +862,20 @@ void main() {
         ),
       );
 
-      await tester.pumpWidget(MoeenProviderApp(api: api, sessionStore: store, hiddenStore: _MemoryHiddenStore()));
+      await tester.pumpWidget(
+        MoeenProviderApp(
+          api: api,
+          sessionStore: store,
+          hiddenStore: _MemoryHiddenStore(),
+        ),
+      );
       await tester.pumpAndSettle();
 
       await tester.tap(find.text('تقديم عرض'));
       await tester.pumpAndSettle();
       expect(find.text('تقديم عرض — تنظيف المكيفات'), findsOneWidget);
 
-      await tester.enterText(
-        find.byType(TextField).at(0),
-        '150',
-      );
+      await tester.enterText(find.byType(TextField).at(0), '150');
       await tester.enterText(find.byType(TextField).at(1), 'full clean');
       await tester.tap(find.text('إرسال العرض'));
       await tester.pumpAndSettle();
@@ -614,7 +904,13 @@ void main() {
         ),
       );
 
-      await tester.pumpWidget(MoeenProviderApp(api: api, sessionStore: store, hiddenStore: _MemoryHiddenStore()));
+      await tester.pumpWidget(
+        MoeenProviderApp(
+          api: api,
+          sessionStore: store,
+          hiddenStore: _MemoryHiddenStore(),
+        ),
+      );
       await tester.pumpAndSettle();
 
       await tester.tap(find.text('تقديم عرض'));
@@ -655,13 +951,16 @@ void main() {
         ),
       );
 
-      await tester.pumpWidget(MoeenProviderApp(api: api, sessionStore: store, hiddenStore: _MemoryHiddenStore()));
+      await tester.pumpWidget(
+        MoeenProviderApp(
+          api: api,
+          sessionStore: store,
+          hiddenStore: _MemoryHiddenStore(),
+        ),
+      );
       await tester.pumpAndSettle();
 
-      expect(
-        find.text('تعذر تحميل الفرص. حاول مرة أخرى.'),
-        findsOneWidget,
-      );
+      expect(find.text('تعذر تحميل الفرص. حاول مرة أخرى.'), findsOneWidget);
 
       await tester.tap(find.text('إعادة المحاولة'));
       await tester.pumpAndSettle();
@@ -683,7 +982,13 @@ void main() {
         ),
       );
 
-      await tester.pumpWidget(MoeenProviderApp(api: api, sessionStore: store, hiddenStore: _MemoryHiddenStore()));
+      await tester.pumpWidget(
+        MoeenProviderApp(
+          api: api,
+          sessionStore: store,
+          hiddenStore: _MemoryHiddenStore(),
+        ),
+      );
       await tester.pumpAndSettle();
 
       expect(store.token, isNull);
@@ -707,7 +1012,13 @@ void main() {
         ),
       );
 
-      await tester.pumpWidget(MoeenProviderApp(api: api, sessionStore: store, hiddenStore: _MemoryHiddenStore()));
+      await tester.pumpWidget(
+        MoeenProviderApp(
+          api: api,
+          sessionStore: store,
+          hiddenStore: _MemoryHiddenStore(),
+        ),
+      );
       await tester.pumpAndSettle();
 
       await tester.tap(find.text('تقديم عرض'));
@@ -741,82 +1052,178 @@ void main() {
   });
 
   test('opportunityMessage returns direct-rejection text', () {
-    final opp = ProviderOpportunity.fromJson({
-      'requestId': 'MOE-1002',
-      'serviceId': 'ac-cleaning',
-      'timing': 'as-soon-as-possible',
-      'opportunityStatus': 'rejected',
-      'myQuote': {
-        'id': 'QTE-2',
-        'amountHalalas': 10000,
-        'scope': 'test',
-        'status': 'rejected',
-      },
-    } as Map<String, dynamic>);
+    final opp = ProviderOpportunity.fromJson(
+      {
+            'requestId': 'MOE-1002',
+            'serviceId': 'ac-cleaning',
+            'timing': 'as-soon-as-possible',
+            'opportunityStatus': 'rejected',
+            'myQuote': {
+              'id': 'QTE-2',
+              'amountHalalas': 10000,
+              'scope': 'test',
+              'status': 'rejected',
+            },
+          }
+          as Map<String, dynamic>,
+    );
 
     expect(opportunityMessage(opp), 'تم رفض عرضك');
   });
 
-  test(
-      'opportunityMessage returns closed-after-other text for non-approved'
+  test('opportunityMessage returns closed-after-other text for non-approved'
       ' closed opportunity', () {
-    final opp = ProviderOpportunity.fromJson({
-      'requestId': 'MOE-1003',
-      'serviceId': 'ac-cleaning',
-      'timing': 'as-soon-as-possible',
-      'opportunityStatus': 'closed',
-      'myQuote': {
-        'id': 'QTE-3',
-        'amountHalalas': 12000,
-        'scope': 'test',
-        'status': 'rejected',
-      },
-    } as Map<String, dynamic>);
+    final opp = ProviderOpportunity.fromJson(
+      {
+            'requestId': 'MOE-1003',
+            'serviceId': 'ac-cleaning',
+            'timing': 'as-soon-as-possible',
+            'opportunityStatus': 'closed',
+            'myQuote': {
+              'id': 'QTE-3',
+              'amountHalalas': 12000,
+              'scope': 'test',
+              'status': 'rejected',
+            },
+          }
+          as Map<String, dynamic>,
+    );
 
     expect(opportunityMessage(opp), 'تم إغلاق الفرصة بعد اختيار عرض آخر');
   });
 
   test(
-      'opportunityMessage returns base label for approved closed opportunity',
-      () {
-    final opp = ProviderOpportunity.fromJson({
-      'requestId': 'MOE-1004',
-      'serviceId': 'ac-cleaning',
-      'timing': 'as-soon-as-possible',
-      'opportunityStatus': 'closed',
-      'myQuote': {
-        'id': 'QTE-4',
-        'amountHalalas': 14000,
-        'scope': 'test',
-        'status': 'approved',
-      },
-    } as Map<String, dynamic>);
+    'opportunityMessage returns base label for approved closed opportunity',
+    () {
+      final opp = ProviderOpportunity.fromJson(
+        {
+              'requestId': 'MOE-1004',
+              'serviceId': 'ac-cleaning',
+              'timing': 'as-soon-as-possible',
+              'opportunityStatus': 'closed',
+              'myQuote': {
+                'id': 'QTE-4',
+                'amountHalalas': 14000,
+                'scope': 'test',
+                'status': 'approved',
+              },
+            }
+            as Map<String, dynamic>,
+      );
 
-    expect(opportunityMessage(opp), 'مغلقة');
-  });
+      expect(opportunityMessage(opp), 'مغلقة');
+    },
+  );
 
-  testWidgets('hide action appears only for final rejected, withdrawn, and losing-closed opportunities', (tester) async {
-    final cases = <String, String>{
-      'rejected': 'تم رفض عرضك',
-      'withdrawn': 'عرضك مسحوب',
-      'closed-losing': 'تم إغلاق الفرصة بعد اختيار عرض آخر',
-    };
-    for (final entry in cases.entries) {
-      final json = switch (entry.key) {
-        'rejected' => _opportunitiesRejectedJson,
-        'withdrawn' => _opportunitiesWithdrawnJson,
-        _ => _opportunitiesClosedLosingJson,
+  testWidgets(
+    'hide action appears only for final rejected, withdrawn, and losing-closed opportunities',
+    (tester) async {
+      final cases = <String, String>{
+        'rejected': 'تم رفض عرضك',
+        'withdrawn': 'عرضك مسحوب',
+        'closed-losing': 'تم إغلاق الفرصة بعد اختيار عرض آخر',
       };
-      final store = _MemorySessionStore()..token = 'stale-token';
+      for (final entry in cases.entries) {
+        final json = switch (entry.key) {
+          'rejected' => _opportunitiesRejectedJson,
+          'withdrawn' => _opportunitiesWithdrawnJson,
+          _ => _opportunitiesClosedLosingJson,
+        };
+        final store = _MemorySessionStore()..token = 'stale-token';
+        final api = ProviderApi(
+          baseUrl: 'https://api.example.test',
+          client: _dashboardMockClient(
+            opportunitiesHandler: (_) async =>
+                http.Response(json, 200, headers: _jsonUtf8),
+          ),
+        );
+        // Tear down the previous app state so each iteration boots fresh.
+        await tester.pumpWidget(const SizedBox());
+        await tester.pumpWidget(
+          MoeenProviderApp(
+            api: api,
+            sessionStore: store,
+            hiddenStore: _MemoryHiddenStore(),
+          ),
+        );
+        await tester.pumpAndSettle();
+        expect(
+          find.textContaining(entry.value),
+          findsOneWidget,
+          reason: 'outcome message for ${entry.key}',
+        );
+        expect(
+          find.text('إخفاء من قائمتي'),
+          findsOneWidget,
+          reason: 'hide button for ${entry.key}',
+        );
+      }
+    },
+  );
+
+  testWidgets(
+    'hide action never appears for invited, quoted, or winning-closed opportunities',
+    (tester) async {
+      final cases = <String, String>{
+        'invited': _opportunitiesInvitedJson,
+        'quoted': _opportunitiesQuotedJson,
+        'winning-closed': _opportunitiesClosedWinnerJson,
+      };
+      for (final entry in cases.entries) {
+        final store = _MemorySessionStore()..token = 'stale-token';
+        final api = ProviderApi(
+          baseUrl: 'https://api.example.test',
+          client: _dashboardMockClient(
+            opportunitiesHandler: (_) async =>
+                http.Response(entry.value, 200, headers: _jsonUtf8),
+          ),
+        );
+        // Tear down the previous app state so each iteration boots fresh.
+        await tester.pumpWidget(const SizedBox());
+        await tester.pumpWidget(
+          MoeenProviderApp(
+            api: api,
+            sessionStore: store,
+            hiddenStore: _MemoryHiddenStore(),
+          ),
+        );
+        await tester.pumpAndSettle();
+        expect(
+          find.text('إخفاء من قائمتي'),
+          findsNothing,
+          reason: 'no hide button for ${entry.key}',
+        );
+      }
+    },
+  );
+
+  testWidgets(
+    'tapping hide removes the card immediately with zero HTTP requests',
+    (tester) async {
+      var totalRequests = 0;
       final api = ProviderApi(
         baseUrl: 'https://api.example.test',
-        client: _dashboardMockClient(
-          opportunitiesHandler: (_) async =>
-              http.Response(json, 200, headers: _jsonUtf8),
-        ),
+        client: MockClient((request) async {
+          totalRequests += 1;
+          final path = request.url.path;
+          if (path == '/provider/auth/me') {
+            return http.Response(_providerJson, 200, headers: _jsonUtf8);
+          }
+          if (path == '/provider/service-requests') {
+            return http.Response('[]', 200);
+          }
+          if (path == '/provider/opportunities') {
+            return http.Response(
+              _opportunitiesRejectedJson,
+              200,
+              headers: _jsonUtf8,
+            );
+          }
+          return http.Response('{}', 404);
+        }),
       );
-      // Tear down the previous app state so each iteration boots fresh.
-      await tester.pumpWidget(const SizedBox());
+      final store = _MemorySessionStore()..token = 'stale-token';
+
       await tester.pumpWidget(
         MoeenProviderApp(
           api: api,
@@ -825,116 +1232,57 @@ void main() {
         ),
       );
       await tester.pumpAndSettle();
-      expect(find.textContaining(entry.value), findsOneWidget,
-          reason: 'outcome message for ${entry.key}');
-      expect(find.text('إخفاء من قائمتي'), findsOneWidget,
-          reason: 'hide button for ${entry.key}');
-    }
-  });
+      expect(find.text('إخفاء من قائمتي'), findsOneWidget);
 
-  testWidgets('hide action never appears for invited, quoted, or winning-closed opportunities', (tester) async {
-    final cases = <String, String>{
-      'invited': _opportunitiesInvitedJson,
-      'quoted': _opportunitiesQuotedJson,
-      'winning-closed': _opportunitiesClosedWinnerJson,
-    };
-    for (final entry in cases.entries) {
+      final requestsBefore = totalRequests;
+      await tester.tap(find.text('إخفاء من قائمتي'));
+      await tester.pumpAndSettle();
+
+      expect(totalRequests, requestsBefore);
+      expect(find.text('إخفاء من قائمتي'), findsNothing);
+      expect(find.text('لا توجد فرص متاحة حاليًا.'), findsOneWidget);
+    },
+  );
+
+  testWidgets(
+    'hidden requestId stays hidden after a rebuild for the same provider',
+    (tester) async {
+      final hiddenStore = _MemoryHiddenStore();
       final store = _MemorySessionStore()..token = 'stale-token';
       final api = ProviderApi(
         baseUrl: 'https://api.example.test',
         client: _dashboardMockClient(
-          opportunitiesHandler: (_) async =>
-              http.Response(entry.value, 200, headers: _jsonUtf8),
+          opportunitiesHandler: (_) async => http.Response(
+            _opportunitiesRejectedJson,
+            200,
+            headers: _jsonUtf8,
+          ),
         ),
       );
-      // Tear down the previous app state so each iteration boots fresh.
-      await tester.pumpWidget(const SizedBox());
-      await tester.pumpWidget(
-        MoeenProviderApp(
-          api: api,
-          sessionStore: store,
-          hiddenStore: _MemoryHiddenStore(),
-        ),
-      );
-      await tester.pumpAndSettle();
-      expect(find.text('إخفاء من قائمتي'), findsNothing,
-          reason: 'no hide button for ${entry.key}');
-    }
-  });
-
-  testWidgets('tapping hide removes the card immediately with zero HTTP requests', (tester) async {
-    var totalRequests = 0;
-    final api = ProviderApi(
-      baseUrl: 'https://api.example.test',
-      client: MockClient((request) async {
-        totalRequests += 1;
-        final path = request.url.path;
-        if (path == '/provider/auth/me') {
-          return http.Response(_providerJson, 200, headers: _jsonUtf8);
-        }
-        if (path == '/provider/service-requests') {
-          return http.Response('[]', 200);
-        }
-        if (path == '/provider/opportunities') {
-          return http.Response(_opportunitiesRejectedJson, 200,
-              headers: _jsonUtf8);
-        }
-        return http.Response('{}', 404);
-      }),
-    );
-    final store = _MemorySessionStore()..token = 'stale-token';
-
-    await tester.pumpWidget(
-      MoeenProviderApp(
+      Widget app() => MoeenProviderApp(
         api: api,
         sessionStore: store,
-        hiddenStore: _MemoryHiddenStore(),
-      ),
-    );
-    await tester.pumpAndSettle();
-    expect(find.text('إخفاء من قائمتي'), findsOneWidget);
+        hiddenStore: hiddenStore,
+      );
 
-    final requestsBefore = totalRequests;
-    await tester.tap(find.text('إخفاء من قائمتي'));
-    await tester.pumpAndSettle();
+      await tester.pumpWidget(app());
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('إخفاء من قائمتي'));
+      await tester.pumpAndSettle();
+      expect(find.text('إخفاء من قائمتي'), findsNothing);
 
-    expect(totalRequests, requestsBefore);
-    expect(find.text('إخفاء من قائمتي'), findsNothing);
-    expect(find.text('لا توجد فرص متاحة حاليًا.'), findsOneWidget);
-  });
+      // Rebuild the whole widget tree with the same stores.
+      await tester.pumpWidget(Container());
+      await tester.pumpWidget(app());
+      await tester.pumpAndSettle();
+      expect(find.text('إخفاء من قائمتي'), findsNothing);
+      expect(find.text('لا توجد فرص متاحة حاليًا.'), findsOneWidget);
+    },
+  );
 
-  testWidgets('hidden requestId stays hidden after a rebuild for the same provider', (tester) async {
-    final hiddenStore = _MemoryHiddenStore();
-    final store = _MemorySessionStore()..token = 'stale-token';
-    final api = ProviderApi(
-      baseUrl: 'https://api.example.test',
-      client: _dashboardMockClient(
-        opportunitiesHandler: (_) async => http.Response(
-            _opportunitiesRejectedJson, 200,
-            headers: _jsonUtf8),
-      ),
-    );
-    Widget app() => MoeenProviderApp(
-          api: api,
-          sessionStore: store,
-          hiddenStore: hiddenStore,
-        );
-
-    await tester.pumpWidget(app());
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('إخفاء من قائمتي'));
-    await tester.pumpAndSettle();
-    expect(find.text('إخفاء من قائمتي'), findsNothing);
-
-    // Rebuild the whole widget tree with the same stores.
-    await tester.pumpWidget(Container());
-    await tester.pumpWidget(app());
-    await tester.pumpAndSettle();
-    expect(find.text('إخفاء من قائمتي'), findsNothing);
-    expect(find.text('لا توجد فرص متاحة حاليًا.'), findsOneWidget);
-  });
-
-  testWidgets('a different provider account does not inherit the hidden list', (tester) async {
+  testWidgets('a different provider account does not inherit the hidden list', (
+    tester,
+  ) async {
     final hiddenStore = _MemoryHiddenStore();
     await hiddenStore.hideRequest('provider-1', 'MOE-9');
     final store = _MemorySessionStore()..token = 'stale-token';
@@ -949,19 +1297,18 @@ void main() {
           return http.Response('[]', 200);
         }
         if (path == '/provider/opportunities') {
-          return http.Response(_opportunitiesRejectedJson, 200,
-              headers: _jsonUtf8);
+          return http.Response(
+            _opportunitiesRejectedJson,
+            200,
+            headers: _jsonUtf8,
+          );
         }
         return http.Response('{}', 404);
       }),
     );
 
     await tester.pumpWidget(
-      MoeenProviderApp(
-        api: api,
-        sessionStore: store,
-        hiddenStore: hiddenStore,
-      ),
+      MoeenProviderApp(api: api, sessionStore: store, hiddenStore: hiddenStore),
     );
     await tester.pumpAndSettle();
 
@@ -969,30 +1316,33 @@ void main() {
   });
 
   test('ProviderOpportunity parses pre-quote details and images', () {
-    final opp = ProviderOpportunity.fromJson({
-      'requestId': 'MOE-30',
-      'serviceId': 'ac-cleaning',
-      'timing': 'scheduled',
-      'opportunityStatus': 'invited',
-      'details': 'مكيف سبليت لا يبرد',
-      'images': [
-        {
-          'id': 'img-2',
-          'mimeType': 'image/jpeg',
-          'byteSize': 1024,
-          'sortOrder': 1,
-          'url': 'https://signed.example.test/img-2?sig=z',
-          'urlExpiresAt': '2026-08-17T12:00:00.000Z',
-        },
-        {
-          'id': 'img-1',
-          'mimeType': 'image/jpeg',
-          'byteSize': 2048,
-          'sortOrder': 0,
-          'url': 'https://signed.example.test/img-1?sig=y',
-        },
-      ],
-    } as Map<String, dynamic>);
+    final opp = ProviderOpportunity.fromJson(
+      {
+            'requestId': 'MOE-30',
+            'serviceId': 'ac-cleaning',
+            'timing': 'scheduled',
+            'opportunityStatus': 'invited',
+            'details': 'مكيف سبليت لا يبرد',
+            'images': [
+              {
+                'id': 'img-2',
+                'mimeType': 'image/jpeg',
+                'byteSize': 1024,
+                'sortOrder': 1,
+                'url': 'https://signed.example.test/img-2?sig=z',
+                'urlExpiresAt': '2026-08-17T12:00:00.000Z',
+              },
+              {
+                'id': 'img-1',
+                'mimeType': 'image/jpeg',
+                'byteSize': 2048,
+                'sortOrder': 0,
+                'url': 'https://signed.example.test/img-1?sig=y',
+              },
+            ],
+          }
+          as Map<String, dynamic>,
+    );
 
     expect(opp.address, isNull);
     expect(opp.details, 'مكيف سبليت لا يبرد');
@@ -1003,36 +1353,48 @@ void main() {
   });
 
   test('ProviderOpportunity ignores malformed image entries', () {
-    final opp = ProviderOpportunity.fromJson({
-      'requestId': 'MOE-31',
-      'serviceId': 'plumbing',
-      'timing': 'as-soon-as-possible',
-      'opportunityStatus': 'invited',
-      'address': 'حي النهضة، بريدة',
-      'images': [
-        {'id': 'img-1', 'mimeType': 'image/jpeg', 'byteSize': 10, 'sortOrder': 0, 'url': 'https://signed.example.test/img-1'},
-        'not-an-object',
-        null,
-      ],
-    } as Map<String, dynamic>);
+    final opp = ProviderOpportunity.fromJson(
+      {
+            'requestId': 'MOE-31',
+            'serviceId': 'plumbing',
+            'timing': 'as-soon-as-possible',
+            'opportunityStatus': 'invited',
+            'address': 'حي النهضة، بريدة',
+            'images': [
+              {
+                'id': 'img-1',
+                'mimeType': 'image/jpeg',
+                'byteSize': 10,
+                'sortOrder': 0,
+                'url': 'https://signed.example.test/img-1',
+              },
+              'not-an-object',
+              null,
+            ],
+          }
+          as Map<String, dynamic>,
+    );
 
     expect(opp.images, hasLength(1));
     expect(opp.images.single.id, 'img-1');
   });
 
   test('ProviderOpportunity without pre-quote fields stays safe and empty', () {
-    final opp = ProviderOpportunity.fromJson({
-      'requestId': 'MOE-32',
-      'serviceId': 'ac-cleaning',
-      'timing': 'as-soon-as-possible',
-      'opportunityStatus': 'closed',
-      'myQuote': {
-        'id': 'QTE-30',
-        'amountHalalas': 10000,
-        'scope': 'test',
-        'status': 'rejected',
-      },
-    } as Map<String, dynamic>);
+    final opp = ProviderOpportunity.fromJson(
+      {
+            'requestId': 'MOE-32',
+            'serviceId': 'ac-cleaning',
+            'timing': 'as-soon-as-possible',
+            'opportunityStatus': 'closed',
+            'myQuote': {
+              'id': 'QTE-30',
+              'amountHalalas': 10000,
+              'scope': 'test',
+              'status': 'rejected',
+            },
+          }
+          as Map<String, dynamic>,
+    );
 
     expect(opp.address, isNull);
     expect(opp.details, isNull);
@@ -1217,6 +1579,44 @@ const _jobCompletedJson =
     '{"id":"MOE-2003","serviceId":"ac-cleaning",'
     '"timing":"as-soon-as-possible","status":"completed"}';
 
+const _onTheWayTransitionJson =
+    '{"id":"MOE-2001","serviceId":"ac-cleaning",'
+    '"address":"حي الصفراء، بريدة","timing":"as-soon-as-possible",'
+    '"status":"on_the_way","tracking":{"active":true,'
+    '"requestId":"MOE-2001","status":"on_the_way",'
+    '"onTheWayCadenceMs":15000,"inProgressCadenceMs":60000}}';
+
+const _onTheWayTrackingJson =
+    '{"tracking":{"active":true,"requestId":"MOE-2002",'
+    '"status":"on_the_way","onTheWayCadenceMs":15000,'
+    '"inProgressCadenceMs":60000}}';
+
+const _onTheWayInactiveTransitionJson =
+    '{"id":"MOE-2001","serviceId":"ac-cleaning",'
+    '"address":"حي الصفراء، بريدة","timing":"as-soon-as-possible",'
+    '"status":"on_the_way","tracking":{"active":false,'
+    '"requestId":"MOE-2001","status":"on_the_way",'
+    '"onTheWayCadenceMs":15000,"inProgressCadenceMs":60000}}';
+
+const _assignedInactiveTrackingJson =
+    '{"tracking":{"active":false,"requestId":"MOE-2001",'
+    '"status":"assigned","onTheWayCadenceMs":15000,'
+    '"inProgressCadenceMs":60000}}';
+
+const _inProgressTransitionJson =
+    '{"id":"MOE-2002","serviceId":"ac-cleaning",'
+    '"address":"حي الصفراء، بريدة","timing":"as-soon-as-possible",'
+    '"status":"in_progress","tracking":{"active":true,'
+    '"requestId":"MOE-2002","status":"in_progress",'
+    '"onTheWayCadenceMs":15000,"inProgressCadenceMs":60000}}';
+
+const _completedTransitionJson =
+    '{"id":"MOE-2003","serviceId":"ac-cleaning",'
+    '"timing":"as-soon-as-possible","status":"completed",'
+    '"tracking":{"active":false,"requestId":"MOE-2003",'
+    '"status":"completed","onTheWayCadenceMs":15000,'
+    '"inProgressCadenceMs":60000}}';
+
 MockClient _dashboardMockClient({
   required Future<http.Response> Function(http.Request) opportunitiesHandler,
   Future<http.Response> Function(http.Request)? quotesHandler,
@@ -1241,5 +1641,87 @@ MockClient _dashboardMockClient({
     }
     return http.Response('{}', 404);
   });
+}
 
+class _GrantedTrackingPermissionGate
+    implements provider_tracking.ProviderTrackingPermissionGate {
+  const _GrantedTrackingPermissionGate();
+
+  @override
+  Future<bool> ensurePermission() async => true;
+}
+
+class _CountingTrackingPermissionGate
+    implements provider_tracking.ProviderTrackingPermissionGate {
+  int calls = 0;
+
+  @override
+  Future<bool> ensurePermission() async {
+    calls += 1;
+    return true;
+  }
+}
+
+class _DeniedTrackingPermissionGate
+    implements provider_tracking.ProviderTrackingPermissionGate {
+  int calls = 0;
+
+  @override
+  Future<bool> ensurePermission() async {
+    calls += 1;
+    return false;
+  }
+}
+
+class _FakeTrackingRuntime
+    implements provider_tracking.ProviderTrackingRuntime {
+  final List<provider_tracking.ProviderTrackingStatus> started = [];
+  final List<provider_tracking.ProviderTrackingStatus> updated = [];
+  int stopCalls = 0;
+  int clearQueueCalls = 0;
+  bool _running = false;
+  provider_tracking.ProviderTrackingStatus? _status;
+
+  @override
+  Future<void> clearQueue() async => clearQueueCalls += 1;
+
+  @override
+  Future<void> dispose() async {}
+
+  @override
+  Future<bool> isRunning() async => _running;
+
+  @override
+  bool matches(provider_tracking.ProviderTrackingStatus status) =>
+      _running &&
+      _status?.requestId == status.requestId &&
+      _status?.status == status.status &&
+      _status?.onTheWayCadenceMs == status.onTheWayCadenceMs &&
+      _status?.inProgressCadenceMs == status.inProgressCadenceMs;
+
+  @override
+  Future<void> start(
+    provider_tracking.ProviderTrackingStatus status,
+    String token,
+  ) async {
+    _running = true;
+    _status = status;
+    started.add(status);
+  }
+
+  @override
+  Future<void> stop() async {
+    _running = false;
+    _status = null;
+    stopCalls += 1;
+  }
+
+  @override
+  Future<void> update(
+    provider_tracking.ProviderTrackingStatus status,
+    String token,
+  ) async {
+    _status = status;
+    updated.add(status);
+  }
 }

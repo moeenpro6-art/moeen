@@ -8,6 +8,7 @@ import 'package:http/http.dart' as http;
 import 'request_images.dart';
 import 'moeen_ui.dart';
 import 'provider_notifications.dart';
+import 'provider_tracking.dart' as provider_tracking;
 
 const _providerTokenStorageKey = 'moeen_provider_session_token';
 const _serviceNames = {
@@ -51,6 +52,7 @@ String opportunityMessage(ProviderOpportunity opp) {
 }
 
 void main() {
+  provider_tracking.initializeProviderTrackingForegroundTask();
   runApp(MoeenProviderApp());
 }
 
@@ -152,6 +154,27 @@ class ProviderJob {
   }
 }
 
+/// Atomic response from the provider status-transition endpoint. The server
+/// supplies the job projection and the current tracking authority together;
+/// status alone can never authorize device-location collection.
+class ProviderStatusTransition {
+  const ProviderStatusTransition({required this.job, required this.tracking});
+
+  final ProviderJob job;
+  final provider_tracking.ProviderTrackingStatus tracking;
+
+  factory ProviderStatusTransition.fromJson(Map<String, dynamic> json) {
+    final job = ProviderJob.fromJson(json);
+    final tracking = provider_tracking.ProviderTrackingStatus.fromResponse(
+      json,
+    );
+    if (tracking.requestId != job.id || tracking.status != job.status) {
+      throw const ProviderApiException();
+    }
+    return ProviderStatusTransition(job: job, tracking: tracking);
+  }
+}
+
 class ProviderOpportunity {
   const ProviderOpportunity({
     required this.requestId,
@@ -241,7 +264,7 @@ String? nextProviderStatus(ProviderJob job) {
 
 String providerActionLabel(ProviderJob job) {
   final nextStatus = nextProviderStatus(job);
-  if (nextStatus == 'on_the_way') return 'تأكيد الانطلاق';
+  if (nextStatus == 'on_the_way') return 'بدء التوجه';
   if (nextStatus == 'in_progress') return 'بدء الخدمة';
   if (nextStatus == 'completed') return 'إنهاء الخدمة';
   if (job.status == 'on_the_way' && job.quote != null) {
@@ -252,7 +275,7 @@ String providerActionLabel(ProviderJob job) {
   return 'لا يوجد إجراء متاح';
 }
 
-class ProviderApi {
+class ProviderApi implements provider_tracking.ProviderTrackingApi {
   ProviderApi({http.Client? client, String? baseUrl})
     : _client = client ?? http.Client(),
       _config = ProviderApiConfig(baseUrl ?? _defaultBaseUrl);
@@ -340,7 +363,7 @@ class ProviderApi {
     return ProviderQuote.fromJson(_responseObject(response));
   }
 
-  Future<ProviderJob> updateJobStatus(
+  Future<ProviderStatusTransition> updateJobStatus(
     String token,
     String requestId,
     String status,
@@ -350,7 +373,57 @@ class ProviderApi {
       headers: _authorization(token, json: true),
       body: jsonEncode({'status': status}),
     );
-    return ProviderJob.fromJson(_responseObject(response));
+    return ProviderStatusTransition.fromJson(_responseObject(response));
+  }
+
+  /// Reads current server authority without accessing a device location.
+  @override
+  Future<provider_tracking.ProviderTrackingStatus> getTrackingStatus(
+    String token,
+    String requestId,
+  ) async {
+    try {
+      final response = await _client.get(
+        _config.endpoint('/provider/service-requests/$requestId/tracking'),
+        headers: _authorization(token),
+      );
+      if (response.statusCode == 401) {
+        throw const ProviderUnauthorizedException();
+      }
+      if (response.statusCode == 404) {
+        throw const provider_tracking.ProviderTrackingNotFoundException();
+      }
+      if (response.statusCode == 409) {
+        throw const provider_tracking.ProviderTrackingConflictException();
+      }
+      if (response.statusCode >= 500) {
+        throw const provider_tracking.ProviderTrackingTransportException();
+      }
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw const provider_tracking.ProviderTrackingProtocolException();
+      }
+      final decoded = jsonDecode(response.body);
+      if (decoded is! Map<dynamic, dynamic>) {
+        throw const provider_tracking.ProviderTrackingProtocolException();
+      }
+      return provider_tracking.ProviderTrackingStatus.fromResponse(
+        Map<String, dynamic>.from(decoded),
+      );
+    } on ProviderUnauthorizedException {
+      rethrow;
+    } on provider_tracking.ProviderTrackingNotFoundException {
+      rethrow;
+    } on provider_tracking.ProviderTrackingConflictException {
+      rethrow;
+    } on provider_tracking.ProviderTrackingTransportException {
+      rethrow;
+    } on provider_tracking.ProviderTrackingProtocolException {
+      rethrow;
+    } catch (_) {
+      // No fresh readable authority means no location collection. The recovery
+      // coordinator keeps the foreground worker off through its bounded retry.
+      throw const provider_tracking.ProviderTrackingTransportException();
+    }
   }
 
   Future<ProviderProfile> updateAvailability(
@@ -496,6 +569,8 @@ class MoeenProviderApp extends StatefulWidget {
     ProviderApi? api,
     ProviderSessionStore? sessionStore,
     HiddenOpportunitiesStore? hiddenStore,
+    this.trackingRuntime,
+    this.trackingPermissionGate,
   }) : _api = api ?? ProviderApi(),
        _sessionStore = sessionStore ?? SecureProviderSessionStore(),
        _hiddenStore = hiddenStore ?? SecureHiddenOpportunitiesStore();
@@ -503,6 +578,9 @@ class MoeenProviderApp extends StatefulWidget {
   final ProviderApi _api;
   final ProviderSessionStore _sessionStore;
   final HiddenOpportunitiesStore _hiddenStore;
+  final provider_tracking.ProviderTrackingRuntime? trackingRuntime;
+  final provider_tracking.ProviderTrackingPermissionGate?
+  trackingPermissionGate;
 
   @override
   State<MoeenProviderApp> createState() => _MoeenProviderAppState();
@@ -514,6 +592,11 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
   final Map<String, GlobalKey> _opportunityCardKeys = {};
   final Map<String, GlobalKey> _jobCardKeys = {};
   late final ProviderNotificationController _notifications;
+  late final provider_tracking.ProviderTrackingRuntime _trackingRuntime;
+  late final provider_tracking.ProviderTrackingPermissionGate
+  _trackingPermissionGate;
+  late final provider_tracking.ProviderTrackingRecoveryCoordinator
+  _trackingRecovery;
 
   String? _token;
   ProviderProfile? _provider;
@@ -529,6 +612,19 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
   @override
   void initState() {
     super.initState();
+    _trackingRuntime =
+        widget.trackingRuntime ??
+        provider_tracking.FlutterProviderTrackingRuntime(
+          baseUrl: widget._api._config.baseUrl,
+          onEvent: _handleTrackingRuntimeEvent,
+        );
+    _trackingPermissionGate =
+        widget.trackingPermissionGate ??
+        const provider_tracking.GeolocatorProviderTrackingPermissionGate();
+    _trackingRecovery = provider_tracking.ProviderTrackingRecoveryCoordinator(
+      api: widget._api,
+      runtime: _trackingRuntime,
+    );
     _notifications = ProviderNotificationController(
       enabled: ProviderFcmConfig.enabled,
       messaging: FirebaseProviderMessagingClient(),
@@ -550,9 +646,101 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
 
   @override
   void dispose() {
+    // Widget disposal is not a server authority transition. Android may destroy
+    // and recreate this UI isolate while an authorized location FGS remains
+    // active, so detach only this runtime callback. Terminal authority, logout,
+    // reassignment, and permission loss remain the explicit stop paths.
+    unawaited(_trackingRuntime.dispose());
     _notifications.dispose();
     _accessCodeController.dispose();
     super.dispose();
+  }
+
+  void _handleTrackingRuntimeEvent(
+    provider_tracking.ProviderTrackingRuntimeEvent event,
+  ) {
+    if (!mounted) return;
+    switch (event.type) {
+      case 'unauthorized':
+        unawaited(_expireSession());
+        return;
+      case 'not_found':
+      case 'inactive':
+      case 'location_unavailable':
+      case 'network':
+        // No sensitive tracking data is surfaced. A refresh reconciles the
+        // normal provider dashboard from authenticated server state.
+        if (_token != null) unawaited(_refresh());
+        return;
+      case 'stopped':
+        // Deliberate local stops are used before every authority check, logout,
+        // and teardown. They must not trigger a stale-token refresh/restart.
+        return;
+      default:
+        return;
+    }
+  }
+
+  Future<void> _reconcileTracking(String token) async {
+    final requestIds = _jobs
+        .where(
+          (job) =>
+              job.status == 'assigned' ||
+              job.status == 'on_the_way' ||
+              job.status == 'in_progress',
+        )
+        .map((job) => job.id);
+    try {
+      final result = await _trackingRecovery.reconcile(
+        token: token,
+        requestIds: requestIds,
+      );
+      if (!mounted) return;
+      switch (result) {
+        case provider_tracking.ProviderTrackingRecoveryResult.conflict:
+          setState(
+            () => _error =
+                'تم إيقاف تتبع الموقع: توجد أكثر من مهمة نشطة تحتاج مراجعة فريق التشغيل.',
+          );
+        case provider_tracking.ProviderTrackingRecoveryResult.notFound:
+          // The dashboard request may have raced with a terminal/reassignment
+          // transition. It granted no collection authority, so refresh the
+          // provider-owned request state while the collector remains off.
+          await _loadDashboard(token);
+          if (!mounted) return;
+          setState(
+            () => _error =
+                'تم إيقاف تتبع الموقع لأن حالة المهمة لم تعد متاحة. تم تحديث الطلبات.',
+          );
+        case provider_tracking.ProviderTrackingRecoveryResult.networkFailure:
+          setState(
+            () => _error =
+                'تم إيقاف تتبع الموقع مؤقتًا لعدم التحقق من حالة المهمة. حاول التحديث لاحقًا.',
+          );
+        case provider_tracking.ProviderTrackingRecoveryResult.active:
+        case provider_tracking.ProviderTrackingRecoveryResult.inactive:
+          return;
+      }
+    } on ProviderUnauthorizedException {
+      await _expireSession();
+    } on provider_tracking.ProviderTrackingLocationPermissionException {
+      if (mounted) {
+        setState(
+          () => _error =
+              'يلزم تفعيل خدمة الموقع ومنح الإذن لتتبع المهمة النشطة فقط.',
+        );
+      }
+    } on provider_tracking.ProviderTrackingRuntimeException {
+      if (mounted) {
+        setState(
+          () => _error = 'تعذر بدء خدمة تتبع الموقع للمهمة. حاول مرة أخرى.',
+        );
+      }
+    }
+  }
+
+  Future<void> _stopAndClearTracking() async {
+    await _trackingRecovery.stopAndClear();
   }
 
   Future<void> _restoreSession() async {
@@ -563,6 +751,7 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
         return;
       }
       await _loadDashboard(token);
+      await _reconcileTracking(token);
       await _loadHiddenOpportunities();
       await _loadOpportunities();
       // Authentication and provider data are ready before a pending notification
@@ -590,6 +779,7 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
     // invalidate the FCM generation before clearing app state so a stale device
     // registration can never reappear for a later provider login.
     unawaited(_notifications.onSessionInvalidated());
+    await _stopAndClearTracking();
     await widget._sessionStore.clearToken();
 
     if (mounted) {
@@ -754,6 +944,7 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
       final login = await widget._api.login(accessCode);
       await widget._sessionStore.writeToken(login.token);
       await _loadDashboard(login.token);
+      await _reconcileTracking(login.token);
       await _loadHiddenOpportunities();
       await _loadOpportunities();
       // Device registration and notification permission are optional. They run
@@ -787,10 +978,19 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
     if (token == null) return;
     setState(() => _submitting = true);
     try {
-      await Future.wait([_loadDashboard(token), _loadOpportunities()]);
+      // The current jobs read must finish before authority reconciliation: a
+      // previously active job must not keep location collection alive after a
+      // refreshed dashboard marks it terminal, reassigned, or absent.
+      await _loadDashboard(token);
+      await _reconcileTracking(token);
+      await _loadOpportunities();
     } on ProviderUnauthorizedException {
       await _expireSession();
     } catch (_) {
+      // The refreshed dashboard is part of the current tracking authority.
+      // If it is unavailable or untrusted, no previously active local stream
+      // may continue while waiting for a later bounded reconciliation attempt.
+      await _stopAndClearTracking();
       if (mounted) setState(() => _error = 'تعذر تحديث الطلبات.');
     } finally {
       if (mounted) setState(() => _submitting = false);
@@ -882,12 +1082,73 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
     final token = _token;
     final status = nextProviderStatus(job);
     if (token == null || status == null) return;
+
     setState(() => _submitting = true);
     try {
-      await widget._api.updateJobStatus(token, job.id, status);
+      // The status transition is the first authority-changing operation. A
+      // request status is not enough: permission prompts, FGS startup, and GPS
+      // acquisition all wait for this *fresh* server tracking snapshot.
+      final transition = await widget._api.updateJobStatus(
+        token,
+        job.id,
+        status,
+      );
+      final tracking = transition.tracking;
+
+      if (status == 'on_the_way') {
+        // An inactive snapshot updates only the job UI and explicitly keeps the
+        // runtime off. Do not request permission for a task the server did not
+        // authorize, because that permission request would have no tracking use.
+        if (!tracking.active) {
+          await _stopAndClearTracking();
+        } else if (!await _trackingPermissionGate.ensurePermission()) {
+          // The status update succeeded, but the user declined the one explicit
+          // location request. Refresh the job projection without starting FGS.
+          await _loadDashboard(token);
+          if (mounted) {
+            setState(
+              () => _error =
+                  'تم تحديث حالة المهمة، لكن لا يمكن تشغيل تتبع الموقع دون الإذن.',
+            );
+          }
+          return;
+        } else {
+          await _trackingRuntime.start(tracking, token);
+        }
+      } else if (status == 'in_progress') {
+        if (tracking.active) {
+          // The worker replaces only its position stream/settings. Its Android
+          // foreground service remains visible throughout 15s → 60s cadence.
+          await _trackingRuntime.update(tracking, token);
+        } else {
+          await _stopAndClearTracking();
+        }
+      } else {
+        // A completed transition is terminal. Tear down the stream, FGS and the
+        // process-memory queue immediately; never retain a catch-up backlog.
+        await _stopAndClearTracking();
+      }
+
+      // The status-transition DTO above is the authority used for this action.
+      // Do not reconcile here: reconciliation stops first, which would create a
+      // foreground-service gap while the active cadence is being changed.
       await _loadDashboard(token);
     } on ProviderUnauthorizedException {
       await _expireSession();
+    } on provider_tracking.ProviderTrackingLocationPermissionException {
+      if (mounted) {
+        setState(
+          () => _error =
+              'تم تحديث حالة المهمة، لكن لا يمكن تشغيل تتبع الموقع دون الإذن.',
+        );
+      }
+    } on provider_tracking.ProviderTrackingRuntimeException {
+      if (mounted) {
+        setState(
+          () => _error =
+              'تم تحديث حالة المهمة، لكن تعذر بدء أو تحديث خدمة تتبع الموقع.',
+        );
+      }
     } on ProviderApiException {
       if (mounted) {
         setState(
@@ -903,6 +1164,9 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
   }
 
   Future<void> _logout() async {
+    // Location collection is revocable local state: clear it before any
+    // best-effort server logout request can delay or fail.
+    await _stopAndClearTracking();
     final token = _token;
     if (token != null) {
       // Starts by invalidating notification ownership and attempts the device
