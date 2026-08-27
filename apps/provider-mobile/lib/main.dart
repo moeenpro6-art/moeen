@@ -659,17 +659,35 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
     provider_tracking.ProviderTrackingRuntimeEvent event,
   ) {
     if (!mounted) return;
+    provider_tracking.providerTrackingLifecycleLog(
+      'ui.runtimeEvent.received',
+      generation: event.generation,
+      reason: event.type,
+    );
     switch (event.type) {
       case 'unauthorized':
         unawaited(_expireSession());
         return;
       case 'not_found':
       case 'inactive':
+        // These server-authoritative terminal transitions cannot restart the
+        // collector, so refresh the provider-owned dashboard state normally.
+        if (_token != null) {
+          unawaited(_refresh(source: 'runtime_terminal:${event.type}'));
+        }
+        return;
       case 'location_unavailable':
       case 'network':
-        // No sensitive tracking data is surfaced. A refresh reconciles the
-        // normal provider dashboard from authenticated server state.
-        if (_token != null) unawaited(_refresh());
+        // A local/transport failure means collection is already fail-closed. Do
+        // not immediately reconcile and start a new location FGS: the app may
+        // be backgrounded or screen-off, where Android forbids that start, and
+        // a persistent fault would otherwise form a tight stop/start loop.
+        // Recovery remains available through the provider's explicit refresh,
+        // which obtains fresh server authority from a visible foreground UI.
+        setState(
+          () => _error =
+              'تم إيقاف تتبع الموقع مؤقتًا. افتح التطبيق واضغط تحديث بعد استعادة الموقع والاتصال.',
+        );
         return;
       case 'stopped':
         // Deliberate local stops are used before every authority check, logout,
@@ -680,7 +698,14 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
     }
   }
 
-  Future<void> _reconcileTracking(String token) async {
+  Future<void> _reconcileTracking(
+    String token, {
+    required String source,
+  }) async {
+    provider_tracking.providerTrackingLifecycleLog(
+      'ui.reconcile.enter',
+      reason: source,
+    );
     final requestIds = _jobs
         .where(
           (job) =>
@@ -693,6 +718,10 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
       final result = await _trackingRecovery.reconcile(
         token: token,
         requestIds: requestIds,
+      );
+      provider_tracking.providerTrackingLifecycleLog(
+        'ui.reconcile.result',
+        reason: '$source:${result.name}',
       );
       if (!mounted) return;
       switch (result) {
@@ -716,6 +745,10 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
             () => _error =
                 'تم إيقاف تتبع الموقع مؤقتًا لعدم التحقق من حالة المهمة. حاول التحديث لاحقًا.',
           );
+        case provider_tracking.ProviderTrackingRecoveryResult.superseded:
+          // A newer status-transition response already owns the runtime action.
+          // This older recovery read must not change the FGS or the UI message.
+          return;
         case provider_tracking.ProviderTrackingRecoveryResult.active:
         case provider_tracking.ProviderTrackingRecoveryResult.inactive:
           return;
@@ -738,8 +771,8 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
     }
   }
 
-  Future<void> _stopAndClearTracking() async {
-    await _trackingRecovery.stopAndClear();
+  Future<void> _stopAndClearTracking({String reason = 'ui_unspecified'}) async {
+    await _trackingRecovery.stopAndClear(reason: reason);
   }
 
   Future<void> _restoreSession() async {
@@ -750,7 +783,7 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
         return;
       }
       await _loadDashboard(token);
-      await _reconcileTracking(token);
+      await _reconcileTracking(token, source: 'restore_session');
       await _loadHiddenOpportunities();
       await _loadOpportunities();
       // Authentication and provider data are ready before a pending notification
@@ -778,7 +811,7 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
     // invalidate the FCM generation before clearing app state so a stale device
     // registration can never reappear for a later provider login.
     unawaited(_notifications.onSessionInvalidated());
-    await _stopAndClearTracking();
+    await _stopAndClearTracking(reason: 'session_expired');
     await widget._sessionStore.clearToken();
 
     if (mounted) {
@@ -862,7 +895,7 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
           _focusCard(_jobCardKeys[intent.requestId]);
           return;
         case ProviderNotificationNavigate.dashboard:
-          await _refresh();
+          await _refresh(source: 'notification_dashboard');
           return;
       }
     } on ProviderUnauthorizedException {
@@ -943,7 +976,7 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
       final login = await widget._api.login(accessCode);
       await widget._sessionStore.writeToken(login.token);
       await _loadDashboard(login.token);
-      await _reconcileTracking(login.token);
+      await _reconcileTracking(login.token, source: 'login');
       await _loadHiddenOpportunities();
       await _loadOpportunities();
       // Device registration and notification permission are optional. They run
@@ -972,16 +1005,20 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
     }
   }
 
-  Future<void> _refresh() async {
+  Future<void> _refresh({String source = 'explicit_ui'}) async {
     final token = _token;
     if (token == null) return;
+    provider_tracking.providerTrackingLifecycleLog(
+      'ui.refresh.enter',
+      reason: source,
+    );
     setState(() => _submitting = true);
     try {
       // The current jobs read must finish before authority reconciliation: a
       // previously active job must not keep location collection alive after a
       // refreshed dashboard marks it terminal, reassigned, or absent.
       await _loadDashboard(token);
-      await _reconcileTracking(token);
+      await _reconcileTracking(token, source: source);
       await _loadOpportunities();
     } on ProviderUnauthorizedException {
       await _expireSession();
@@ -989,7 +1026,7 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
       // The refreshed dashboard is part of the current tracking authority.
       // If it is unavailable or untrusted, no previously active local stream
       // may continue while waiting for a later bounded reconciliation attempt.
-      await _stopAndClearTracking();
+      await _stopAndClearTracking(reason: 'refresh_failed');
       if (mounted) setState(() => _error = 'تعذر تحديث الطلبات.');
     } finally {
       if (mounted) setState(() => _submitting = false);
@@ -1093,45 +1130,45 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
         status,
       );
       final tracking = transition.tracking;
-
-      if (status == 'on_the_way') {
-        // An inactive snapshot updates only the job UI and explicitly keeps the
-        // runtime off. Do not request permission for a task the server did not
-        // authorize, because that permission request would have no tracking use.
-        if (!tracking.active) {
-          await _stopAndClearTracking();
-        } else if (!await _trackingPermissionGate.ensurePermission()) {
-          // The status update succeeded, but the user declined the one explicit
-          // location request. Refresh the job projection without starting FGS.
-          await _loadDashboard(token);
-          if (mounted) {
-            setState(
-              () => _error =
-                  'تم تحديث حالة المهمة، لكن لا يمكن تشغيل تتبع الموقع دون الإذن.',
+      var dashboardLoaded = false;
+      await _trackingRecovery.applyAuthoritativeTransition(() async {
+        if (status == 'on_the_way') {
+          // An inactive snapshot updates only the job UI and explicitly keeps
+          // the runtime off. Do not ask for location without authority.
+          if (!tracking.active) {
+            await _stopAndClearTracking(
+              reason: 'transition_on_the_way_inactive',
+            );
+          } else if (!await _trackingPermissionGate.ensurePermission()) {
+            await _loadDashboard(token);
+            dashboardLoaded = true;
+            if (mounted) {
+              setState(
+                () => _error =
+                    'تم تحديث حالة المهمة، لكن لا يمكن تشغيل تتبع الموقع دون الإذن.',
+              );
+            }
+            return;
+          } else {
+            await _trackingRuntime.start(tracking, token);
+          }
+        } else if (status == 'in_progress') {
+          if (tracking.active) {
+            await _trackingRuntime.update(tracking, token);
+          } else {
+            await _stopAndClearTracking(
+              reason: 'transition_in_progress_inactive',
             );
           }
-          return;
         } else {
-          await _trackingRuntime.start(tracking, token);
+          await _stopAndClearTracking(reason: 'transition_terminal');
         }
-      } else if (status == 'in_progress') {
-        if (tracking.active) {
-          // The worker replaces only its position stream/settings. Its Android
-          // foreground service remains visible throughout 15s → 60s cadence.
-          await _trackingRuntime.update(tracking, token);
-        } else {
-          await _stopAndClearTracking();
-        }
-      } else {
-        // A completed transition is terminal. Tear down the stream, FGS and the
-        // process-memory queue immediately; never retain a catch-up backlog.
-        await _stopAndClearTracking();
-      }
+      });
 
       // The status-transition DTO above is the authority used for this action.
       // Do not reconcile here: reconciliation stops first, which would create a
       // foreground-service gap while the active cadence is being changed.
-      await _loadDashboard(token);
+      if (!dashboardLoaded) await _loadDashboard(token);
     } on ProviderUnauthorizedException {
       await _expireSession();
     } on provider_tracking.ProviderTrackingLocationPermissionException {
@@ -1165,7 +1202,7 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
   Future<void> _logout() async {
     // Location collection is revocable local state: clear it before any
     // best-effort server logout request can delay or fail.
-    await _stopAndClearTracking();
+    await _stopAndClearTracking(reason: 'logout');
     final token = _token;
     if (token != null) {
       // Starts by invalidating notification ownership and attempts the device

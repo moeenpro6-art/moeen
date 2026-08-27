@@ -1,5 +1,6 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
+import 'package:moeen_provider/provider_tracking.dart';
 
 import 'tracking_models.dart';
 
@@ -27,7 +28,15 @@ class FlutterTrackingForegroundServiceController
   Future<void> stop() async {
     // A no-op stop is expected before a future phase ever starts the service.
     // Never surface plugin/service internals to the operational UI.
+    providerTrackingLifecycleLog(
+      'flutter.stopService.request',
+      reason: 'legacy_tracking_service',
+    );
     await FlutterForegroundTask.stopService();
+    providerTrackingLifecycleLog(
+      'flutter.stopService.return',
+      reason: 'legacy_tracking_service',
+    );
   }
 }
 

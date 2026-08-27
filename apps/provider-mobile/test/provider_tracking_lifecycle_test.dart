@@ -1,5 +1,8 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_foreground_task/flutter_foreground_task.dart';
+import 'package:flutter_foreground_task/flutter_foreground_task_platform_interface.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:geolocator/geolocator.dart' as geolocator;
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:moeen_provider/main.dart';
@@ -169,6 +172,104 @@ void main() {
       expect(runtime.started, hasLength(1));
       expect(runtime.stopCalls, 0);
       expect(runtime.clearQueueCalls, 0);
+    },
+  );
+
+  testWidgets(
+    'location failure stays stopped until an explicit foreground refresh recovers tracking',
+    (tester) async {
+      final previousForegroundPlatform = FlutterForegroundTaskPlatform.instance;
+      final previousGeolocatorPlatform = geolocator.GeolocatorPlatform.instance;
+      final foreground = _LifecycleForegroundPlatform();
+      FlutterForegroundTask.resetStatic();
+      FlutterForegroundTaskPlatform.instance = foreground;
+      geolocator.GeolocatorPlatform.instance = _LifecycleGeolocatorPlatform();
+      FlutterForegroundTask.skipServiceResponseCheck = true;
+      addTearDown(() {
+        FlutterForegroundTask.resetStatic();
+        FlutterForegroundTaskPlatform.instance = previousForegroundPlatform;
+        geolocator.GeolocatorPlatform.instance = previousGeolocatorPlatform;
+      });
+
+      var trackingReads = 0;
+      var availabilityWrites = 0;
+      final api = ProviderApi(
+        baseUrl: 'https://api.example.test',
+        client: MockClient((request) async {
+          switch (request.url.path) {
+            case '/provider/auth/me':
+              return _json(
+                '{"id":"PILOT-1","name":"مقدم اختبار",'
+                '"specialties":["ac-cleaning"],"serviceZone":"القصيم",'
+                '"available":true}',
+              );
+            case '/provider/service-requests':
+              return _json(
+                '[{"id":"MOE-1001","serviceId":"ac-cleaning",'
+                '"timing":"as-soon-as-possible","status":"on_the_way"}]',
+              );
+            case '/provider/opportunities':
+              return _json('[]');
+            case '/provider/service-requests/MOE-1001/tracking':
+              trackingReads += 1;
+              return _json(
+                '{"tracking":{"active":true,"requestId":"MOE-1001",'
+                '"status":"on_the_way","onTheWayCadenceMs":15000,'
+                '"inProgressCadenceMs":60000}}',
+              );
+            case '/provider/availability':
+              availabilityWrites += 1;
+              return _json(
+                '{"id":"PILOT-1","name":"مقدم اختبار",'
+                '"specialties":["ac-cleaning"],"serviceZone":"القصيم",'
+                '"available":false}',
+              );
+            default:
+              return _json('{}', status: 404);
+          }
+        }),
+      );
+
+      await tester.pumpWidget(
+        MoeenProviderApp(
+          api: api,
+          sessionStore: _MemorySessionStore('provider-session'),
+          hiddenStore: _MemoryHiddenStore(),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(foreground.startCalls, 1);
+      expect(trackingReads, 1);
+
+      // The worker sends this terminal event immediately before stopping its
+      // service. It must not become a location-FGS restart loop while the app is
+      // backgrounded or the screen is off.
+      final generation =
+          (foreground.taskMessages.single
+              as Map<Object?, Object?>)['generation'];
+      foreground.running = false;
+      FlutterForegroundTask.dataCallbacks.single({
+        'event': 'location_unavailable',
+        'generation': generation,
+        'requestId': 'MOE-1001',
+      });
+      await tester.pumpAndSettle();
+
+      expect(foreground.startCalls, 1);
+      expect(trackingReads, 1);
+      expect(availabilityWrites, 0);
+      expect(
+        tester.widget<SwitchListTile>(find.byType(SwitchListTile)).value,
+        isTrue,
+      );
+      expect(find.textContaining('تم إيقاف تتبع الموقع'), findsOneWidget);
+
+      await tester.tap(find.byTooltip('تحديث'));
+      await tester.pumpAndSettle();
+
+      expect(foreground.startCalls, 2);
+      expect(trackingReads, 2);
+      expect(foreground.running, isTrue);
     },
   );
 
@@ -607,4 +708,43 @@ class _FakeTrackingRuntime implements ProviderTrackingRuntime {
     _status = null;
     stopCalls += 1;
   }
+}
+
+class _LifecycleForegroundPlatform extends FlutterForegroundTaskPlatform {
+  bool running = false;
+  int startCalls = 0;
+  final List<Object> taskMessages = [];
+
+  @override
+  Future<bool> get isRunningService async => running;
+
+  @override
+  Future<void> startService({
+    required AndroidNotificationOptions androidNotificationOptions,
+    required IOSNotificationOptions iosNotificationOptions,
+    required ForegroundTaskOptions foregroundTaskOptions,
+    int? serviceId,
+    List<ForegroundServiceTypes>? serviceTypes,
+    required String notificationTitle,
+    required String notificationText,
+    NotificationIcon? notificationIcon,
+    List<NotificationButton>? notificationButtons,
+    String? notificationInitialRoute,
+    Function? callback,
+  }) async {
+    startCalls += 1;
+    running = true;
+  }
+
+  @override
+  void sendDataToTask(Object data) => taskMessages.add(data);
+}
+
+class _LifecycleGeolocatorPlatform extends geolocator.GeolocatorPlatform {
+  @override
+  Future<geolocator.LocationPermission> checkPermission() async =>
+      geolocator.LocationPermission.whileInUse;
+
+  @override
+  Future<bool> isLocationServiceEnabled() async => true;
 }

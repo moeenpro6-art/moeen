@@ -48,6 +48,10 @@ flutter {
     source = "../.."
 }
 
+dependencies {
+    testImplementation("junit:junit:4.13.2")
+}
+
 /**
  * This app must clear a stale flutter_foreground_task stopWithTask preference
  * before plugin initialization. The preference API is plugin-internal, so fail

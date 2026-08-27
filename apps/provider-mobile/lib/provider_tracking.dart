@@ -1,10 +1,30 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:developer' show Timeline;
 import 'dart:io' show Platform;
+import 'dart:math';
 
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:geolocator/geolocator.dart' as geolocator;
 import 'package:http/http.dart' as http;
+
+void providerTrackingLifecycleLog(
+  String event, {
+  String? runtimeId,
+  String? generation,
+  String? reason,
+}) {
+  final fields = <String>[
+    'tMonoUs=${Timeline.now}',
+    'event=$event',
+    if (runtimeId != null) 'runtime=$runtimeId',
+    if (generation != null) 'generation=$generation',
+    if (reason != null) 'reason=$reason',
+  ];
+  debugPrint('[MoeenTrackingLifecycle] ${fields.join(' ')}');
+}
 
 /// The server is the only authority for active collection. This value is never
 /// derived from a local job status or persisted client-side state.
@@ -240,6 +260,7 @@ enum ProviderTrackingRecoveryResult {
   conflict,
   notFound,
   networkFailure,
+  superseded,
 }
 
 /// Reconciles every assigned job before granting the local runtime permission
@@ -276,8 +297,50 @@ class ProviderTrackingRecoveryCoordinator {
   final ProviderTrackingRuntime runtime;
   final List<Duration> _retryDelays;
   final ProviderTrackingWait _wait;
+  int _authorityRevision = 0;
+  Future<void> _runtimeActionTail = Future<void>.value();
 
-  Future<void> stopAndClear() async {
+  /// Invalidates older recovery reads and serializes this fresh transition's
+  /// runtime action against any recovery action that already began.
+  Future<T> applyAuthoritativeTransition<T>(Future<T> Function() action) {
+    _authorityRevision += 1;
+    providerTrackingLifecycleLog(
+      'authority.transition.claimed',
+      reason: 'revision=$_authorityRevision',
+    );
+    return _serializeRuntimeAction(action);
+  }
+
+  Future<T> _serializeRuntimeAction<T>(Future<T> Function() action) async {
+    final previous = _runtimeActionTail;
+    final completion = Completer<void>();
+    _runtimeActionTail = completion.future;
+    await previous;
+    try {
+      return await action();
+    } finally {
+      completion.complete();
+    }
+  }
+
+  Future<bool> _applyIfCurrent(int revision, Future<void> Function() action) =>
+      _serializeRuntimeAction(() async {
+        if (revision != _authorityRevision) {
+          providerTrackingLifecycleLog(
+            'authority.recovery.superseded',
+            reason: 'read=$revision current=$_authorityRevision',
+          );
+          return false;
+        }
+        await action();
+        return true;
+      });
+
+  Future<void> stopAndClear({String reason = 'unspecified'}) async {
+    providerTrackingLifecycleLog(
+      'authority.stopAndClear.dispatch',
+      reason: 'revision=$_authorityRevision source=$reason',
+    );
     await runtime.stop();
     await runtime.clearQueue();
   }
@@ -290,12 +353,21 @@ class ProviderTrackingRecoveryCoordinator {
     required String token,
     required Iterable<String> requestIds,
   }) async {
+    final revision = _authorityRevision;
+    providerTrackingLifecycleLog(
+      'authority.recovery.claimed',
+      reason: 'revision=$revision',
+    );
     final previous = _reconciliationTail;
     final completion = Completer<void>();
     _reconciliationTail = completion.future;
     await previous;
     try {
-      return await _reconcile(token: token, requestIds: requestIds);
+      return await _reconcile(
+        token: token,
+        requestIds: requestIds,
+        revision: revision,
+      );
     } finally {
       completion.complete();
     }
@@ -304,11 +376,17 @@ class ProviderTrackingRecoveryCoordinator {
   Future<ProviderTrackingRecoveryResult> _reconcile({
     required String token,
     required Iterable<String> requestIds,
+    required int revision,
   }) async {
     final uniqueIds = requestIds.toSet().toList(growable: false);
     if (uniqueIds.isEmpty) {
       // No candidate request can authorize device location acquisition.
-      await stopAndClear();
+      if (!await _applyIfCurrent(
+        revision,
+        () => stopAndClear(reason: 'reconcile'),
+      )) {
+        return ProviderTrackingRecoveryResult.superseded;
+      }
       return ProviderTrackingRecoveryResult.inactive;
     }
 
@@ -330,7 +408,12 @@ class ProviderTrackingRecoveryCoordinator {
         // A transport failure leaves authority unresolved. Stop before waiting
         // or retrying so no location is collected on stale server authority.
         if (!stoppedForAmbiguousAuthority) {
-          await stopAndClear();
+          if (!await _applyIfCurrent(
+            revision,
+            () => stopAndClear(reason: 'reconcile'),
+          )) {
+            return ProviderTrackingRecoveryResult.superseded;
+          }
           stoppedForAmbiguousAuthority = true;
         }
         if (attempt == _retryDelays.length) {
@@ -338,62 +421,106 @@ class ProviderTrackingRecoveryCoordinator {
         }
         await _wait(_retryDelays[attempt]);
       } on ProviderTrackingConflictException {
-        await stopAndClear();
+        if (!await _applyIfCurrent(
+          revision,
+          () => stopAndClear(reason: 'reconcile'),
+        )) {
+          return ProviderTrackingRecoveryResult.superseded;
+        }
         return ProviderTrackingRecoveryResult.inactive;
       } on ProviderTrackingProtocolException {
-        await stopAndClear();
+        if (!await _applyIfCurrent(
+          revision,
+          () => stopAndClear(reason: 'reconcile'),
+        )) {
+          return ProviderTrackingRecoveryResult.superseded;
+        }
         return ProviderTrackingRecoveryResult.inactive;
       }
     }
 
     if (statuses == null) {
-      await stopAndClear();
+      if (!await _applyIfCurrent(
+        revision,
+        () => stopAndClear(reason: 'reconcile'),
+      )) {
+        return ProviderTrackingRecoveryResult.superseded;
+      }
       return ProviderTrackingRecoveryResult.inactive;
     }
     if (missingAuthority) {
       // The request may have become terminal or been reassigned between the
       // dashboard read and the authority read. It cannot grant collection.
-      await stopAndClear();
+      if (!await _applyIfCurrent(
+        revision,
+        () => stopAndClear(reason: 'reconcile'),
+      )) {
+        return ProviderTrackingRecoveryResult.superseded;
+      }
       return ProviderTrackingRecoveryResult.notFound;
     }
     final active = statuses.where((status) => status.active).toList();
 
     if (active.length > 1) {
-      await stopAndClear();
+      if (!await _applyIfCurrent(
+        revision,
+        () => stopAndClear(reason: 'reconcile'),
+      )) {
+        return ProviderTrackingRecoveryResult.superseded;
+      }
       return ProviderTrackingRecoveryResult.conflict;
     }
     if (active.isEmpty) {
-      await stopAndClear();
+      if (!await _applyIfCurrent(
+        revision,
+        () => stopAndClear(reason: 'reconcile'),
+      )) {
+        return ProviderTrackingRecoveryResult.superseded;
+      }
       return ProviderTrackingRecoveryResult.inactive;
     }
     final authority = active.single;
 
-    if (await runtime.isRunning()) {
-      if (runtime.matches(authority)) {
-        // Idempotent no-op: same active request with the same cadence. The
-        // running foreground service and its location stream are neither
-        // stopped nor rebuilt.
+    return _serializeRuntimeAction(() async {
+      if (revision != _authorityRevision) {
+        providerTrackingLifecycleLog(
+          'authority.recovery.superseded',
+          reason: 'read=$revision current=$_authorityRevision',
+        );
+        return ProviderTrackingRecoveryResult.superseded;
+      }
+      if (await runtime.isRunning()) {
+        if (runtime.matches(authority)) {
+          providerTrackingLifecycleLog(
+            'authority.recovery.noop',
+            reason: 'revision=$revision',
+          );
+          // Idempotent no-op: same active request with the same cadence. The
+          // running foreground service and its location stream are untouched.
+          return ProviderTrackingRecoveryResult.active;
+        }
+        try {
+          providerTrackingLifecycleLog(
+            'authority.recovery.update.dispatch',
+            reason: 'revision=$revision',
+          );
+          await runtime.update(authority, token);
+        } on ProviderTrackingRuntimeException {
+          await stopAndClear(reason: 'reconcile_update_failure');
+          rethrow;
+        }
         return ProviderTrackingRecoveryResult.active;
       }
-      try {
-        // Changed cadence/status: reconfigure the single existing collector in
-        // place; never tear the foreground service down and never create a
-        // second location stream.
-        await runtime.update(authority, token);
-      } on ProviderTrackingRuntimeException {
-        // A failed in-place update leaves collector ownership ambiguous. Stop
-        // rather than attempting a second start; the next fresh authority read
-        // may safely start one collector from a known stopped state.
-        await stopAndClear();
-        rethrow;
-      }
-      return ProviderTrackingRecoveryResult.active;
-    }
 
-    // Cold recovery: start device acquisition only after this fresh
-    // authenticated GET above returned an active authority.
-    await runtime.start(authority, token);
-    return ProviderTrackingRecoveryResult.active;
+      // Cold recovery: start device acquisition only after this fresh
+      // authenticated GET above returned an active authority.
+      providerTrackingLifecycleLog(
+        'authority.recovery.start.dispatch',
+        reason: 'revision=$revision',
+      );
+      await runtime.start(authority, token);
+      return ProviderTrackingRecoveryResult.active;
+    });
   }
 
   Future<_AuthorityRead> _readStatuses(
@@ -436,20 +563,303 @@ class ProviderTrackingRuntimeEvent {
   const ProviderTrackingRuntimeEvent({
     required this.type,
     required this.requestId,
+    required this.generation,
   });
 
   final String type;
   final String requestId;
+  final String generation;
 
   factory ProviderTrackingRuntimeEvent.fromMessage(Map<dynamic, dynamic> json) {
     final type = json['event'];
     final requestId = json['requestId'];
-    if (type is! String || requestId is! String || requestId.isEmpty) {
+    final generation = json['generation'];
+    if (type is! String ||
+        requestId is! String ||
+        requestId.isEmpty ||
+        generation is! String ||
+        generation.isEmpty) {
       throw const ProviderTrackingProtocolException();
     }
-    return ProviderTrackingRuntimeEvent(type: type, requestId: requestId);
+    return ProviderTrackingRuntimeEvent(
+      type: type,
+      requestId: requestId,
+      generation: generation,
+    );
   }
 }
+
+enum ProviderTrackingServiceStopResult { requested, alreadyStopped, stale }
+
+/// Process-memory ownership boundary for the one global Android location FGS.
+///
+/// The Android implementation atomically validates the caller's runtime epoch
+/// or worker generation before it dispatches the global service stop. No FCM
+/// payload or persisted Dart state participates in this decision.
+abstract interface class ProviderTrackingServiceAuthority {
+  Future<int> beginRuntime(String runtimeId, {required int runtimeSequence});
+
+  Future<bool> claimGeneration({
+    required String runtimeId,
+    required int runtimeEpoch,
+    required String generation,
+  });
+
+  Future<bool> ownsGeneration(String generation);
+
+  Future<void> releaseGeneration(String generation);
+
+  Future<ProviderTrackingServiceStopResult> stopGeneration(String generation);
+
+  Future<ProviderTrackingServiceStopResult> stopForZeroAuthority({
+    required String runtimeId,
+    required int runtimeEpoch,
+    required String stopRequestId,
+  });
+}
+
+const _providerTrackingServiceAuthorityChannel = MethodChannel(
+  'com.moeen.moeen_provider/provider_tracking_service_authority',
+);
+
+class _AndroidProviderTrackingServiceAuthority
+    implements ProviderTrackingServiceAuthority {
+  const _AndroidProviderTrackingServiceAuthority();
+
+  @override
+  Future<int> beginRuntime(
+    String runtimeId, {
+    required int runtimeSequence,
+  }) async {
+    try {
+      return await _providerTrackingServiceAuthorityChannel.invokeMethod<int>(
+            'beginRuntime',
+            <String, Object>{
+              'runtimeId': runtimeId,
+              'runtimeSequence': runtimeSequence,
+            },
+          ) ??
+          -1;
+    } catch (_) {
+      throw const ProviderTrackingRuntimeException();
+    }
+  }
+
+  @override
+  Future<bool> claimGeneration({
+    required String runtimeId,
+    required int runtimeEpoch,
+    required String generation,
+  }) async {
+    try {
+      return await _providerTrackingServiceAuthorityChannel.invokeMethod<bool>(
+            'claimGeneration',
+            <String, Object>{
+              'runtimeId': runtimeId,
+              'runtimeEpoch': runtimeEpoch,
+              'generation': generation,
+            },
+          ) ??
+          false;
+    } catch (_) {
+      throw const ProviderTrackingRuntimeException();
+    }
+  }
+
+  @override
+  Future<bool> ownsGeneration(String generation) async {
+    try {
+      return await _providerTrackingServiceAuthorityChannel.invokeMethod<bool>(
+            'ownsGeneration',
+            <String, Object>{'generation': generation},
+          ) ??
+          false;
+    } catch (_) {
+      throw const ProviderTrackingRuntimeException();
+    }
+  }
+
+  @override
+  Future<void> releaseGeneration(String generation) async {
+    try {
+      await _providerTrackingServiceAuthorityChannel.invokeMethod<void>(
+        'releaseGeneration',
+        <String, Object>{'generation': generation},
+      );
+    } catch (_) {
+      throw const ProviderTrackingRuntimeException();
+    }
+  }
+
+  @override
+  Future<ProviderTrackingServiceStopResult> stopGeneration(String generation) =>
+      _stop('stopGeneration', <String, Object>{'generation': generation});
+
+  @override
+  Future<ProviderTrackingServiceStopResult> stopForZeroAuthority({
+    required String runtimeId,
+    required int runtimeEpoch,
+    required String stopRequestId,
+  }) => _stop('stopForZeroAuthority', <String, Object>{
+    'runtimeId': runtimeId,
+    'runtimeEpoch': runtimeEpoch,
+    'stopRequestId': stopRequestId,
+  });
+
+  Future<ProviderTrackingServiceStopResult> _stop(
+    String method,
+    Map<String, Object> arguments,
+  ) async {
+    try {
+      final value = await _providerTrackingServiceAuthorityChannel
+          .invokeMethod<String>(method, arguments);
+      return switch (value) {
+        'requested' => ProviderTrackingServiceStopResult.requested,
+        'alreadyStopped' => ProviderTrackingServiceStopResult.alreadyStopped,
+        'stale' => ProviderTrackingServiceStopResult.stale,
+        _ => throw const ProviderTrackingRuntimeException(),
+      };
+    } on ProviderTrackingRuntimeException {
+      rethrow;
+    } catch (_) {
+      throw const ProviderTrackingRuntimeException();
+    }
+  }
+}
+
+/// Non-Android/test fallback. Android never uses this isolate-local registry;
+/// its production authority lives in synchronized native process memory so the
+/// UI and foreground-worker Flutter engines share one decision point.
+class _LocalProviderTrackingServiceAuthority
+    implements ProviderTrackingServiceAuthority {
+  _LocalProviderTrackingServiceAuthority._();
+
+  static final instance = _LocalProviderTrackingServiceAuthority._();
+
+  String? _runtimeId;
+  int _latestRuntimeEpoch = 0;
+  String? _generation;
+  bool _hasRuntime = false;
+  String? _pendingStop;
+  String? _lastStoppedGeneration;
+  String? _lastZeroAuthorityStop;
+
+  @override
+  Future<int> beginRuntime(
+    String runtimeId, {
+    required int runtimeSequence,
+  }) async {
+    _runtimeId = runtimeId;
+    _latestRuntimeEpoch += 1;
+    _hasRuntime = true;
+    return _latestRuntimeEpoch;
+  }
+
+  @override
+  Future<bool> claimGeneration({
+    required String runtimeId,
+    required int runtimeEpoch,
+    required String generation,
+  }) async {
+    if (_runtimeId != runtimeId || runtimeEpoch != _latestRuntimeEpoch) {
+      return false;
+    }
+    if (_pendingStop != null && await FlutterForegroundTask.isRunningService) {
+      return false;
+    }
+    _generation = generation;
+    _pendingStop = null;
+    return true;
+  }
+
+  @override
+  Future<bool> ownsGeneration(String generation) async {
+    // Direct worker tests run without an Android UI engine. Production Android
+    // never takes this branch; accepting the first configuration here only
+    // models the main runtime's prior native claim in that single test isolate.
+    if (!_hasRuntime && _generation == null) _generation = generation;
+    return _generation == generation;
+  }
+
+  @override
+  Future<void> releaseGeneration(String generation) async {
+    if (_generation == generation) _generation = null;
+  }
+
+  @override
+  Future<ProviderTrackingServiceStopResult> stopGeneration(
+    String generation,
+  ) async {
+    if (_generation != generation) {
+      return _lastStoppedGeneration == generation
+          ? ProviderTrackingServiceStopResult.alreadyStopped
+          : ProviderTrackingServiceStopResult.stale;
+    }
+    _generation = null;
+    _lastStoppedGeneration = generation;
+    return _requestStop('generation:$generation');
+  }
+
+  @override
+  Future<ProviderTrackingServiceStopResult> stopForZeroAuthority({
+    required String runtimeId,
+    required int runtimeEpoch,
+    required String stopRequestId,
+  }) async {
+    if (_runtimeId != runtimeId || runtimeEpoch != _latestRuntimeEpoch) {
+      return ProviderTrackingServiceStopResult.stale;
+    }
+    if (_lastZeroAuthorityStop == stopRequestId) {
+      return ProviderTrackingServiceStopResult.alreadyStopped;
+    }
+    _generation = null;
+    _lastZeroAuthorityStop = stopRequestId;
+    return _requestStop('zero:$stopRequestId');
+  }
+
+  Future<ProviderTrackingServiceStopResult> _requestStop(String request) async {
+    if (_pendingStop != null) {
+      return ProviderTrackingServiceStopResult.alreadyStopped;
+    }
+    if (!await FlutterForegroundTask.isRunningService) {
+      return ProviderTrackingServiceStopResult.alreadyStopped;
+    }
+    _pendingStop = request;
+    providerTrackingLifecycleLog(
+      'flutter.stopService.request',
+      generation: _generation,
+      reason: request,
+    );
+    final result = await FlutterForegroundTask.stopService();
+    providerTrackingLifecycleLog(
+      'flutter.stopService.return',
+      generation: _generation,
+      reason: result.runtimeType.toString(),
+    );
+    _pendingStop = null;
+    if (result is ServiceRequestFailure) {
+      throw const ProviderTrackingRuntimeException();
+    }
+    return ProviderTrackingServiceStopResult.requested;
+  }
+}
+
+ProviderTrackingServiceAuthority _defaultProviderTrackingServiceAuthority() =>
+    Platform.isAndroid
+    ? const _AndroidProviderTrackingServiceAuthority()
+    : _LocalProviderTrackingServiceAuthority.instance;
+
+final Random _trackingIdRandom = Random.secure();
+int _trackingIdCounter = 0;
+int _trackingRuntimeSequence = 0;
+
+String _newTrackingRuntimeId() =>
+    'runtime-${DateTime.now().microsecondsSinceEpoch}-'
+    '${_trackingIdCounter++}-${_trackingIdRandom.nextInt(0x7fffffff)}';
+
+String _newTrackingGeneration() =>
+    'generation-${DateTime.now().microsecondsSinceEpoch}-'
+    '${_trackingIdCounter++}-${_trackingIdRandom.nextInt(0x7fffffff)}';
 
 /// Initializes the Android foreground-service integration without asking for
 /// GPS, notification, battery, or alarm permissions. The service itself is
@@ -496,16 +906,34 @@ class FlutterProviderTrackingRuntime implements ProviderTrackingRuntime {
     required String baseUrl,
     required this._onEvent,
     bool Function()? shouldProbePlatformService,
+    ProviderTrackingServiceAuthority? serviceAuthority,
+    this._collectorReadyTimeout = const Duration(seconds: 5),
   }) : _baseUrl = baseUrl.replaceFirst(RegExp(r'/$'), ''),
        _shouldProbePlatformService =
-           shouldProbePlatformService ?? _isAndroidPlatform {
+           shouldProbePlatformService ?? _isAndroidPlatform,
+       _serviceAuthority =
+           serviceAuthority ?? _defaultProviderTrackingServiceAuthority(),
+       _runtimeId = _newTrackingRuntimeId(),
+       _runtimeSequence = _trackingRuntimeSequence++ {
+    // This isolate-local sequence orders runtime objects within one engine. The
+    // Android plugin combines it with a native process-memory engine sequence,
+    // which remains monotonic if a replacement Flutter isolate resets this one.
     FlutterForegroundTask.addTaskDataCallback(_onTaskData);
   }
 
   final String _baseUrl;
   final void Function(ProviderTrackingRuntimeEvent event) _onEvent;
   final bool Function() _shouldProbePlatformService;
+  final ProviderTrackingServiceAuthority _serviceAuthority;
+  final Duration _collectorReadyTimeout;
+  final String _runtimeId;
+  final int _runtimeSequence;
+  Future<int>? _runtimeEpochFuture;
+  String? _currentGeneration;
   bool _serviceStartedByThisRuntime = false;
+  bool _collectorActive = false;
+  String? _collectorReadyGeneration;
+  Completer<bool>? _collectorReadyCompleter;
   ProviderTrackingStatus? _configuredStatus;
   // Process-memory-only marker for a replacement worker. No coordinates are
   // retained, written to storage, or sent to the UI isolate. The request id
@@ -516,6 +944,12 @@ class FlutterProviderTrackingRuntime implements ProviderTrackingRuntime {
 
   @override
   Future<void> start(ProviderTrackingStatus status, String token) async {
+    await _runtimeEpoch();
+    providerTrackingLifecycleLog(
+      'runtime.start.enter',
+      runtimeId: _runtimeId,
+      reason: 'status=${status.status}',
+    );
     if (!status.active) {
       throw const ProviderTrackingLocationPermissionException();
     }
@@ -552,7 +986,9 @@ class FlutterProviderTrackingRuntime implements ProviderTrackingRuntime {
         // The worker ended outside this isolate. Its configuration is no longer
         // live, so this fresh authority may create one replacement worker.
         _serviceStartedByThisRuntime = false;
+        _collectorActive = false;
         _configuredStatus = null;
+        _currentGeneration = null;
       }
       if (_serviceStartedByThisRuntime) {
         // Owned but configured differently: fail-closed clean restart.
@@ -564,22 +1000,20 @@ class FlutterProviderTrackingRuntime implements ProviderTrackingRuntime {
           // and configures its existing worker instead of tearing the FGS down
           // and creating a second collector.
           //
-          // The plugin gives a persisted stopWithTask preference precedence over
-          // the manifest flag. Refresh it before adoption so an FGS inherited
-          // from an earlier process/configuration cannot be stopped when the
-          // Activity becomes invisible after Home is pressed.
-          try {
-            await _refreshForegroundServiceOptions(status);
-          } on ProviderTrackingRuntimeException {
-            // The inherited worker cannot be trusted if its persisted service
-            // options could not be refreshed. Do not leave it collecting while
-            // the runtime reports that adoption failed.
-            await _stopPlatformServiceAndVerifyStopped();
-            rethrow;
-          }
+          // Adoption is configuration-only. flutter_foreground_task persists
+          // the start options (including stopWithTask=false) and implements
+          // updateService by sending another Android startService command. Do
+          // not manufacture that start while adopting an already-live worker.
+          final generation = _newTrackingGeneration();
+          await _claimGeneration(generation);
           _serviceStartedByThisRuntime = true;
+          // A configure send is not collector liveness. The surviving worker
+          // acknowledges only after it installs the generation's real GPS
+          // subscription; until then reconciliation may not false-no-op.
+          _collectorActive = false;
           _configuredStatus = status;
-          _sendConfiguration(status, token);
+          _currentGeneration = generation;
+          await _configureAndAwaitCollector(status, token, generation);
           return;
         }
         // A non-Android test/platform service cannot be adopted as an Android
@@ -599,6 +1033,15 @@ class FlutterProviderTrackingRuntime implements ProviderTrackingRuntime {
         ),
         foregroundTaskOptions: _foregroundTaskOptions(status.cadenceMs),
       );
+      final generation = _newTrackingGeneration();
+      // Claim before Android receives the start command. That invalidates every
+      // older worker continuation before a replacement service can exist.
+      await _claimGeneration(generation);
+      providerTrackingLifecycleLog(
+        'runtime.startService.request',
+        runtimeId: _runtimeId,
+        generation: generation,
+      );
       final result = await FlutterForegroundTask.startService(
         serviceId: 4103,
         serviceTypes: const [ForegroundServiceTypes.location],
@@ -607,18 +1050,31 @@ class FlutterProviderTrackingRuntime implements ProviderTrackingRuntime {
         callback: providerTrackingForegroundTaskStartCallback,
       );
       if (result is ServiceRequestFailure) {
+        await _serviceAuthority.releaseGeneration(generation);
         throw ProviderTrackingRuntimeException();
       }
+      providerTrackingLifecycleLog(
+        'runtime.startService.return',
+        runtimeId: _runtimeId,
+        generation: generation,
+        reason: 'success',
+      );
       _serviceStartedByThisRuntime = true;
+      // startService means the Android FGS exists, not that its worker has
+      // installed the authorized location subscription.
+      _collectorActive = false;
       _configuredStatus = status;
+      _currentGeneration = generation;
       // The worker begins blank and cannot call location APIs until this
       // current, server-authorized configuration arrives in memory.
-      _sendConfiguration(status, token);
+      await _configureAndAwaitCollector(status, token, generation);
     } catch (_) {
       // A failed foreground-service start is fail-closed: it never starts a
       // fallback foreground/background GPS listener.
       _serviceStartedByThisRuntime = false;
+      _collectorActive = false;
       _configuredStatus = null;
+      _currentGeneration = null;
       throw const ProviderTrackingRuntimeException();
     }
   }
@@ -633,10 +1089,15 @@ class FlutterProviderTrackingRuntime implements ProviderTrackingRuntime {
   }
 
   @override
-  Future<bool> isRunning() async =>
-      _serviceStartedByThisRuntime &&
-      !_disposed &&
-      await FlutterForegroundTask.isRunningService;
+  Future<bool> isRunning() async {
+    final generation = _currentGeneration;
+    return _serviceStartedByThisRuntime &&
+        _collectorActive &&
+        !_disposed &&
+        generation != null &&
+        await _serviceAuthority.ownsGeneration(generation) &&
+        await FlutterForegroundTask.isRunningService;
+  }
 
   @override
   bool matches(ProviderTrackingStatus status) {
@@ -662,29 +1123,39 @@ class FlutterProviderTrackingRuntime implements ProviderTrackingRuntime {
     try {
       // The worker cancels/replaces its stream in-memory while this foreground
       // service remains running; it never falls back to a local cadence.
-      _sendConfiguration(status, token);
+      final generation = _currentGeneration;
+      if (generation == null) {
+        throw const ProviderTrackingRuntimeException();
+      }
+      _collectorActive = false;
       _configuredStatus = status;
+      await _configureAndAwaitCollector(status, token, generation);
     } catch (_) {
       throw const ProviderTrackingRuntimeException();
     }
   }
 
-  Future<void> _refreshForegroundServiceOptions(
-    ProviderTrackingStatus status,
-  ) async {
-    final result = await FlutterForegroundTask.updateService(
-      foregroundTaskOptions: _foregroundTaskOptions(status.cadenceMs),
-      notificationTitle: 'معين — تتبع الطلب نشط',
-      notificationText: 'رقم الطلب: ${status.requestId}',
-    );
-    if (result is ServiceRequestFailure) {
+  Future<int> _runtimeEpoch() => _runtimeEpochFuture ??= _serviceAuthority
+      .beginRuntime(_runtimeId, runtimeSequence: _runtimeSequence);
+
+  Future<void> _claimGeneration(String generation) async {
+    if (!await _serviceAuthority.claimGeneration(
+      runtimeId: _runtimeId,
+      runtimeEpoch: await _runtimeEpoch(),
+      generation: generation,
+    )) {
       throw const ProviderTrackingRuntimeException();
     }
   }
 
-  void _sendConfiguration(ProviderTrackingStatus status, String token) {
+  void _sendConfiguration(
+    ProviderTrackingStatus status,
+    String token,
+    String generation,
+  ) {
     FlutterForegroundTask.sendDataToTask({
       'command': 'configure',
+      'generation': generation,
       'baseUrl': _baseUrl,
       'requestId': status.requestId,
       'token': token,
@@ -694,6 +1165,46 @@ class FlutterProviderTrackingRuntime implements ProviderTrackingRuntime {
       if (_lastCollectedAt != null)
         'lastCollectedAt': _lastCollectedAt!.toIso8601String(),
     });
+  }
+
+  Future<void> _configureAndAwaitCollector(
+    ProviderTrackingStatus status,
+    String token,
+    String generation,
+  ) async {
+    if (!_shouldProbePlatformService()) {
+      // Non-Android platforms have no process-global service authority to
+      // acknowledge across engines. Preserve their existing local/test contract.
+      _sendConfiguration(status, token, generation);
+      _collectorActive = true;
+      return;
+    }
+
+    final ready = Completer<bool>();
+    _collectorReadyGeneration = generation;
+    _collectorReadyCompleter = ready;
+    _sendConfiguration(status, token, generation);
+
+    final acknowledged = await ready.future.timeout(
+      _collectorReadyTimeout,
+      onTimeout: () => false,
+    );
+    if (_collectorReadyGeneration == generation) {
+      _collectorReadyGeneration = null;
+      _collectorReadyCompleter = null;
+    }
+    if (acknowledged && _currentGeneration == generation && await isRunning()) {
+      return;
+    }
+
+    // A missing/terminal acknowledgement leaves only an empty FGS. Final
+    // native ownership validation decides whether this generation may stop it;
+    // a concurrently claimed replacement returns stale and remains untouched.
+    final result = await _serviceAuthority.stopGeneration(generation);
+    if (result != ProviderTrackingServiceStopResult.stale) {
+      await _verifyPlatformServiceStopped();
+    }
+    throw const ProviderTrackingRuntimeException();
   }
 
   @override
@@ -713,31 +1224,49 @@ class FlutterProviderTrackingRuntime implements ProviderTrackingRuntime {
   @override
   Future<void> stop() async {
     final ownsLiveWorker = _serviceStartedByThisRuntime;
+    final generation = _currentGeneration;
+    providerTrackingLifecycleLog(
+      'runtime.stop.enter',
+      runtimeId: _runtimeId,
+      generation: generation,
+      reason: ownsLiveWorker ? 'owned_generation' : 'zero_authority',
+    );
     try {
-      if (ownsLiveWorker) {
-        FlutterForegroundTask.sendDataToTask(const {'command': 'stop'});
-      }
-      // A recreated UI isolate has no local ownership marker for an Android
-      // foreground service that survived it. Revoked, zero, or unverifiable
-      // authority must still explicitly stop that inherited platform service.
-      if (ownsLiveWorker ||
-          (_shouldProbePlatformService() &&
-              await FlutterForegroundTask.isRunningService)) {
-        await _stopPlatformServiceAndVerifyStopped();
+      // The native authority atomically compares this generation/runtime epoch
+      // before it dispatches the plugin's global stop. A delayed continuation
+      // from an older worker or runtime therefore cannot stop a replacement.
+      final result = ownsLiveWorker && generation != null
+          ? await _serviceAuthority.stopGeneration(generation)
+          : !_shouldProbePlatformService()
+          ? ProviderTrackingServiceStopResult.alreadyStopped
+          : await _serviceAuthority.stopForZeroAuthority(
+              runtimeId: _runtimeId,
+              runtimeEpoch: await _runtimeEpoch(),
+              stopRequestId: _newTrackingGeneration(),
+            );
+      providerTrackingLifecycleLog(
+        'runtime.stop.decision',
+        runtimeId: _runtimeId,
+        generation: generation,
+        reason: result.name,
+      );
+      if (result != ProviderTrackingServiceStopResult.stale) {
+        await _verifyPlatformServiceStopped();
       }
     } on ProviderTrackingRuntimeException {
       rethrow;
     } catch (_) {
-      // The explicit worker stop command is sent before stopping an owned
-      // service; do not start a replacement collector when platform teardown
-      // fails. Automatic restart remains disabled until a fresh GET authority.
+      // Do not start a replacement collector when platform teardown fails.
+      // Automatic restart remains disabled until fresh GET authority succeeds.
       throw const ProviderTrackingRuntimeException();
     } finally {
       // The old service is never a future authority source. A teardown failure
       // is propagated, never converted into an OFF result; a later authority
       // response must explicitly create a fresh worker.
       _serviceStartedByThisRuntime = false;
+      _collectorActive = false;
       _configuredStatus = null;
+      _currentGeneration = null;
       // Preserve only this process-memory cadence marker. A fresh
       // server-authorized start of the same request seeds the new worker so an
       // immediate Android stream emission cannot create a sub-cadence POST.
@@ -745,22 +1274,56 @@ class FlutterProviderTrackingRuntime implements ProviderTrackingRuntime {
   }
 
   Future<void> _stopPlatformServiceAndVerifyStopped() async {
-    final result = await FlutterForegroundTask.stopService();
-    if (result is ServiceRequestFailure ||
-        (_shouldProbePlatformService() &&
-            await FlutterForegroundTask.isRunningService)) {
+    final result = await _serviceAuthority.stopForZeroAuthority(
+      runtimeId: _runtimeId,
+      runtimeEpoch: await _runtimeEpoch(),
+      stopRequestId: _newTrackingGeneration(),
+    );
+    if (result == ProviderTrackingServiceStopResult.stale) {
       throw const ProviderTrackingRuntimeException();
     }
+    await _verifyPlatformServiceStopped();
+  }
+
+  Future<void> _verifyPlatformServiceStopped() async {
+    if (!_shouldProbePlatformService()) return;
+    try {
+      for (var attempt = 0; attempt < 100; attempt += 1) {
+        if (!await FlutterForegroundTask.isRunningService) return;
+        if (attempt < 99) {
+          await Future<void>.delayed(const Duration(milliseconds: 50));
+        }
+      }
+    } catch (_) {
+      throw const ProviderTrackingRuntimeException();
+    }
+    throw const ProviderTrackingRuntimeException();
   }
 
   void _onTaskData(Object data) {
     if (_disposed || data is! Map<dynamic, dynamic>) return;
     try {
       final event = ProviderTrackingRuntimeEvent.fromMessage(data);
+      providerTrackingLifecycleLog(
+        'runtime.event.received',
+        runtimeId: _runtimeId,
+        generation: event.generation,
+        reason: event.type,
+      );
       // A delayed message from a prior worker must not update the active
       // request's cadence gate or stop its replacement collector.
-      if (event.requestId != _configuredStatus?.requestId) return;
+      if (event.requestId != _configuredStatus?.requestId ||
+          event.generation != _currentGeneration) {
+        providerTrackingLifecycleLog(
+          'runtime.event.ignored',
+          runtimeId: _runtimeId,
+          generation: event.generation,
+          reason: 'stale_generation_or_request',
+        );
+        return;
+      }
       if (event.type == 'sample_collected') {
+        _collectorActive = true;
         final capturedAt = data['capturedAt'];
         if (capturedAt is String) {
           final parsed = DateTime.tryParse(capturedAt);
@@ -776,6 +1339,26 @@ class FlutterProviderTrackingRuntime implements ProviderTrackingRuntime {
         }
         return;
       }
+      if (event.type == 'collector_started') {
+        // Worker-side proof that the current generation owns one concrete GPS
+        // subscription. Sending configure alone never establishes liveness.
+        _collectorActive = true;
+        final ready = _collectorReadyGeneration == event.generation
+            ? _collectorReadyCompleter
+            : null;
+        if (ready != null && !ready.isCompleted) ready.complete(true);
+        return;
+      }
+      if (event.type == 'collector_paused') {
+        _collectorActive = false;
+        _onEvent(event);
+        return;
+      }
+      if (event.type == 'authority_restored') {
+        _collectorActive = true;
+        _onEvent(event);
+        return;
+      }
       if (const {
         'unauthorized',
         'not_found',
@@ -784,9 +1367,15 @@ class FlutterProviderTrackingRuntime implements ProviderTrackingRuntime {
         'network',
         'stopped',
       }.contains(event.type)) {
+        final ready = _collectorReadyGeneration == event.generation
+            ? _collectorReadyCompleter
+            : null;
+        if (ready != null && !ready.isCompleted) ready.complete(false);
         _serviceStartedByThisRuntime = false;
+        _collectorActive = false;
         _configuredStatus = null;
-        // Terminal worker events cannot prove platform teardown completed. A
+        _currentGeneration = null;
+        // Terminal worker events cannot prove platform teardown completed.
         // later fail-closed reconciliation probes and confirms that no FGS
         // remains before it reports collection as off or starts a replacement.
         // Keep only the latest collection timestamp in process memory. If a
@@ -803,6 +1392,10 @@ class FlutterProviderTrackingRuntime implements ProviderTrackingRuntime {
   @override
   Future<void> dispose() async {
     _disposed = true;
+    final ready = _collectorReadyCompleter;
+    if (ready != null && !ready.isCompleted) ready.complete(false);
+    _collectorReadyGeneration = null;
+    _collectorReadyCompleter = null;
     FlutterForegroundTask.removeTaskDataCallback(_onTaskData);
   }
 }
@@ -817,13 +1410,25 @@ class _ProviderTrackingWorkerConfig {
     required this.baseUrl,
     required this.token,
     required this.status,
+    required this.generation,
     this.lastCollectedAt,
   });
 
   final String baseUrl;
   final String token;
   final ProviderTrackingStatus status;
+  final String generation;
   final DateTime? lastCollectedAt;
+}
+
+class _ProviderTrackingWorkerOwnership {
+  const _ProviderTrackingWorkerOwnership({
+    required this.requestId,
+    required this.generation,
+  });
+
+  final String requestId;
+  final String generation;
 }
 
 class _ProviderSample {
@@ -857,26 +1462,33 @@ class ProviderTrackingTaskHandler extends TaskHandler {
       Duration(seconds: 5),
     ],
     ProviderTrackingWait? wait,
+    ProviderTrackingServiceAuthority? serviceAuthority,
   }) : _client = client ?? http.Client(),
        _authorityRetryDelays = List<Duration>.unmodifiable(
          authorityRetryDelays,
        ),
-       _wait = wait ?? Future<void>.delayed;
+       _wait = wait ?? Future<void>.delayed,
+       _serviceAuthority =
+           serviceAuthority ?? _defaultProviderTrackingServiceAuthority();
 
   final http.Client _client;
   final List<Duration> _authorityRetryDelays;
   final ProviderTrackingWait _wait;
+  final ProviderTrackingServiceAuthority _serviceAuthority;
   final List<_ProviderSample> _queue = <_ProviderSample>[];
   final ProviderTrackingCadenceGate _cadenceGate =
       ProviderTrackingCadenceGate();
   _ProviderTrackingWorkerConfig? _configuration;
+  _ProviderTrackingWorkerOwnership? _ownership;
   StreamSubscription<geolocator.Position>? _positionSubscription;
   Future<void> _configurationTail = Future<void>.value();
   bool _busy = false;
   bool _stopped = false;
+  String? _terminalTeardownGeneration;
 
   @override
   Future<void> onStart(DateTime timestamp, TaskStarter starter) async {
+    providerTrackingLifecycleLog('worker.onStart', reason: starter.name);
     // Do not collect GPS here. The main isolate must first perform an
     // authenticated GET /tracking and explicitly configure this new worker.
   }
@@ -892,7 +1504,10 @@ class ProviderTrackingTaskHandler extends TaskHandler {
     if (data is! Map<dynamic, dynamic>) return;
     final command = data['command'];
     if (command == 'stop') {
-      unawaited(_stopAndNotify('stopped'));
+      final ownership = _ownership;
+      if (ownership != null) {
+        unawaited(_stopAndNotify('stopped', ownership));
+      }
       return;
     }
     if (command == 'clearQueue') {
@@ -901,7 +1516,16 @@ class ProviderTrackingTaskHandler extends TaskHandler {
     }
     if (command == 'configure') {
       final config = _configurationFromMessage(data);
-      if (config == null || _stopped) return;
+      if (config == null ||
+          _stopped ||
+          config.generation == _terminalTeardownGeneration) {
+        return;
+      }
+      providerTrackingLifecycleLog(
+        'worker.configure.received',
+        generation: config.generation,
+        reason: 'status=${config.status.status}',
+      );
       unawaited(_configureSerially(config));
     }
   }
@@ -923,6 +1547,7 @@ class ProviderTrackingTaskHandler extends TaskHandler {
   ) {
     final baseUrl = data['baseUrl'];
     final token = data['token'];
+    final generation = data['generation'];
     final requestId = data['requestId'];
     final status = data['status'];
     final onTheWayCadenceMs = data['onTheWayCadenceMs'];
@@ -931,6 +1556,8 @@ class ProviderTrackingTaskHandler extends TaskHandler {
     if (baseUrl is! String ||
         token is! String ||
         token.isEmpty ||
+        generation is! String ||
+        generation.isEmpty ||
         requestId is! String ||
         status is! String ||
         onTheWayCadenceMs is! int ||
@@ -966,6 +1593,7 @@ class ProviderTrackingTaskHandler extends TaskHandler {
         baseUrl: baseUrl.replaceFirst(RegExp(r'/$'), ''),
         token: token,
         status: tracking,
+        generation: generation,
         lastCollectedAt: parsedLastCollectedAt,
       );
     } catch (_) {
@@ -979,6 +1607,7 @@ class ProviderTrackingTaskHandler extends TaskHandler {
   ) {
     return left.baseUrl == right.baseUrl &&
         left.token == right.token &&
+        left.generation == right.generation &&
         left.status.requestId == right.status.requestId &&
         left.status.status == right.status.status &&
         left.status.onTheWayCadenceMs == right.status.onTheWayCadenceMs &&
@@ -986,6 +1615,20 @@ class ProviderTrackingTaskHandler extends TaskHandler {
   }
 
   Future<void> _applyConfiguration(_ProviderTrackingWorkerConfig config) async {
+    if (_stopped || config.generation == _terminalTeardownGeneration) return;
+    if (!await _serviceAuthority.ownsGeneration(config.generation)) {
+      providerTrackingLifecycleLog(
+        'worker.configure.ignored',
+        generation: config.generation,
+        reason: 'not_current_generation',
+      );
+      return;
+    }
+    if (_stopped || config.generation == _terminalTeardownGeneration) return;
+    _ownership = _ProviderTrackingWorkerOwnership(
+      requestId: config.status.requestId,
+      generation: config.generation,
+    );
     final existing = _configuration;
     if (existing != null &&
         _positionSubscription != null &&
@@ -997,6 +1640,11 @@ class ProviderTrackingTaskHandler extends TaskHandler {
       if (lastCollectedAt != null) {
         _cadenceGate.seed(config.status, lastCollectedAt);
       }
+      _sendEvent(
+        'collector_started',
+        config.status.requestId,
+        config.generation,
+      );
       return;
     }
 
@@ -1005,36 +1653,62 @@ class ProviderTrackingTaskHandler extends TaskHandler {
     // while the server changes cadence from on-the-way to in-progress.
     final previousSubscription = _positionSubscription;
     _positionSubscription = null;
+    if (previousSubscription != null) {
+      providerTrackingLifecycleLog(
+        'worker.stream.cancel',
+        generation: config.generation,
+        reason: 'reconfigure',
+      );
+    }
     await previousSubscription?.cancel();
     _configuration = config;
     final lastCollectedAt = config.lastCollectedAt;
     if (lastCollectedAt != null) {
       _cadenceGate.seed(config.status, lastCollectedAt);
     }
-    final result = await FlutterForegroundTask.updateService(
-      foregroundTaskOptions: _foregroundTaskOptions(config.status.cadenceMs),
-      notificationTitle: 'معين — تتبع الطلب نشط',
-      notificationText: 'رقم الطلب: ${config.status.requestId}',
-    );
-    if (result is ServiceRequestFailure) {
-      await _stopAndNotify('network');
-      return;
-    }
+    // This isolate changes only its in-memory GPS subscription. On Android,
+    // flutter_foreground_task implements updateService by dispatching another
+    // startService command to the already-running Service. Calling it during
+    // worker setup/recovery therefore creates an unnecessary FGS start request.
+    // Real service ownership and any native option changes stay in the UI
+    // runtime; stable worker configuration never touches the service channel.
     if (_configuration != config || _stopped) return;
     _positionSubscription =
         geolocator.Geolocator.getPositionStream(
           locationSettings: geolocator.AndroidSettings(
             accuracy: geolocator.LocationAccuracy.high,
             distanceFilter: 0,
+            // The worker isolate has no Activity. FusedLocationClient checks
+            // Google location settings asynchronously and immediately reports
+            // locationServicesDisabled when a resolvable setting lacks an
+            // Activity, even though Android's LocationManager providers are on.
+            // Use the direct system LocationManager inside Moeen's already
+            // authorized location FGS; this changes no permission boundary.
+            forceLocationManager: true,
             intervalDuration: Duration(milliseconds: config.status.cadenceMs),
           ),
         ).listen(
           (position) => unawaited(_onNewPosition(config, position)),
           onError: (error, stackTrace) {
-            unawaited(_stopAndNotify('location_unavailable'));
+            // The error class distinguishes a native settings/permission stream
+            // failure without logging a platform message or any location data.
+            providerTrackingLifecycleLog(
+              'worker.stream.error',
+              generation: config.generation,
+              reason: 'type=${error.runtimeType}',
+            );
+            unawaited(
+              _stopAndNotify('location_unavailable', _ownershipFor(config)),
+            );
           },
           cancelOnError: true,
         );
+    providerTrackingLifecycleLog(
+      'worker.stream.started',
+      generation: config.generation,
+      reason: 'status=${config.status.status}',
+    );
+    _sendEvent('collector_started', config.status.requestId, config.generation);
   }
 
   Future<void> _onNewPosition(
@@ -1045,7 +1719,7 @@ class ProviderTrackingTaskHandler extends TaskHandler {
     _busy = true;
     try {
       if (!await _hasLocationPermissionAndEnabledService()) {
-        await _stopAndNotify('location_unavailable');
+        await _stopAndNotify('location_unavailable', _ownershipFor(config));
         return;
       }
       // Recheck after the platform stream emits: a concurrent pause/recovery
@@ -1063,19 +1737,24 @@ class ProviderTrackingTaskHandler extends TaskHandler {
         capturedAt: capturedAt,
       );
       if (!_isValidSample(sample)) {
-        await _recoverAfterSampleRejection(config);
+        await _recoverAfterSampleRejection(config, _ownershipFor(config));
         return;
       }
       // Carry only the collection timestamp to the live main isolate. It is
       // never persisted and is used solely to seed a same-process replacement
       // worker's cadence gate; no coordinate data leaves this worker.
-      _sendEvent('sample_collected', config.status.requestId, capturedAt);
+      _sendEvent(
+        'sample_collected',
+        config.status.requestId,
+        config.generation,
+        capturedAt,
+      );
       _enqueue(sample);
       await _submitOldest(config);
     } catch (_) {
       // GPS loss and all unexpected acquisition faults revoke collection; they
       // must never become an offline coordinate buffer.
-      await _stopAndNotify('location_unavailable');
+      await _stopAndNotify('location_unavailable', _ownershipFor(config));
     } finally {
       _busy = false;
     }
@@ -1112,7 +1791,10 @@ class ProviderTrackingTaskHandler extends TaskHandler {
 
   Future<void> _submitOldest(_ProviderTrackingWorkerConfig config) async {
     _pruneQueue();
-    if (_queue.isEmpty || _configuration != config || _stopped) return;
+    final expectedOwnership = _ownershipFor(config);
+    if (_queue.isEmpty || !_ownsConfiguration(config, expectedOwnership)) {
+      return;
+    }
     final sample = _queue.first;
     http.Response response;
     try {
@@ -1132,48 +1814,62 @@ class ProviderTrackingTaskHandler extends TaskHandler {
         }),
       );
     } catch (_) {
-      await _recoverAfterNetworkFailure(config);
+      await _recoverAfterNetworkFailure(config, expectedOwnership);
       return;
     }
 
     if (response.statusCode >= 200 && response.statusCode < 300) {
-      _queue.remove(sample);
+      // A successful old request is stale too: it must not mutate a replacement
+      // generation's queue after the transport await.
+      if (_ownsConfiguration(config, expectedOwnership)) {
+        _queue.remove(sample);
+      }
       return;
     }
     if (response.statusCode == 401) {
-      await _stopAndNotify('unauthorized');
+      await _stopAndNotify('unauthorized', expectedOwnership);
       return;
     }
     if (response.statusCode == 404) {
-      await _stopAndNotify('not_found');
+      await _stopAndNotify('not_found', expectedOwnership);
       return;
     }
     if (response.statusCode >= 500) {
-      await _recoverAfterNetworkFailure(config);
+      await _recoverAfterNetworkFailure(config, expectedOwnership);
       return;
     }
     // 409 and every rejected sample fail closed, then re-read server authority.
-    await _recoverAfterSampleRejection(config);
+    await _recoverAfterSampleRejection(config, expectedOwnership);
   }
 
   Future<void> _recoverAfterSampleRejection(
     _ProviderTrackingWorkerConfig config,
+    _ProviderTrackingWorkerOwnership expectedOwnership,
   ) async {
-    await _pauseAndClear();
-    final result = await _readAndApplyAuthority(config);
+    if (!await _pauseAndClear(config, expectedOwnership)) return;
+    final result = await _readAndApplyAuthority(config, expectedOwnership);
     if (result == _AuthorityReadResult.networkFailure) {
-      await _boundedAuthorityRetry(config);
+      await _boundedAuthorityRetry(config, expectedOwnership);
     }
   }
 
   Future<void> _recoverAfterNetworkFailure(
     _ProviderTrackingWorkerConfig config,
+    _ProviderTrackingWorkerOwnership expectedOwnership,
   ) async {
-    await _pauseAndClear();
-    await _boundedAuthorityRetry(config);
+    if (!await _pauseAndClear(config, expectedOwnership)) return;
+    await _boundedAuthorityRetry(config, expectedOwnership);
   }
 
-  Future<void> _pauseAndClear() async {
+  Future<bool> _pauseAndClear(
+    _ProviderTrackingWorkerConfig expectedConfig,
+    _ProviderTrackingWorkerOwnership expectedOwnership,
+  ) async {
+    // This is the final synchronous mutation boundary for a POST failure. The
+    // request may have been awaiting transport while fresh authority installed
+    // a replacement generation, so never snapshot or mutate the newer worker
+    // state from this old continuation.
+    if (!_ownsConfiguration(expectedConfig, expectedOwnership)) return false;
     _configuration = null;
     _queue.clear();
     // Keep the last accepted timestamp while recovering this same request.
@@ -1181,26 +1877,48 @@ class ProviderTrackingTaskHandler extends TaskHandler {
     // sub-cadence catch-up sample after an authority/network recovery.
     final subscription = _positionSubscription;
     _positionSubscription = null;
+    if (subscription != null) {
+      providerTrackingLifecycleLog(
+        'worker.stream.cancel',
+        generation: expectedOwnership.generation,
+        reason: 'pause_and_clear',
+      );
+    }
     await subscription?.cancel();
+    // Cancellation is an await boundary. A fresh configure can claim and start
+    // its collector while it is pending, so revalidate before emitting or
+    // continuing into authority recovery for the initiating generation.
+    if (!_isPausedFor(expectedOwnership)) return false;
+    _sendEvent(
+      'collector_paused',
+      expectedOwnership.requestId,
+      expectedOwnership.generation,
+    );
+    return true;
   }
 
   Future<void> _boundedAuthorityRetry(
     _ProviderTrackingWorkerConfig config,
+    _ProviderTrackingWorkerOwnership expectedOwnership,
   ) async {
     // All retry time is collector-off time. No local cadence or GPS fallback.
     for (final delay in _authorityRetryDelays) {
-      if (_stopped || _configuration != null) return;
+      if (!_isPausedFor(expectedOwnership)) return;
       await _wait(delay);
-      if (_stopped || _configuration != null) return;
-      final result = await _readAndApplyAuthority(config);
+      if (!_isPausedFor(expectedOwnership)) return;
+      final result = await _readAndApplyAuthority(config, expectedOwnership);
       if (result != _AuthorityReadResult.networkFailure) return;
     }
-    await _stopAndNotify('network');
+    await _stopAndNotify('network', expectedOwnership);
   }
 
   Future<_AuthorityReadResult> _readAndApplyAuthority(
     _ProviderTrackingWorkerConfig previous,
+    _ProviderTrackingWorkerOwnership expectedOwnership,
   ) async {
+    if (!_isPausedFor(expectedOwnership)) {
+      return _AuthorityReadResult.superseded;
+    }
     http.Response response;
     try {
       response = await _client.get(
@@ -1210,14 +1928,21 @@ class ProviderTrackingTaskHandler extends TaskHandler {
         headers: <String, String>{'Authorization': 'Bearer ${previous.token}'},
       );
     } catch (_) {
-      return _AuthorityReadResult.networkFailure;
+      return _isPausedFor(expectedOwnership)
+          ? _AuthorityReadResult.networkFailure
+          : _AuthorityReadResult.superseded;
+    }
+    // Bind every response branch to the generation that initiated this read.
+    // A replacement may have been configured while the HTTP request awaited.
+    if (!_isPausedFor(expectedOwnership)) {
+      return _AuthorityReadResult.superseded;
     }
     if (response.statusCode == 401) {
-      await _stopAndNotify('unauthorized');
+      await _stopAndNotify('unauthorized', expectedOwnership);
       return _AuthorityReadResult.terminal;
     }
     if (response.statusCode == 404) {
-      await _stopAndNotify('not_found');
+      await _stopAndNotify('not_found', expectedOwnership);
       return _AuthorityReadResult.terminal;
     }
     if (response.statusCode < 200 || response.statusCode >= 300) {
@@ -1232,44 +1957,140 @@ class ProviderTrackingTaskHandler extends TaskHandler {
         Map<String, dynamic>.from(decoded),
       );
       if (!status.active || status.requestId != previous.status.requestId) {
-        await _stopAndNotify('inactive');
+        await _stopAndNotify('inactive', expectedOwnership);
         return _AuthorityReadResult.terminal;
       }
-      await _configureSerially(
-        _ProviderTrackingWorkerConfig(
-          baseUrl: previous.baseUrl,
-          token: previous.token,
-          status: status,
-        ),
+      final restoredConfig = _ProviderTrackingWorkerConfig(
+        baseUrl: previous.baseUrl,
+        token: previous.token,
+        status: status,
+        generation: previous.generation,
       );
-      if (_configuration == null) return _AuthorityReadResult.networkFailure;
-      _sendEvent('authority_restored', status.requestId);
+      await _configureSerially(restoredConfig);
+      if (!_ownsConfiguration(restoredConfig, expectedOwnership)) {
+        return _AuthorityReadResult.superseded;
+      }
+      _sendEvent('authority_restored', status.requestId, previous.generation);
       return _AuthorityReadResult.active;
     } catch (_) {
-      return _AuthorityReadResult.networkFailure;
+      return _isPausedFor(expectedOwnership)
+          ? _AuthorityReadResult.networkFailure
+          : _AuthorityReadResult.superseded;
     }
   }
 
-  Future<void> _stopAndNotify(String event) async {
-    final requestId = _configuration?.status.requestId;
-    _stopped = true;
-    _configuration = null;
-    _queue.clear();
-    _cadenceGate.reset();
-    final subscription = _positionSubscription;
-    _positionSubscription = null;
-    await subscription?.cancel();
-    if (requestId != null) _sendEvent(event, requestId);
-    await FlutterForegroundTask.stopService();
+  bool _ownsConfiguration(
+    _ProviderTrackingWorkerConfig expectedConfig,
+    _ProviderTrackingWorkerOwnership expectedOwnership,
+  ) {
+    return !_stopped &&
+        _configuration == expectedConfig &&
+        _hasOwnership(expectedOwnership) &&
+        _terminalTeardownGeneration != expectedOwnership.generation;
   }
 
-  void _sendEvent(String event, String requestId, [DateTime? capturedAt]) {
+  bool _isPausedFor(_ProviderTrackingWorkerOwnership expectedOwnership) {
+    return !_stopped &&
+        _configuration == null &&
+        _positionSubscription == null &&
+        _hasOwnership(expectedOwnership) &&
+        _terminalTeardownGeneration != expectedOwnership.generation;
+  }
+
+  bool _hasOwnership(_ProviderTrackingWorkerOwnership expectedOwnership) {
+    final ownership = _ownership;
+    return ownership != null &&
+        ownership.requestId == expectedOwnership.requestId &&
+        ownership.generation == expectedOwnership.generation;
+  }
+
+  Future<void> _stopAndNotify(
+    String event,
+    _ProviderTrackingWorkerOwnership expectedOwnership,
+  ) async {
+    final ownership = _ownership;
+    final requestId = expectedOwnership.requestId;
+    final generation = expectedOwnership.generation;
+    // The final worker decision is generation-owned, just like the native
+    // check-and-stop below. An older async continuation must never adopt the
+    // mutable ownership installed by a fresh configure message.
+    if (_stopped ||
+        ownership == null ||
+        ownership.requestId != requestId ||
+        ownership.generation != generation ||
+        _terminalTeardownGeneration == generation) {
+      return;
+    }
+    providerTrackingLifecycleLog(
+      'worker.stopAndNotify',
+      generation: generation,
+      reason: event,
+    );
+    // Terminal collection is off immediately, but the handler remains able to
+    // accept a freshly native-claimed generation while this old generation's
+    // final check-and-stop decision is delayed.
+    _terminalTeardownGeneration = generation;
+    _configuration = null;
+    _ownership = null;
+    _queue.clear();
+    // Preserve cadence state until native proves the whole service is ending.
+    // A replacement generation may arrive first and must not submit a catch-up
+    // sample from its immediate position-stream emission.
+    final subscription = _positionSubscription;
+    _positionSubscription = null;
+    if (subscription != null) {
+      providerTrackingLifecycleLog(
+        'worker.stream.cancel',
+        generation: generation,
+        reason: 'stop_and_notify:$event',
+      );
+    }
+    await subscription?.cancel();
+    _sendEvent(event, requestId, generation);
+    // The native final execution point owns the check-and-stop transaction. If
+    // fresh authority reconfigures this still-live FGS first, this delayed old
+    // generation becomes stale and must leave the replacement collector live.
+    final result = await _serviceAuthority.stopGeneration(generation);
+    if (result == ProviderTrackingServiceStopResult.stale) {
+      if (_terminalTeardownGeneration == generation) {
+        _terminalTeardownGeneration = null;
+      }
+      return;
+    }
+
+    // requested/alreadyStopped prove there is no newer native generation. The
+    // service is ending (or gone), so this handler can become permanently inert.
+    _stopped = true;
+    _terminalTeardownGeneration = null;
+    _configuration = null;
+    _ownership = null;
+    _queue.clear();
+    _cadenceGate.reset();
+    final currentSubscription = _positionSubscription;
+    _positionSubscription = null;
+    await currentSubscription?.cancel();
+  }
+
+  _ProviderTrackingWorkerOwnership _ownershipFor(
+    _ProviderTrackingWorkerConfig config,
+  ) => _ProviderTrackingWorkerOwnership(
+    requestId: config.status.requestId,
+    generation: config.generation,
+  );
+
+  void _sendEvent(
+    String event,
+    String requestId,
+    String generation, [
+    DateTime? capturedAt,
+  ]) {
     // Never expose coordinate data, bearer tokens, or server response bodies to
     // the UI isolate or logs. The optional timestamp is process-memory-only
     // cadence state for a same-process replacement worker.
     FlutterForegroundTask.sendDataToMain(<String, String>{
       'event': event,
       'requestId': requestId,
+      'generation': generation,
       if (capturedAt != null)
         'capturedAt': capturedAt.toUtc().toIso8601String(),
     });
@@ -1277,13 +2098,28 @@ class ProviderTrackingTaskHandler extends TaskHandler {
 
   @override
   Future<void> onDestroy(DateTime timestamp, bool isTimeout) async {
+    final generation = _ownership?.generation;
+    providerTrackingLifecycleLog(
+      'worker.onDestroy',
+      generation: generation,
+      reason: isTimeout ? 'timeout' : 'service_destroyed',
+    );
     _stopped = true;
+    _terminalTeardownGeneration = null;
     _configuration = null;
+    _ownership = null;
     _queue.clear();
+    if (_positionSubscription != null) {
+      providerTrackingLifecycleLog(
+        'worker.stream.cancel',
+        generation: generation,
+        reason: 'on_destroy',
+      );
+    }
     await _positionSubscription?.cancel();
     _positionSubscription = null;
     _client.close();
   }
 }
 
-enum _AuthorityReadResult { active, terminal, networkFailure }
+enum _AuthorityReadResult { active, terminal, networkFailure, superseded }

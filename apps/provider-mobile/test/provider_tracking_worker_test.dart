@@ -64,12 +64,13 @@ void main() {
   );
 
   test(
-    'repeated stable authority keeps one foreground service and one GPS stream',
+    'first and repeated stable authority configure one GPS stream without issuing service update starts',
     () async {
       final worker = ProviderTrackingTaskHandler(
         client: MockClient((_) async => _json('{}', status: 201)),
       );
 
+      await worker.onStart(DateTime.utc(2026), TaskStarter.developer);
       worker.onReceiveData(_configuration());
       await _settle();
       worker.onReceiveData(_configuration());
@@ -77,9 +78,20 @@ void main() {
       await _settle();
 
       expect(foreground.running, isTrue);
-      expect(foreground.updateCalls, 1);
+      expect(foreground.updateCalls, 0);
       expect(foreground.stopCalls, 0);
       expect(geolocatorPlatform.positionStreamCalls, 1);
+      expect(
+        geolocatorPlatform.latestLocationSettings,
+        isA<geolocator.AndroidSettings>(),
+      );
+      expect(
+        (geolocatorPlatform.latestLocationSettings!
+                as geolocator.AndroidSettings)
+            .forceLocationManager,
+        isTrue,
+      );
+      expect(geolocatorPlatform.positionStreamCancelCalls, 0);
     },
   );
 
@@ -101,7 +113,7 @@ void main() {
       geolocatorPlatform.positions.add(_position());
       await _settle();
 
-      expect(foreground.updateCalls, 1);
+      expect(foreground.updateCalls, 0);
       expect(geolocatorPlatform.positionStreamCalls, 1);
       expect(requests, hasLength(1));
       expect(
@@ -138,7 +150,16 @@ void main() {
 
       expect(foreground.stopCalls, 1);
       expect(events, [
-        {'event': 'location_unavailable', 'requestId': 'MOE-1001'},
+        {
+          'event': 'collector_started',
+          'generation': 'worker-generation-1',
+          'requestId': 'MOE-1001',
+        },
+        {
+          'event': 'location_unavailable',
+          'generation': 'worker-generation-1',
+          'requestId': 'MOE-1001',
+        },
       ]);
     },
   );
@@ -161,9 +182,16 @@ void main() {
       await _settle();
 
       expect(foreground.stopCalls, 1);
-      expect(events.last, {'event': 'unauthorized', 'requestId': 'MOE-1001'});
+      expect(events.last, {
+        'event': 'unauthorized',
+        'generation': 'worker-generation-1',
+        'requestId': 'MOE-1001',
+      });
       expect(
-        events.first,
+        events.singleWhere(
+          (event) =>
+              (event as Map<Object?, Object?>)['event'] == 'sample_collected',
+        ),
         isA<Map<String, String>>()
             .having((event) => event['event'], 'event', 'sample_collected')
             .having(
@@ -206,14 +234,18 @@ void main() {
 
       expect(methods, ['POST', 'GET']);
       expect(foreground.stopCalls, 0);
-      expect(foreground.updateCalls, 2);
+      expect(foreground.updateCalls, 0);
       expect(geolocatorPlatform.positionStreamCalls, 2);
       expect(events.last, {
         'event': 'authority_restored',
+        'generation': 'worker-generation-1',
         'requestId': 'MOE-1001',
       });
       expect(
-        events.first,
+        events.singleWhere(
+          (event) =>
+              (event as Map<Object?, Object?>)['event'] == 'sample_collected',
+        ),
         isA<Map<String, String>>()
             .having((event) => event['event'], 'event', 'sample_collected')
             .having(
@@ -292,6 +324,7 @@ void main() {
 
 Map<String, Object> _configuration() => {
   'command': 'configure',
+  'generation': 'worker-generation-1',
   'baseUrl': 'https://api.example.test/',
   'token': 'provider-session',
   'requestId': 'MOE-1001',
@@ -352,9 +385,17 @@ class _WorkerForegroundPlatform extends FlutterForegroundTaskPlatform {
 }
 
 class _WorkerGeolocatorPlatform extends geolocator.GeolocatorPlatform {
-  final positions = StreamController<geolocator.Position>.broadcast();
+  _WorkerGeolocatorPlatform() {
+    positions = StreamController<geolocator.Position>.broadcast(
+      onCancel: () => positionStreamCancelCalls += 1,
+    );
+  }
+
+  late final StreamController<geolocator.Position> positions;
   bool serviceEnabled = true;
   int positionStreamCalls = 0;
+  int positionStreamCancelCalls = 0;
+  geolocator.LocationSettings? latestLocationSettings;
 
   @override
   Future<geolocator.LocationPermission> checkPermission() async =>
@@ -368,6 +409,7 @@ class _WorkerGeolocatorPlatform extends geolocator.GeolocatorPlatform {
     geolocator.LocationSettings? locationSettings,
   }) {
     positionStreamCalls += 1;
+    latestLocationSettings = locationSettings;
     return positions.stream;
   }
 

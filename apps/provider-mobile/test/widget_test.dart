@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
@@ -52,44 +53,41 @@ void main() {
     },
   );
 
-  test(
-    'a stale rejected marketplace quote does not suppress provider controls '
-    '(admin reassignment regression)',
-    () {
-      // Production bug t_c15d4ef2: a provider whose offer was rejected can
-      // later be manually assigned by an admin; operational actions must
-      // derive from the current assignment + status, never from the
-      // historical rejected quote.
-      Map<String, dynamic> jobWithRejectedQuote(String status) => {
-        'id': 'MOE-2001',
-        'serviceId': 'ac-cleaning',
-        'address': 'حي الصفراء، بريدة',
-        'timing': 'as-soon-as-possible',
-        'status': status,
-        'quote': {
-          'id': 'QTE-3',
-          'amountHalalas': 15000,
-          'scope': 'تنظيف مكيف',
-          'status': 'rejected',
-        },
-      };
+  test('a stale rejected marketplace quote does not suppress provider controls '
+      '(admin reassignment regression)', () {
+    // Production bug t_c15d4ef2: a provider whose offer was rejected can
+    // later be manually assigned by an admin; operational actions must
+    // derive from the current assignment + status, never from the
+    // historical rejected quote.
+    Map<String, dynamic> jobWithRejectedQuote(String status) => {
+      'id': 'MOE-2001',
+      'serviceId': 'ac-cleaning',
+      'address': 'حي الصفراء، بريدة',
+      'timing': 'as-soon-as-possible',
+      'status': status,
+      'quote': {
+        'id': 'QTE-3',
+        'amountHalalas': 15000,
+        'scope': 'تنظيف مكيف',
+        'status': 'rejected',
+      },
+    };
 
-      final assignedJob = ProviderJob.fromJson(jobWithRejectedQuote('assigned'));
-      final onTheWayJob = ProviderJob.fromJson(
-        jobWithRejectedQuote('on_the_way'),
-      );
-      final inProgressJob = ProviderJob.fromJson(
-        jobWithRejectedQuote('in_progress'),
-      );
+    final assignedJob = ProviderJob.fromJson(jobWithRejectedQuote('assigned'));
+    final onTheWayJob = ProviderJob.fromJson(
+      jobWithRejectedQuote('on_the_way'),
+    );
+    final inProgressJob = ProviderJob.fromJson(
+      jobWithRejectedQuote('in_progress'),
+    );
 
-      expect(nextProviderStatus(assignedJob), 'on_the_way');
-      expect(providerActionLabel(assignedJob), 'بدء التوجه');
-      expect(nextProviderStatus(onTheWayJob), 'in_progress');
-      expect(providerActionLabel(onTheWayJob), 'بدء الخدمة');
-      expect(nextProviderStatus(inProgressJob), 'completed');
-      expect(providerActionLabel(inProgressJob), 'إنهاء الخدمة');
-    },
-  );
+    expect(nextProviderStatus(assignedJob), 'on_the_way');
+    expect(providerActionLabel(assignedJob), 'بدء التوجه');
+    expect(nextProviderStatus(onTheWayJob), 'in_progress');
+    expect(providerActionLabel(onTheWayJob), 'بدء الخدمة');
+    expect(nextProviderStatus(inProgressJob), 'completed');
+    expect(providerActionLabel(inProgressJob), 'إنهاء الخدمة');
+  });
 
   test('provider job parsing keeps the assigned-provider customer phone', () {
     final job = ProviderJob.fromJson({
@@ -481,6 +479,104 @@ void main() {
     expect(runtime.started.single.requestId, 'MOE-2001');
     expect(runtime.started.single.cadenceMs, 15000);
   });
+
+  testWidgets(
+    'a stale pre-transition reconciliation cannot stop the service started by the transition',
+    (tester) async {
+      tester.view.physicalSize = const Size(800, 1000);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      final staleTrackingRead = Completer<http.Response>();
+      final staleTrackingReadStarted = Completer<void>();
+      final runtime = _FakeTrackingRuntime();
+      var jobStatus = 'assigned';
+      var trackingReads = 0;
+      final api = ProviderApi(
+        baseUrl: 'https://api.example.test',
+        client: MockClient((request) async {
+          final path = request.url.path;
+          if (request.method == 'GET' && path == '/provider/auth/me') {
+            return http.Response(_providerJson, 200, headers: _jsonUtf8);
+          }
+          if (request.method == 'GET' && path == '/provider/service-requests') {
+            return http.Response(
+              jobStatus == 'assigned'
+                  ? '[$_jobAssignedJson]'
+                  : '[$_jobOnTheWayJson]',
+              200,
+              headers: _jsonUtf8,
+            );
+          }
+          if (request.method == 'GET' && path == '/provider/opportunities') {
+            return http.Response('[]', 200, headers: _jsonUtf8);
+          }
+          if (request.method == 'GET' &&
+              path == '/provider/service-requests/MOE-2001/tracking') {
+            trackingReads += 1;
+            if (trackingReads == 1) {
+              staleTrackingReadStarted.complete();
+              return staleTrackingRead.future;
+            }
+            return http.Response(
+              _onTheWayTrackingJson,
+              200,
+              headers: _jsonUtf8,
+            );
+          }
+          if (request.method == 'PATCH' &&
+              path == '/provider/service-requests/MOE-2001/status') {
+            jobStatus = 'on_the_way';
+            return http.Response(
+              _onTheWayTransitionJson,
+              200,
+              headers: _jsonUtf8,
+            );
+          }
+          return http.Response('{}', 404);
+        }),
+      );
+
+      await tester.pumpWidget(
+        MoeenProviderApp(
+          api: api,
+          sessionStore: _MemorySessionStore()..token = 'provider-session',
+          hiddenStore: _MemoryHiddenStore(),
+          trackingRuntime: runtime,
+          trackingPermissionGate: const _GrantedTrackingPermissionGate(),
+        ),
+      );
+      for (var attempt = 0; attempt < 20; attempt += 1) {
+        await tester.pump(const Duration(milliseconds: 1));
+        if (find.text('بدء التوجه').evaluate().isNotEmpty) break;
+      }
+      await staleTrackingReadStarted.future;
+
+      await tester.ensureVisible(find.text('بدء التوجه'));
+      await tester.tap(find.text('بدء التوجه'));
+      await tester.pump(const Duration(seconds: 1));
+      tester
+          .widget<FilledButton>(
+            find.widgetWithText(FilledButton, 'تأكيد: بدء التوجه'),
+          )
+          .onPressed!();
+      for (var attempt = 0; attempt < 20; attempt += 1) {
+        await tester.pump(const Duration(milliseconds: 10));
+        if (runtime.started.isNotEmpty) break;
+      }
+      expect(runtime.started, hasLength(1));
+      expect(await runtime.isRunning(), isTrue);
+      expect(trackingReads, 1);
+
+      staleTrackingRead.complete(
+        http.Response(_assignedInactiveTrackingJson, 200, headers: _jsonUtf8),
+      );
+      await tester.pumpAndSettle();
+
+      expect(runtime.stopCalls, 0);
+      expect(await runtime.isRunning(), isTrue);
+    },
+  );
 
   testWidgets(
     'an inactive transition snapshot updates the job without requesting location permission',
