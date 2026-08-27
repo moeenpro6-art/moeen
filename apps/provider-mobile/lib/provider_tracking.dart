@@ -1431,6 +1431,18 @@ class _ProviderTrackingWorkerOwnership {
   final String generation;
 }
 
+class _ProviderTrackingSubmissionState {
+  _ProviderTrackingSubmissionState(this.ownership);
+
+  final _ProviderTrackingWorkerOwnership ownership;
+  final List<_ProviderSample> queue = <_ProviderSample>[];
+  bool busy = false;
+
+  bool owns(_ProviderTrackingWorkerOwnership expectedOwnership) =>
+      ownership.requestId == expectedOwnership.requestId &&
+      ownership.generation == expectedOwnership.generation;
+}
+
 class _ProviderSample {
   const _ProviderSample({
     required this.latitude,
@@ -1475,14 +1487,13 @@ class ProviderTrackingTaskHandler extends TaskHandler {
   final List<Duration> _authorityRetryDelays;
   final ProviderTrackingWait _wait;
   final ProviderTrackingServiceAuthority _serviceAuthority;
-  final List<_ProviderSample> _queue = <_ProviderSample>[];
   final ProviderTrackingCadenceGate _cadenceGate =
       ProviderTrackingCadenceGate();
   _ProviderTrackingWorkerConfig? _configuration;
   _ProviderTrackingWorkerOwnership? _ownership;
+  _ProviderTrackingSubmissionState? _submissionState;
   StreamSubscription<geolocator.Position>? _positionSubscription;
   Future<void> _configurationTail = Future<void>.value();
-  bool _busy = false;
   bool _stopped = false;
   String? _terminalTeardownGeneration;
 
@@ -1511,7 +1522,7 @@ class ProviderTrackingTaskHandler extends TaskHandler {
       return;
     }
     if (command == 'clearQueue') {
-      _queue.clear();
+      _submissionState?.queue.clear();
       return;
     }
     if (command == 'configure') {
@@ -1625,10 +1636,16 @@ class ProviderTrackingTaskHandler extends TaskHandler {
       return;
     }
     if (_stopped || config.generation == _terminalTeardownGeneration) return;
-    _ownership = _ProviderTrackingWorkerOwnership(
-      requestId: config.status.requestId,
-      generation: config.generation,
-    );
+    final nextOwnership = _ownershipFor(config);
+    _ownership = nextOwnership;
+    final submissionState = _submissionState;
+    if (submissionState == null || !submissionState.owns(nextOwnership)) {
+      // A surviving worker may adopt a fresh native generation while an older
+      // generation's HTTP request is still pending. Submission serialization
+      // and queued samples belong to the generation/request that created them;
+      // they must never suppress or contaminate its replacement.
+      _submissionState = _ProviderTrackingSubmissionState(nextOwnership);
+    }
     final existing = _configuration;
     if (existing != null &&
         _positionSubscription != null &&
@@ -1715,16 +1732,24 @@ class ProviderTrackingTaskHandler extends TaskHandler {
     _ProviderTrackingWorkerConfig config,
     geolocator.Position position,
   ) async {
-    if (_stopped || _busy || _configuration != config) return;
-    _busy = true;
+    final expectedOwnership = _ownershipFor(config);
+    final submissionState = _submissionState;
+    if (_stopped ||
+        _configuration != config ||
+        submissionState == null ||
+        !submissionState.owns(expectedOwnership) ||
+        submissionState.busy) {
+      return;
+    }
+    submissionState.busy = true;
     try {
       if (!await _hasLocationPermissionAndEnabledService()) {
-        await _stopAndNotify('location_unavailable', _ownershipFor(config));
+        await _stopAndNotify('location_unavailable', expectedOwnership);
         return;
       }
       // Recheck after the platform stream emits: a concurrent pause/recovery
       // may have revoked authority while this sample was being delivered.
-      if (_configuration != config || _stopped) return;
+      if (!_ownsSubmission(config, expectedOwnership, submissionState)) return;
       final capturedAt = DateTime.now().toUtc();
       // Android may emit faster than intervalDuration after a network or GNSS
       // change. The server-supplied cadence is the final client-side throttle;
@@ -1737,7 +1762,7 @@ class ProviderTrackingTaskHandler extends TaskHandler {
         capturedAt: capturedAt,
       );
       if (!_isValidSample(sample)) {
-        await _recoverAfterSampleRejection(config, _ownershipFor(config));
+        await _recoverAfterSampleRejection(config, expectedOwnership);
         return;
       }
       // Carry only the collection timestamp to the live main isolate. It is
@@ -1749,14 +1774,14 @@ class ProviderTrackingTaskHandler extends TaskHandler {
         config.generation,
         capturedAt,
       );
-      _enqueue(sample);
-      await _submitOldest(config);
+      _enqueue(submissionState, sample);
+      await _submitOldest(config, expectedOwnership, submissionState);
     } catch (_) {
       // GPS loss and all unexpected acquisition faults revoke collection; they
       // must never become an offline coordinate buffer.
-      await _stopAndNotify('location_unavailable', _ownershipFor(config));
+      await _stopAndNotify('location_unavailable', expectedOwnership);
     } finally {
-      _busy = false;
+      submissionState.busy = false;
     }
   }
 
@@ -1778,24 +1803,35 @@ class ProviderTrackingTaskHandler extends TaskHandler {
         sample.accuracyMeters >= 0;
   }
 
-  void _enqueue(_ProviderSample sample) {
-    _pruneQueue();
-    if (_queue.length >= _queueMaximumSize) _queue.removeAt(0);
-    _queue.add(sample);
+  void _enqueue(
+    _ProviderTrackingSubmissionState submissionState,
+    _ProviderSample sample,
+  ) {
+    _pruneQueue(submissionState);
+    if (submissionState.queue.length >= _queueMaximumSize) {
+      submissionState.queue.removeAt(0);
+    }
+    submissionState.queue.add(sample);
   }
 
-  void _pruneQueue() {
+  void _pruneQueue(_ProviderTrackingSubmissionState submissionState) {
     final oldestAllowed = DateTime.now().toUtc().subtract(_sampleMaximumAge);
-    _queue.removeWhere((sample) => sample.capturedAt.isBefore(oldestAllowed));
+    submissionState.queue.removeWhere(
+      (sample) => sample.capturedAt.isBefore(oldestAllowed),
+    );
   }
 
-  Future<void> _submitOldest(_ProviderTrackingWorkerConfig config) async {
-    _pruneQueue();
-    final expectedOwnership = _ownershipFor(config);
-    if (_queue.isEmpty || !_ownsConfiguration(config, expectedOwnership)) {
+  Future<void> _submitOldest(
+    _ProviderTrackingWorkerConfig config,
+    _ProviderTrackingWorkerOwnership expectedOwnership,
+    _ProviderTrackingSubmissionState submissionState,
+  ) async {
+    _pruneQueue(submissionState);
+    if (submissionState.queue.isEmpty ||
+        !_ownsSubmission(config, expectedOwnership, submissionState)) {
       return;
     }
-    final sample = _queue.first;
+    final sample = submissionState.queue.first;
     http.Response response;
     try {
       response = await _client.post(
@@ -1819,11 +1855,9 @@ class ProviderTrackingTaskHandler extends TaskHandler {
     }
 
     if (response.statusCode >= 200 && response.statusCode < 300) {
-      // A successful old request is stale too: it must not mutate a replacement
-      // generation's queue after the transport await.
-      if (_ownsConfiguration(config, expectedOwnership)) {
-        _queue.remove(sample);
-      }
+      // Remove only from the immutable generation-owned state captured before
+      // the HTTP await. A replacement owns a different queue and busy flag.
+      submissionState.queue.remove(sample);
       return;
     }
     if (response.statusCode == 401) {
@@ -1871,7 +1905,8 @@ class ProviderTrackingTaskHandler extends TaskHandler {
     // state from this old continuation.
     if (!_ownsConfiguration(expectedConfig, expectedOwnership)) return false;
     _configuration = null;
-    _queue.clear();
+    _submissionState?.queue.clear();
+    _submissionState = null;
     // Keep the last accepted timestamp while recovering this same request.
     // The replacement stream may emit immediately, but it must not submit a
     // sub-cadence catch-up sample after an authority/network recovery.
@@ -1989,10 +2024,20 @@ class ProviderTrackingTaskHandler extends TaskHandler {
         _terminalTeardownGeneration != expectedOwnership.generation;
   }
 
+  bool _ownsSubmission(
+    _ProviderTrackingWorkerConfig expectedConfig,
+    _ProviderTrackingWorkerOwnership expectedOwnership,
+    _ProviderTrackingSubmissionState expectedSubmissionState,
+  ) =>
+      _ownsConfiguration(expectedConfig, expectedOwnership) &&
+      _submissionState == expectedSubmissionState &&
+      expectedSubmissionState.owns(expectedOwnership);
+
   bool _isPausedFor(_ProviderTrackingWorkerOwnership expectedOwnership) {
     return !_stopped &&
         _configuration == null &&
         _positionSubscription == null &&
+        _submissionState == null &&
         _hasOwnership(expectedOwnership) &&
         _terminalTeardownGeneration != expectedOwnership.generation;
   }
@@ -2032,7 +2077,8 @@ class ProviderTrackingTaskHandler extends TaskHandler {
     _terminalTeardownGeneration = generation;
     _configuration = null;
     _ownership = null;
-    _queue.clear();
+    _submissionState?.queue.clear();
+    _submissionState = null;
     // Preserve cadence state until native proves the whole service is ending.
     // A replacement generation may arrive first and must not submit a catch-up
     // sample from its immediate position-stream emission.
@@ -2064,7 +2110,8 @@ class ProviderTrackingTaskHandler extends TaskHandler {
     _terminalTeardownGeneration = null;
     _configuration = null;
     _ownership = null;
-    _queue.clear();
+    _submissionState?.queue.clear();
+    _submissionState = null;
     _cadenceGate.reset();
     final currentSubscription = _positionSubscription;
     _positionSubscription = null;
@@ -2108,7 +2155,8 @@ class ProviderTrackingTaskHandler extends TaskHandler {
     _terminalTeardownGeneration = null;
     _configuration = null;
     _ownership = null;
-    _queue.clear();
+    _submissionState?.queue.clear();
+    _submissionState = null;
     if (_positionSubscription != null) {
       providerTrackingLifecycleLog(
         'worker.stream.cancel',

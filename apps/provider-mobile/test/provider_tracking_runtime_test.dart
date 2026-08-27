@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:math';
 
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task_platform_interface.dart';
@@ -551,6 +553,118 @@ void main() {
       await replacementRuntime.dispose();
     },
   );
+
+  test(
+    'a successful old POST cannot cross-contaminate a replacement request queue',
+    () async {
+      initializeProviderTrackingForegroundTask();
+      final serviceAuthority = _ImmediateServiceAuthority();
+      final firstPostStarted = Completer<void>();
+      final releaseFirstPost = Completer<http.Response>();
+      final requests = <http.Request>[];
+      final worker = ProviderTrackingTaskHandler(
+        client: MockClient((request) async {
+          if (request.method != 'POST') return http.Response('{}', 200);
+          requests.add(request);
+          if (requests.length == 1) {
+            firstPostStarted.complete();
+            return releaseFirstPost.future;
+          }
+          return http.Response('{}', 201);
+        }),
+        serviceAuthority: serviceAuthority,
+      );
+      foreground
+        ..handler = worker
+        ..deliverTaskMessages = true;
+      final firstRuntime = FlutterProviderTrackingRuntime(
+        baseUrl: 'https://api.example.test',
+        onEvent: (_) {},
+        shouldProbePlatformService: () => true,
+        serviceAuthority: serviceAuthority,
+      );
+      final replacementRuntime = FlutterProviderTrackingRuntime(
+        baseUrl: 'https://api.example.test',
+        onEvent: (_) {},
+        shouldProbePlatformService: () => true,
+        serviceAuthority: serviceAuthority,
+      );
+
+      await firstRuntime.start(_status(), 'provider-session');
+      await _settle();
+      geolocatorPlatform.emitPosition(latitude: 26.31);
+      await firstPostStarted.future;
+
+      await replacementRuntime.start(
+        _status(requestId: 'MOE-2002'),
+        'provider-session',
+      );
+      releaseFirstPost.complete(http.Response('{}', 201));
+      await _settle();
+      geolocatorPlatform.emitPosition(latitude: 27.22);
+      await _settle();
+
+      expect(requests, hasLength(2));
+      expect(
+        requests.last.url.path,
+        '/provider/service-requests/MOE-2002/location',
+      );
+      final replacementBody =
+          jsonDecode(requests.last.body) as Map<String, dynamic>;
+      expect(replacementBody['latitude'], 27.22);
+      expect(replacementBody['latitude'], isNot(26.31));
+
+      await firstRuntime.dispose();
+      await replacementRuntime.dispose();
+    },
+  );
+
+  test('a current generation keeps at most one POST in flight', () async {
+    initializeProviderTrackingForegroundTask();
+    final serviceAuthority = _ImmediateServiceAuthority();
+    final postStarted = Completer<void>();
+    final releasePost = Completer<http.Response>();
+    var postsInFlight = 0;
+    var maximumPostsInFlight = 0;
+    var postAttempts = 0;
+    final worker = ProviderTrackingTaskHandler(
+      client: MockClient((request) async {
+        if (request.method != 'POST') return http.Response('{}', 200);
+        postAttempts += 1;
+        postsInFlight += 1;
+        maximumPostsInFlight = max(maximumPostsInFlight, postsInFlight);
+        if (!postStarted.isCompleted) postStarted.complete();
+        final response = await releasePost.future;
+        postsInFlight -= 1;
+        return response;
+      }),
+      serviceAuthority: serviceAuthority,
+    );
+    foreground
+      ..handler = worker
+      ..deliverTaskMessages = true;
+    final runtime = FlutterProviderTrackingRuntime(
+      baseUrl: 'https://api.example.test',
+      onEvent: (_) {},
+      shouldProbePlatformService: () => true,
+      serviceAuthority: serviceAuthority,
+    );
+
+    await runtime.start(_status(), 'provider-session');
+    await _settle();
+    geolocatorPlatform.emitPosition();
+    geolocatorPlatform.emitPosition();
+    await postStarted.future;
+    await _settle();
+
+    expect(postAttempts, 1);
+    expect(maximumPostsInFlight, 1);
+
+    releasePost.complete(http.Response('{}', 201));
+    await _settle();
+    expect(postsInFlight, 0);
+    await runtime.dispose();
+  });
 
   for (final postFailure in <({String label, int? statusCode})>[
     (label: 'transport failure', statusCode: null),
@@ -1720,10 +1834,10 @@ class _GeolocatorPlatform extends geolocator.GeolocatorPlatform {
     _positionControllers.last.addError(StateError('location stream failed'));
   }
 
-  void emitPosition() {
+  void emitPosition({double latitude = 26.31}) {
     _positionControllers.last.add(
       geolocator.Position(
-        latitude: 26.31,
+        latitude: latitude,
         longitude: 43.98,
         timestamp: DateTime.now().toUtc(),
         accuracy: 9.5,
