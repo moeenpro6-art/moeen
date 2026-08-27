@@ -153,7 +153,7 @@ export class AppController {
   @Get('provider/service-requests')
   async getMyProviderServiceRequests(
     @Headers('authorization') authorization: string | undefined,
-  ): Promise<ServiceRequest[]> {
+  ): Promise<import('./app.service').ProviderServiceRequest[]> {
     const provider = await this.providerAuthService.getCurrentProvider(
       this.extractBearerToken(authorization),
     );

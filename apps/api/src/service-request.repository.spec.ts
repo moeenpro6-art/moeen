@@ -2527,13 +2527,14 @@ describe('ServiceRequestRepository', () => {
     expect(opportunity).toMatchObject({
       details: 'معلومات حساسة جدًا مع رقم جوال في الملاحظات',
       requestStatus: 'pending_dispatch',
+      location: {
+        point: { latitude: 26.359123, longitude: 43.981988 },
+      },
     });
     expect(opportunity).not.toHaveProperty('address');
-    expect(opportunity).not.toHaveProperty('location');
-    // Customer identity and exact coordinates never participate in this shape.
+    // The store carries the exact point internally so the service layer can
+    // derive a coarse public bucket. It still never carries customer identity.
     const serialized = JSON.stringify(opportunity);
-    expect(serialized).not.toContain('26.359123');
-    expect(serialized).not.toContain('43.981988');
     expect(serialized).not.toContain('CUS-');
     expect(serialized).not.toContain(customer.id);
     for (const key of Object.keys(opportunity)) {

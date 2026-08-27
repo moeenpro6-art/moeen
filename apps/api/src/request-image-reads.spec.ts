@@ -80,6 +80,8 @@ describe('provider pre-quote visibility (Slice 3)', () => {
       location: {
         point: { latitude: 26.359123, longitude: 43.981988 },
         displayAddress: REQUEST.address,
+        source: 'map_pin',
+        confirmedAt: '2026-08-21T12:00:00.000Z',
       },
       requestStatus: 'pending_dispatch',
     } as unknown as ProviderOpportunityAccess;
@@ -104,6 +106,10 @@ describe('provider pre-quote visibility (Slice 3)', () => {
       details: REQUEST.details,
       // Signed DTOs preserve the store's sort_order order exactly.
       images: images.map((image) => signedDto(image)),
+      approximateLocation: {
+        point: { latitude: 26.4, longitude: 44 },
+        precisionKm: 10,
+      },
     });
     expect(store.listProviderOpportunities).toHaveBeenCalledWith('provider-1');
     expect(store.findRequestImagesByRequestIds).toHaveBeenCalledWith([
@@ -128,6 +134,9 @@ describe('provider pre-quote visibility (Slice 3)', () => {
       details: REQUEST.details,
       location: {
         point: { latitude: 26.359123, longitude: 43.981988 },
+        displayAddress: REQUEST.address,
+        source: 'map_pin',
+        confirmedAt: '2026-08-21T12:00:00.000Z',
       },
       requestStatus: 'pending_dispatch',
       customerId: 'CUS-1001',
@@ -162,6 +171,7 @@ describe('provider pre-quote visibility (Slice 3)', () => {
       [
         'details',
         'images',
+        'approximateLocation',
         'myQuote',
         'opportunityStatus',
         'requestId',

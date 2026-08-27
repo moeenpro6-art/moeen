@@ -3103,6 +3103,8 @@ export class ServiceRequestRepository
       details: string | null;
       request_status: ServiceRequest['status'];
       opportunity_status: ProviderOpportunityStatus;
+      location_latitude: string | number | null;
+      location_longitude: string | number | null;
       quote_id: string | null;
       quote_provider_id: string | null;
       quote_amount_halalas: number | null;
@@ -3114,6 +3116,7 @@ export class ServiceRequestRepository
       `SELECT r.id AS request_id, r.service_id, r.timing, r.details,
               r.status AS request_status,
               o.status AS opportunity_status,
+              r.location_latitude, r.location_longitude,
               q.id AS quote_id, q.provider_id AS quote_provider_id,
               q.amount_halalas AS quote_amount_halalas, q.scope AS quote_scope,
               q.status AS quote_status, q.proposed_at AS quote_proposed_at,
@@ -3136,8 +3139,23 @@ export class ServiceRequestRepository
       serviceId: row.service_id,
       timing: row.timing,
       opportunityStatus: row.opportunity_status,
-      // Request content needed to assess and price the job. Exact address and
-      // coordinates are intentionally absent from this query/projection.
+      // Request content needed to assess and price the job. The exact
+      // address is intentionally absent from this query/projection; the
+      // confirmed coordinates are carried internally so the service layer
+      // can derive a coarse approximate location for eligible bidders.
+      ...(row.location_latitude !== null && row.location_longitude !== null
+        ? {
+            location: {
+              point: {
+                latitude: Number(row.location_latitude),
+                longitude: Number(row.location_longitude),
+              },
+            },
+          }
+        : {}),
+      // The coarse disclosure is intentionally omitted here: it is derived
+      // in the service layer only for providers that still own an eligible
+      // pre-quote opportunity for this request.
       details: row.details ?? undefined,
       requestStatus: row.request_status,
       myQuote: row.quote_id

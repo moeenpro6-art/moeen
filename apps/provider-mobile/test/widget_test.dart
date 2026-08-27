@@ -102,6 +102,80 @@ void main() {
     expect(job.customerPhone, '+966****0012');
   });
 
+  test('provider job parsing keeps the exact active-job location', () {
+    final exact = ProviderJob.fromJson({
+      'id': 'MOE-1006',
+      'serviceId': 'ac-cleaning',
+      'timing': 'scheduled',
+      'status': 'assigned',
+      'location': {
+        'point': {'latitude': 26.359123, 'longitude': 43.981988},
+      },
+    });
+
+    expect(exact.location?.point.latitude, 26.359123);
+    expect(exact.location?.point.longitude, 43.981988);
+    expect(exact.approximateLocation, isNull);
+  });
+
+  test('provider job parsing keeps only the approximate bidder location', () {
+    final approximate = ProviderJob.fromJson({
+      'id': 'MOE-1007',
+      'serviceId': 'ac-cleaning',
+      'timing': 'scheduled',
+      'status': 'pending_dispatch',
+      'approximateLocation': {
+        'point': {'latitude': 26.4, 'longitude': 44.0},
+        'precisionKm': 10,
+      },
+    });
+
+    expect(approximate.location, isNull);
+    expect(approximate.approximateLocation?.point.latitude, 26.4);
+    expect(approximate.approximateLocation?.precisionKm, 10);
+  });
+
+  test('provider job parsing rejects a payload that mixes both tiers', () {
+    expect(
+      () => ProviderJob.fromJson({
+        'id': 'MOE-1008',
+        'serviceId': 'ac-cleaning',
+        'timing': 'scheduled',
+        'status': 'assigned',
+        'location': {
+          'point': {'latitude': 26.359123, 'longitude': 43.981988},
+        },
+        'approximateLocation': {
+          'point': {'latitude': 26.4, 'longitude': 44.0},
+          'precisionKm': 10,
+        },
+      }),
+      throwsA(isA<ProviderApiException>()),
+    );
+  });
+
+  test('external map URI uses Google Maps outside iOS', () {
+    final uri = providerExternalMapUri(
+      const ProviderGeoPoint(latitude: 26.359123, longitude: 43.981988),
+      platform: TargetPlatform.android,
+    );
+
+    expect(uri.scheme, 'https');
+    expect(uri.host, 'www.google.com');
+    expect(uri.path, '/maps');
+    expect(uri.queryParameters['q'], '26.359123,43.981988');
+  });
+
+  test('external map URI uses Apple Maps on iOS', () {
+    final uri = providerExternalMapUri(
+      const ProviderGeoPoint(latitude: 26.359123, longitude: 43.981988),
+      platform: TargetPlatform.iOS,
+    );
+
+    expect(uri.scheme, 'maps');
+    expect(uri.queryParameters['q'], '26.359123,43.981988');
+  });
+
   test(
     'provider job parsing accepts terminal history without private fields',
     () {
@@ -322,6 +396,8 @@ void main() {
     expect(find.text('فرص العمل المتاحة'), findsOneWidget);
     expect(find.text('تنظيف المكيفات'), findsOneWidget);
     expect(find.text('في أقرب وقت · مدعو'), findsOneWidget);
+    expect(find.text('موقع العميل تقريبي ضمن نطاق ~10 كم'), findsOneWidget);
+    expect(find.byKey(const ValueKey('open-customer-map')), findsNothing);
     expect(find.text('تقديم عرض'), findsOneWidget);
   });
 
@@ -362,6 +438,60 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(find.text('رقم العميل: +966****0012'), findsOneWidget);
+    },
+  );
+
+  testWidgets(
+    'assigned exact location renders a map button that launches its coordinates',
+    (tester) async {
+      final store = _MemorySessionStore()..token = 'stale-token';
+      Uri? launchedUri;
+      final api = ProviderApi(
+        baseUrl: 'https://api.example.test',
+        client: MockClient((request) async {
+          final path = request.url.path;
+          if (path == '/provider/auth/me') {
+            return http.Response(_providerJson, 200, headers: _jsonUtf8);
+          }
+          if (path == '/provider/service-requests') {
+            return http.Response(
+              '[{"id":"MOE-1001","serviceId":"ac-cleaning",'
+              '"address":"حي الصفراء، بريدة","timing":"as-soon-as-possible",'
+              '"status":"assigned","location":{"point":{'
+              '"latitude":26.359123,"longitude":43.981988}}}]',
+              200,
+              headers: _jsonUtf8,
+            );
+          }
+          if (path == '/provider/opportunities') {
+            return http.Response('[]', 200);
+          }
+          return http.Response('{}', 404);
+        }),
+      );
+
+      await tester.pumpWidget(
+        MoeenProviderApp(
+          api: api,
+          sessionStore: store,
+          hiddenStore: _MemoryHiddenStore(),
+          externalUriLauncher: (uri) async {
+            launchedUri = uri;
+            return true;
+          },
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final mapButton = find.byKey(const ValueKey('open-customer-map'));
+      expect(mapButton, findsOneWidget);
+      await tester.tap(mapButton);
+      await tester.pump();
+
+      expect(launchedUri, isNotNull);
+      expect(launchedUri!.host, 'www.google.com');
+      expect(launchedUri!.path, '/maps');
+      expect(launchedUri!.queryParameters['q'], '26.359123,43.981988');
     },
   );
 
@@ -1483,10 +1613,61 @@ void main() {
 
     expect(opp.address, isNull);
     expect(opp.details, 'مكيف سبليت لا يبرد');
+    expect(opp.approximateLocation, isNull);
     expect(opp.images, hasLength(2));
     // Server sort order is preserved exactly as returned.
     expect(opp.images.map((image) => image.id), ['img-2', 'img-1']);
     expect(opp.images.first.url, 'https://signed.example.test/img-2?sig=z');
+  });
+
+  test('ProviderOpportunity parses the approximate bidder location tier', () {
+    final opp = ProviderOpportunity.fromJson({
+      'requestId': 'MOE-33',
+      'serviceId': 'ac-cleaning',
+      'timing': 'scheduled',
+      'opportunityStatus': 'invited',
+      'approximateLocation': {
+        'point': {'latitude': 26.4, 'longitude': 44.0},
+        'precisionKm': 10,
+      },
+    });
+
+    expect(opp.approximateLocation?.point.latitude, 26.4);
+    expect(opp.approximateLocation?.point.longitude, 44.0);
+    expect(opp.approximateLocation?.precisionKm, 10);
+  });
+
+  test('ProviderOpportunity accepts an exact-only location payload', () {
+    final opp = ProviderOpportunity.fromJson({
+      'requestId': 'MOE-34',
+      'serviceId': 'ac-cleaning',
+      'timing': 'scheduled',
+      'opportunityStatus': 'invited',
+      'location': {
+        'point': {'latitude': 26.359123, 'longitude': 43.981988},
+      },
+    });
+
+    expect(opp.approximateLocation, isNull);
+  });
+
+  test('ProviderOpportunity rejects a payload that mixes location tiers', () {
+    expect(
+      () => ProviderOpportunity.fromJson({
+        'requestId': 'MOE-35',
+        'serviceId': 'ac-cleaning',
+        'timing': 'scheduled',
+        'opportunityStatus': 'invited',
+        'location': {
+          'point': {'latitude': 26.359123, 'longitude': 43.981988},
+        },
+        'approximateLocation': {
+          'point': {'latitude': 26.4, 'longitude': 44.0},
+          'precisionKm': 10,
+        },
+      }),
+      throwsA(isA<ProviderApiException>()),
+    );
   });
 
   test('ProviderOpportunity ignores malformed image entries', () {
@@ -1643,7 +1824,9 @@ const _jsonUtf8 = {'content-type': 'application/json; charset=utf-8'};
 
 const _opportunitiesInvitedJson =
     '[{"requestId":"MOE-1","serviceId":"ac-cleaning",'
-    '"timing":"as-soon-as-possible","opportunityStatus":"invited"}]';
+    '"timing":"as-soon-as-possible","opportunityStatus":"invited",'
+    '"approximateLocation":{"point":{"latitude":26.4,"longitude":44.0},'
+    '"precisionKm":10}}]';
 
 const _opportunitiesInvitedWithImagesJson =
     '[{"requestId":"MOE-30","serviceId":"ac-cleaning",'

@@ -1,9 +1,11 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
+import 'package:url_launcher/url_launcher.dart';
 
 import 'request_images.dart';
 import 'moeen_ui.dart';
@@ -68,6 +70,80 @@ class ProviderUnauthorizedException implements Exception {
   const ProviderUnauthorizedException();
 }
 
+class ProviderGeoPoint {
+  const ProviderGeoPoint({required this.latitude, required this.longitude});
+
+  final double latitude;
+  final double longitude;
+
+  factory ProviderGeoPoint.fromJson(Object? value) {
+    if (value is! Map<dynamic, dynamic>) throw const ProviderApiException();
+    final latitude = value['latitude'];
+    final longitude = value['longitude'];
+    if (latitude is! num || longitude is! num) {
+      throw const ProviderApiException();
+    }
+    final parsedLatitude = latitude.toDouble();
+    final parsedLongitude = longitude.toDouble();
+    if (!parsedLatitude.isFinite ||
+        !parsedLongitude.isFinite ||
+        parsedLatitude < -90 ||
+        parsedLatitude > 90 ||
+        parsedLongitude < -180 ||
+        parsedLongitude > 180) {
+      throw const ProviderApiException();
+    }
+    return ProviderGeoPoint(
+      latitude: parsedLatitude,
+      longitude: parsedLongitude,
+    );
+  }
+}
+
+class ProviderExactLocation {
+  const ProviderExactLocation({required this.point});
+
+  final ProviderGeoPoint point;
+
+  factory ProviderExactLocation.fromJson(Object? value) {
+    if (value is! Map<dynamic, dynamic>) throw const ProviderApiException();
+    return ProviderExactLocation(
+      point: ProviderGeoPoint.fromJson(value['point']),
+    );
+  }
+}
+
+class ProviderApproximateLocation {
+  const ProviderApproximateLocation({
+    required this.point,
+    required this.precisionKm,
+  });
+
+  final ProviderGeoPoint point;
+  final int precisionKm;
+
+  factory ProviderApproximateLocation.fromJson(Object? value) {
+    if (value is! Map<dynamic, dynamic>) throw const ProviderApiException();
+    final precisionKm = value['precisionKm'];
+    if (precisionKm is! int || precisionKm <= 0) {
+      throw const ProviderApiException();
+    }
+    return ProviderApproximateLocation(
+      point: ProviderGeoPoint.fromJson(value['point']),
+      precisionKm: precisionKm,
+    );
+  }
+}
+
+typedef ProviderExternalUriLauncher = Future<bool> Function(Uri uri);
+
+Uri providerExternalMapUri(ProviderGeoPoint point, {TargetPlatform? platform}) {
+  final coordinate = '${point.latitude},${point.longitude}';
+  return (platform ?? defaultTargetPlatform) == TargetPlatform.iOS
+      ? Uri(scheme: 'maps', queryParameters: {'q': coordinate})
+      : Uri.https('www.google.com', '/maps', {'q': coordinate});
+}
+
 class ProviderApiConfig {
   const ProviderApiConfig(this.baseUrl);
 
@@ -119,6 +195,8 @@ class ProviderJob {
     this.address,
     this.quote,
     this.customerPhone,
+    this.location,
+    this.approximateLocation,
   });
 
   final String id;
@@ -136,9 +214,14 @@ class ProviderJob {
   /// returns it for the authenticated assigned provider in an active
   /// lifecycle state; never synthesized or defaulted on the client.
   final String? customerPhone;
+  final ProviderExactLocation? location;
+  final ProviderApproximateLocation? approximateLocation;
 
   factory ProviderJob.fromJson(Map<String, dynamic> json) {
     final quote = json['quote'];
+    if (json['location'] != null && json['approximateLocation'] != null) {
+      throw const ProviderApiException();
+    }
     return ProviderJob(
       id: json['id'] as String,
       serviceId: json['serviceId'] as String,
@@ -150,6 +233,12 @@ class ProviderJob {
           ? ProviderQuote.fromJson(quote)
           : null,
       customerPhone: json['customerPhone'] as String?,
+      location: json['location'] == null
+          ? null
+          : ProviderExactLocation.fromJson(json['location']),
+      approximateLocation: json['approximateLocation'] == null
+          ? null
+          : ProviderApproximateLocation.fromJson(json['approximateLocation']),
     );
   }
 }
@@ -185,6 +274,7 @@ class ProviderOpportunity {
     this.address,
     this.details,
     this.images = const [],
+    this.approximateLocation,
   });
 
   final String requestId;
@@ -201,9 +291,13 @@ class ProviderOpportunity {
   final String? address;
   final String? details;
   final List<ProviderRequestImage> images;
+  final ProviderApproximateLocation? approximateLocation;
 
   factory ProviderOpportunity.fromJson(Map<String, dynamic> json) {
     final quote = json['myQuote'];
+    if (json['location'] != null && json['approximateLocation'] != null) {
+      throw const ProviderApiException();
+    }
     return ProviderOpportunity(
       requestId: json['requestId'] as String,
       serviceId: json['serviceId'] as String,
@@ -215,6 +309,9 @@ class ProviderOpportunity {
       address: json['address'] as String?,
       details: json['details'] as String?,
       images: ProviderRequestImage.listFromJson(json['images']),
+      approximateLocation: json['approximateLocation'] == null
+          ? null
+          : ProviderApproximateLocation.fromJson(json['approximateLocation']),
     );
   }
 }
@@ -570,13 +667,18 @@ class MoeenProviderApp extends StatefulWidget {
     HiddenOpportunitiesStore? hiddenStore,
     this.trackingRuntime,
     this.trackingPermissionGate,
+    ProviderExternalUriLauncher? externalUriLauncher,
   }) : _api = api ?? ProviderApi(),
        _sessionStore = sessionStore ?? SecureProviderSessionStore(),
-       _hiddenStore = hiddenStore ?? SecureHiddenOpportunitiesStore();
+       _hiddenStore = hiddenStore ?? SecureHiddenOpportunitiesStore(),
+       _externalUriLauncher =
+           externalUriLauncher ??
+           ((uri) => launchUrl(uri, mode: LaunchMode.externalApplication));
 
   final ProviderApi _api;
   final ProviderSessionStore _sessionStore;
   final HiddenOpportunitiesStore _hiddenStore;
+  final ProviderExternalUriLauncher _externalUriLauncher;
   final provider_tracking.ProviderTrackingRuntime? trackingRuntime;
   final provider_tracking.ProviderTrackingPermissionGate?
   trackingPermissionGate;
@@ -1458,6 +1560,42 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
     });
   }
 
+  Widget _buildApproximateLocation(ProviderApproximateLocation location) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Icon(
+          Icons.location_searching_rounded,
+          size: 18,
+          color: Color(0xFF0B6E69),
+        ),
+        const SizedBox(width: 6),
+        Expanded(
+          child: Text(
+            'موقع العميل تقريبي ضمن نطاق ~${location.precisionKm} كم',
+          ),
+        ),
+      ],
+    );
+  }
+
+  Future<void> _openExactLocation(ProviderGeoPoint point) async {
+    final uri = providerExternalMapUri(point);
+    try {
+      final launched = await widget._externalUriLauncher(uri);
+      if (!launched && mounted) {
+        _scaffoldMessengerKey.currentState?.showSnackBar(
+          const SnackBar(content: Text('تعذر فتح تطبيق الخرائط.')),
+        );
+      }
+    } catch (_) {
+      if (!mounted) return;
+      _scaffoldMessengerKey.currentState?.showSnackBar(
+        const SnackBar(content: Text('تعذر فتح تطبيق الخرائط.')),
+      );
+    }
+  }
+
   Widget _buildOpportunityCard(ProviderOpportunity opportunity) {
     final cardKey = _opportunityCardKeys.putIfAbsent(
       opportunity.requestId,
@@ -1516,6 +1654,10 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
                   ),
                 ),
               ),
+            ],
+            if (opportunity.approximateLocation != null) ...[
+              const SizedBox(height: 8),
+              _buildApproximateLocation(opportunity.approximateLocation!),
             ],
             if (opportunity.address != null) ...[
               const SizedBox(height: 8),
@@ -1610,6 +1752,18 @@ class _MoeenProviderAppState extends State<MoeenProviderApp> {
             if (job.address?.isNotEmpty ?? false) ...[
               const SizedBox(height: 4),
               Text(job.address!),
+            ],
+            if (job.location != null) ...[
+              const SizedBox(height: 8),
+              OutlinedButton.icon(
+                key: const ValueKey('open-customer-map'),
+                onPressed: () => _openExactLocation(job.location!.point),
+                icon: const Icon(Icons.map_outlined),
+                label: const Text('فتح موقع العميل في الخرائط'),
+              ),
+            ] else if (job.approximateLocation != null) ...[
+              const SizedBox(height: 8),
+              _buildApproximateLocation(job.approximateLocation!),
             ],
             if (job.details?.isNotEmpty ?? false) ...[
               const SizedBox(height: 4),

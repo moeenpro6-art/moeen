@@ -1011,4 +1011,84 @@ describe('AppController staff audit integration', () => {
       'The selected provider is not available; please choose another quote',
     );
   });
+
+  it('returns exact location only on the authenticated provider assigned-job endpoint', async () => {
+    const exactJob = {
+      id: 'MOE-1048',
+      serviceId: 'ac-cleaning',
+      address: 'حي الصفراء، بريدة',
+      timing: 'scheduled' as const,
+      status: 'assigned' as const,
+      location: {
+        point: { latitude: 26.359123, longitude: 43.981988 },
+        displayAddress: 'حي الصفراء، بريدة',
+        source: 'map_pin' as const,
+        confirmedAt: '2026-08-21T12:00:00.000Z',
+      },
+      createdAt: '2026-08-21T12:00:00.000Z',
+    };
+    const appService = {
+      getProviderServiceRequests: jest.fn().mockResolvedValue([exactJob]),
+    };
+    const providerAuthService = {
+      getCurrentProvider: jest.fn().mockResolvedValue({ id: 'provider-owner' }),
+    };
+    const controller = new AppController(
+      appService as unknown as AppService,
+      {} as StaffAuthService,
+      {} as StaffAuditService,
+      {} as CustomerAuthService,
+      providerAuthService as unknown as ProviderAuthService,
+    );
+
+    await expect(
+      controller.getMyProviderServiceRequests('Bearer provider-session'),
+    ).resolves.toEqual([exactJob]);
+    expect(providerAuthService.getCurrentProvider).toHaveBeenCalledWith(
+      'provider-session',
+    );
+    expect(appService.getProviderServiceRequests).toHaveBeenCalledWith(
+      'provider-owner',
+    );
+  });
+
+  it('returns approximate-only location on the authenticated provider opportunity endpoint', async () => {
+    const approximateOpportunity = {
+      requestId: 'MOE-1048',
+      serviceId: 'ac-cleaning',
+      timing: 'scheduled' as const,
+      opportunityStatus: 'invited' as const,
+      approximateLocation: {
+        point: { latitude: 26.4, longitude: 44 },
+        precisionKm: 10,
+      },
+    };
+    const appService = {
+      getProviderOpportunities: jest
+        .fn()
+        .mockResolvedValue([approximateOpportunity]),
+    };
+    const providerAuthService = {
+      getCurrentProvider: jest.fn().mockResolvedValue({ id: 'provider-owner' }),
+    };
+    const controller = new AppController(
+      appService as unknown as AppService,
+      {} as StaffAuthService,
+      {} as StaffAuditService,
+      {} as CustomerAuthService,
+      providerAuthService as unknown as ProviderAuthService,
+    );
+
+    const result = await controller.getMyProviderOpportunities(
+      'Bearer provider-session',
+    );
+
+    expect(result).toEqual([approximateOpportunity]);
+    expect(result[0]).not.toHaveProperty('location');
+    expect(result[0]).not.toHaveProperty('address');
+    expect(result[0]).not.toHaveProperty('providerId');
+    expect(appService.getProviderOpportunities).toHaveBeenCalledWith(
+      'provider-owner',
+    );
+  });
 });

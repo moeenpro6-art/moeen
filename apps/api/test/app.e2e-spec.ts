@@ -1501,10 +1501,11 @@ describe('AppController (e2e)', () => {
       .expect(200);
     const body = opportunities.body as Record<string, unknown>[];
     expect(body).toHaveLength(1);
-    // Phase 1 pre-quote contract: an invited provider receives the job details
-    // and image list needed to quote, but exact location and customer identity
-    // or contact data stay hidden.
+    // The invited owner receives only the coarse ~10 km location tier plus
+    // content needed to quote. The exact pin and customer identity/contact stay
+    // hidden.
     expect(Object.keys(body[0]).sort()).toEqual([
+      'approximateLocation',
       'details',
       'images',
       'opportunityStatus',
@@ -1513,6 +1514,10 @@ describe('AppController (e2e)', () => {
       'timing',
     ]);
     expect(body[0]).toMatchObject({
+      approximateLocation: {
+        point: { latitude: 26.4, longitude: 44 },
+        precisionKm: 10,
+      },
       details: 'معلومات حساسة للخصوصية',
       images: [],
     });

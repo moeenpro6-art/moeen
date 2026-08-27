@@ -644,7 +644,12 @@ describe('AppService', () => {
       opportunityStatus: 'quoted' as const,
       address: 'sensitive-address',
       details: 'details-needed-to-price',
-      location: { point: { latitude: 'sensitive', longitude: 'sensitive' } },
+      location: {
+        point: { latitude: 26.359123, longitude: 43.981988 },
+        displayAddress: 'sensitive-address',
+        source: 'map_pin' as const,
+        confirmedAt: '2026-08-21T12:00:00.000Z',
+      },
       requestStatus: 'pending_dispatch' as const,
       customerId: 'CUS-sensitive',
       customerPhone: '+966-sensitive',
@@ -676,6 +681,10 @@ describe('AppService', () => {
       opportunityStatus: opportunity.opportunityStatus,
       details: opportunity.details,
       images: [imageDto],
+      approximateLocation: {
+        point: { latitude: 26.4, longitude: 44 },
+        precisionKm: 10,
+      },
       myQuote: {
         id: opportunity.myQuote.id,
         providerId: opportunity.myQuote.providerId,
@@ -688,6 +697,8 @@ describe('AppService', () => {
     });
     expect(projected).not.toHaveProperty('address');
     expect(projected).not.toHaveProperty('location');
+    expect(JSON.stringify(projected)).not.toContain('26.359123');
+    expect(JSON.stringify(projected)).not.toContain('43.981988');
     expect(projected).not.toHaveProperty('customerId');
     expect(projected).not.toHaveProperty('customerPhone');
     expect(projected.myQuote).not.toHaveProperty('providerName');

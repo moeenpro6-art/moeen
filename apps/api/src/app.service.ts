@@ -193,6 +193,15 @@ export type ProviderOpportunity = {
   myQuote?: ServiceQuote;
   details?: string;
   images?: RequestImageDto[];
+  /**
+   * Coarse customer-area disclosure for the pre-quote tier, derived
+   * server-side from the exact confirmed point. Present ONLY while the
+   * authenticated provider owns an eligible (`invited`/`quoted`,
+   * request still pending dispatch) opportunity. The exact point,
+   * address, and customer identity/contact data are never part of this
+   * shape.
+   */
+  approximateLocation?: ProviderApproximateLocation;
 };
 
 /**
@@ -202,6 +211,8 @@ export type ProviderOpportunity = {
  */
 export type ProviderOpportunityAccess = ProviderOpportunity & {
   requestStatus?: ServiceRequestStatus;
+  /** Internal exact point used only to derive the public coarse projection. */
+  location?: Pick<ServiceLocation, 'point'>;
 };
 
 export type CustomerQuoteProviderSummary = {
@@ -264,7 +275,32 @@ export type ServiceRequest = CreateServiceRequest & {
   createdAt: string;
 };
 
-export type ProviderStatusTransitionResponseDto = ServiceRequest &
+type ProviderServiceRequestSummary = Pick<
+  ServiceRequest,
+  | 'id'
+  | 'serviceId'
+  | 'timing'
+  | 'status'
+  | 'assignedProvider'
+  | 'quote'
+  | 'payment'
+  | 'rating'
+  | 'ratingComment'
+  | 'createdAt'
+>;
+
+/**
+ * Provider-owned job projection. Active assignments use the full exact
+ * request shape; pre-assignment reads may carry only a coarse location; all
+ * other states use the redacted summary.
+ */
+export type ProviderServiceRequest =
+  | ServiceRequest
+  | (ProviderServiceRequestSummary & {
+      approximateLocation?: ProviderApproximateLocation;
+    });
+
+export type ProviderStatusTransitionResponseDto = ProviderServiceRequest &
   ProviderTrackingStatusResponseDto;
 
 const ACTIVE_PROVIDER_LOCATION_STATUSES = new Set<ServiceRequestStatus>([
@@ -274,19 +310,89 @@ const ACTIVE_PROVIDER_LOCATION_STATUSES = new Set<ServiceRequestStatus>([
 ]);
 
 /**
+ * Coarse customer-area disclosure for the pre-quote provider tier.
+ *
+ * Derived server-side from the exact confirmed point; the exact
+ * latitude/longitude never appears in this shape and it is never
+ * accepted from client input. Coordinates are rounded to one decimal
+ * place (roughly a 10 km bucket around Buraidah/Qassim), so the exact
+ * customer pin cannot be recovered from this projection.
+ */
+export type ProviderApproximateLocation = {
+  point: {
+    latitude: number;
+    longitude: number;
+  };
+  /** Approximate width of the disclosed coordinate bucket. */
+  precisionKm: 10;
+};
+
+// One decimal degree is roughly a 10 km bucket around Buraidah/Qassim.
+// This gives invited providers useful coarse area context without an exact pin.
+const APPROXIMATE_LOCATION_COORDINATE_PRECISION = 10;
+
+/**
+ * Strips the exact service point down to a coarse, non-recoverable
+ * representation. Always derived from the stored exact point and never
+ * from any client-supplied value.
+ */
+export function deriveProviderApproximateLocation(
+  location: Pick<ServiceLocation, 'point'>,
+): ProviderApproximateLocation {
+  const coarse = (coordinate: number): number =>
+    Math.round(coordinate * APPROXIMATE_LOCATION_COORDINATE_PRECISION) /
+    APPROXIMATE_LOCATION_COORDINATE_PRECISION;
+  return {
+    point: {
+      latitude: coarse(location.point.latitude),
+      longitude: coarse(location.point.longitude),
+    },
+    precisionKm: 10,
+  };
+}
+
+/**
+ * The three provider location tiers, enforced in one place:
+ *  - active assignment statuses -> exact `location` (unchanged);
+ *  - pre-quote bidder/invited statuses -> coarse `approximateLocation`
+ *    only (never the exact point);
+ *  - terminal/other statuses -> no location at all (unchanged).
+ */
+const BIDDER_PROVIDER_LOCATION_STATUSES = new Set<ServiceRequestStatus>([
+  'pending_dispatch',
+]);
+
+/**
  * Explicit provider projection for assigned jobs. Exact address, details,
  * customer contact, images and confirmed coordinates exist only while the
- * assignment is active; terminal history is rebuilt from a safe whitelist.
+ * assignment is active; pre-quote history is reduced to a coarse
+ * approximate location; terminal history is rebuilt from a safe whitelist.
  */
 export function projectServiceRequestForProvider(
   request: ServiceRequest,
-):
-  | ServiceRequest
-  | Omit<
-      ServiceRequest,
-      'address' | 'details' | 'images' | 'customerPhone' | 'location'
-    > {
+): ProviderServiceRequest {
   if (ACTIVE_PROVIDER_LOCATION_STATUSES.has(request.status)) return request;
+  if (BIDDER_PROVIDER_LOCATION_STATUSES.has(request.status)) {
+    return {
+      id: request.id,
+      serviceId: request.serviceId,
+      timing: request.timing,
+      status: request.status,
+      assignedProvider: request.assignedProvider,
+      quote: request.quote,
+      payment: request.payment,
+      rating: request.rating,
+      ratingComment: request.ratingComment,
+      createdAt: request.createdAt,
+      ...(request.location
+        ? {
+            approximateLocation: deriveProviderApproximateLocation(
+              request.location,
+            ),
+          }
+        : {}),
+    };
+  }
   return {
     id: request.id,
     serviceId: request.serviceId,
@@ -366,6 +472,7 @@ export interface ServiceRequestStore {
     requestId: string,
     providerId: string,
   ): Promise<ProviderTrackingAuthorityRecord | undefined>;
+
   findRequestEvents(requestId: string): Promise<ServiceRequestEvent[]>;
   findCustomerBySession(token: string): Promise<Customer | undefined>;
   findProviderByAccessCode(
@@ -902,7 +1009,7 @@ export class AppService {
 
   async getProviderServiceRequests(
     providerId: string,
-  ): Promise<ServiceRequest[]> {
+  ): Promise<ProviderServiceRequest[]> {
     const requests =
       await this.serviceRequestStore.findByProviderId(providerId);
     const active = requests.filter((request) =>
@@ -914,7 +1021,7 @@ export class AppService {
     );
     return requests.map((request) =>
       projectServiceRequestForProvider(activeById.get(request.id) ?? request),
-    ) as ServiceRequest[];
+    );
   }
 
   async updateProviderServiceRequestStatus(
@@ -930,9 +1037,7 @@ export class AppService {
       providerId,
       status,
     );
-    const projected = projectServiceRequestForProvider(
-      updated,
-    ) as ServiceRequest;
+    const projected = projectServiceRequestForProvider(updated);
     const statusResponse = await this.getProviderTrackingStatus(
       providerId,
       requestId,
@@ -1197,9 +1302,10 @@ export class AppService {
 
   /**
    * Fixed whitelist projection for provider opportunities. Eligible owners
-   * receive description/images needed to quote. Exact address/coordinates,
-   * customer identity/contact, auth/session data, and storage metadata are
-   * never copied from the store projection.
+   * receive description/images needed to quote and a coarse approximate
+   * location. Exact address/coordinates, customer identity/contact,
+   * auth/session data, and storage metadata are never copied from the
+   * store projection.
    */
   private toProviderOpportunityDto(
     opportunity: ProviderOpportunityAccess,
@@ -1229,10 +1335,14 @@ export class AppService {
     if (!this.isEligiblePreQuoteOpportunity(opportunity)) {
       return base;
     }
+    const approximateLocation = opportunity.location
+      ? deriveProviderApproximateLocation(opportunity.location)
+      : undefined;
     return {
       ...base,
       details: opportunity.details,
       images: signedImagesByRequest.get(opportunity.requestId) ?? [],
+      ...(approximateLocation ? { approximateLocation } : {}),
     };
   }
 
