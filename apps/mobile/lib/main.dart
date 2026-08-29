@@ -9,6 +9,8 @@ import 'customer_session.dart';
 import 'customer_notifications.dart';
 import 'request_images.dart';
 import 'service_location.dart';
+import 'service_location_form_section.dart';
+import 'service_location_picker_page.dart';
 import 'moeen_ui.dart';
 
 void main() {
@@ -360,6 +362,7 @@ class BookingPage extends StatefulWidget {
     this.apiConfig,
     this.serviceLocationMode,
     this.locationPlatform,
+    this.serviceLocationMapSurfaceBuilder,
   });
 
   final ServiceOption service;
@@ -379,6 +382,9 @@ class BookingPage extends StatefulWidget {
 
   /// Test seam: prevents widget tests from invoking platform location APIs.
   final CustomerLocationPlatform? locationPlatform;
+
+  /// Test seam: replaces the native map surface in widget tests.
+  final ServiceLocationMapSurfaceBuilder? serviceLocationMapSurfaceBuilder;
 
   @override
   State<BookingPage> createState() => _BookingPageState();
@@ -417,14 +423,32 @@ class _BookingPageState extends State<BookingPage> {
   @override
   void initState() {
     super.initState();
-    _serviceLocationController = ServiceLocationController(
-      platform: widget.locationPlatform ??
-          const GeolocatorCustomerLocationPlatform(),
-    );
+    _serviceLocationController = ServiceLocationController();
     _addressController.addListener(_onAddressChanged);
   }
 
   void _onAddressChanged() {
+    _serviceLocationController.updateDisplayAddress(_addressController.text);
+  }
+
+  Future<void> _openServiceLocationPicker() async {
+    final current = _serviceLocationController.selection;
+    final result = await Navigator.of(context).push(
+      MaterialPageRoute<ServiceLocationPickerResult>(
+        builder: (_) => ServiceLocationPickerPage(
+          initialPoint: current?.point,
+          initialSource: current?.source,
+          locationPlatform:
+              widget.locationPlatform ??
+              const GeolocatorCustomerLocationPlatform(),
+          mapSurfaceBuilder:
+              widget.serviceLocationMapSurfaceBuilder ??
+              buildMapboxServiceLocationSurface,
+        ),
+      ),
+    );
+    if (!mounted || result == null) return;
+    _serviceLocationController.applyConfirmedPoint(result.point, result.source);
     _serviceLocationController.updateDisplayAddress(_addressController.text);
   }
 
@@ -724,24 +748,22 @@ class _BookingPageState extends State<BookingPage> {
                       'الحي، الشارع، رقم المبنى أو معلم قريب',
                       Icons.location_on_outlined,
                     ),
-                    validator: (value) => value == null || value.trim().isEmpty
-                        ? 'أدخل عنوان الخدمة'
-                        : null,
+                    validator: (value) {
+                      final address = value?.trim() ?? '';
+                      if (address.isEmpty) return 'أدخل عنوان الخدمة';
+                      if (address.length < 3) {
+                        return 'أدخل 3 أحرف على الأقل لعنوان الخدمة';
+                      }
+                      if (address.length > 240) {
+                        return 'عنوان الخدمة طويل جداً (الحد الأقصى 240 حرفاً)';
+                      }
+                      return null;
+                    },
                   ),
-                  ServiceLocationPicker(
+                  ServiceLocationFormSection(
                     controller: _serviceLocationController,
                     mode: _serviceLocationMode,
-                    addressController: _addressController,
-                    onConfirmWithoutAddress: () {
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        const SnackBar(
-                          content: Text(
-                            'أدخل عنوان الخدمة أو معلماً قريباً ثم أكّد الموقع.',
-                          ),
-                          backgroundColor: Color(0xFF9B2C2C),
-                        ),
-                      );
-                    },
+                    onOpenPicker: _openServiceLocationPicker,
                   ),
                   const SizedBox(height: 24),
                   Text(
