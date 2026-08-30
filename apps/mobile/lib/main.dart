@@ -7,6 +7,7 @@ import 'package:http/http.dart' as http;
 import 'api_config.dart';
 import 'customer_session.dart';
 import 'customer_notifications.dart';
+import 'customer_provider_tracking.dart';
 import 'request_images.dart';
 import 'service_location.dart';
 import 'service_location_form_section.dart';
@@ -147,6 +148,7 @@ class _MoeenAppState extends State<MoeenApp> {
       title: 'معين',
       debugShowCheckedModeBanner: false,
       navigatorKey: _navigatorKey,
+      navigatorObservers: [customerProviderTrackingRouteObserver],
       theme: MoeenTheme.light(),
       builder: (context, child) => Directionality(
         textDirection: TextDirection.rtl,
@@ -1244,6 +1246,7 @@ class CustomerRequest {
     this.rating,
     this.ratingComment,
     this.images = const [],
+    this.serviceLocation,
   });
 
   final String id;
@@ -1256,6 +1259,7 @@ class CustomerRequest {
   final int? rating;
   final String? ratingComment;
   final List<RequestImage> images;
+  final ServiceLocationPoint? serviceLocation;
 
   factory CustomerRequest.fromJson(Map<String, dynamic> json) =>
       CustomerRequest(
@@ -1279,7 +1283,26 @@ class CustomerRequest {
         rating: json['rating'] as int?,
         ratingComment: json['ratingComment'] as String?,
         images: RequestImage.listFromJson(json['images']),
+        serviceLocation: _serviceLocationPointFromJson(
+          json['location'] as Map<String, dynamic>?,
+        ),
       );
+}
+
+ServiceLocationPoint? _serviceLocationPointFromJson(
+  Map<String, dynamic>? json,
+) {
+  if (json == null) return null;
+  final point = json['point'];
+  if (point is! Map<String, dynamic>) return null;
+  final latitude = point['latitude'];
+  final longitude = point['longitude'];
+  if (latitude is! num || longitude is! num) return null;
+  final candidate = ServiceLocationPoint(
+    latitude: latitude.toDouble(),
+    longitude: longitude.toDouble(),
+  );
+  return candidate.isValid ? candidate : null;
 }
 
 Future<bool> ratingWasPersistedAfterAmbiguousFailure({
@@ -1480,6 +1503,15 @@ class CustomerRequestDetailsPage extends StatelessWidget {
               title: 'صور الطلب',
               subtitle: 'اضغط على أي صورة لمشاهدتها بالحجم الكامل.',
               child: RequestImageThumbnails(images: request.images),
+            ),
+          ],
+          if (customerProviderTrackingAllowedForStatus(request.status)) ...[
+            const SizedBox(height: MoeenSpacing.md),
+            CustomerProviderTrackingPanel(
+              requestId: request.id,
+              serviceLocation: request.serviceLocation,
+              sessionManager: customerSessionManager,
+              apiConfig: moeenApi,
             ),
           ],
           const SizedBox(height: MoeenSpacing.md),

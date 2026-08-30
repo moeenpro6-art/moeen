@@ -9,6 +9,8 @@ import {
 import { staffCapabilities } from './auth/roles';
 import { logoutStaffAction } from './logout/action';
 import RequestImagesGallery from './request-images-gallery';
+import ProviderTrackingPanel from './provider-tracking-panel';
+import { ProviderTrackingSlot } from './provider-tracking-slot';
 import {
   isApiServiceRequest,
   isApiServiceRequestEvent,
@@ -701,6 +703,18 @@ export default async function Home({ searchParams }: HomeProps) {
                   {job.images && job.images.length > 0 && (
                     <RequestImagesGallery images={job.images} />
                   )}
+                  <ProviderTrackingSlot
+                    role={staff.role}
+                    status={job.statusKey}
+                    requestId={job.id}
+                    serviceLocation={job.serviceLocation}
+                    renderPanel={(requestId, serviceLocation) => (
+                      <ProviderTrackingPanel
+                        requestId={requestId}
+                        serviceLocation={serviceLocation}
+                      />
+                    )}
+                  />
                   {job.quote && (
                     <div className={styles.quote}>
                       <strong>
