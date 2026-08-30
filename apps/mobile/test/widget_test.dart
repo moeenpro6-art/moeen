@@ -248,6 +248,26 @@ void main() {
   );
 
   test(
+    'CustomerRequest.fromJson keeps the confirmed service point for tracking',
+    () {
+      final request = CustomerRequest.fromJson({
+        'id': 'MOE-2000',
+        'serviceId': 'plumbing',
+        'status': 'on_the_way',
+        'location': {
+          'point': {'latitude': 26.359123, 'longitude': 43.981988},
+          'displayAddress': 'حي الصفراء، بريدة',
+          'source': 'map_pin',
+          'confirmedAt': '2026-08-30T10:00:00.000Z',
+        },
+      });
+
+      expect(request.serviceLocation?.latitude, 26.359123);
+      expect(request.serviceLocation?.longitude, 43.981988);
+    },
+  );
+
+  test(
     'CustomerRequest.fromJson parses the quotes array with mixed statuses',
     () {
       final request = CustomerRequest.fromJson({

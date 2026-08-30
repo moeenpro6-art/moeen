@@ -1152,3 +1152,92 @@
   color: #64748b;
   background: #f8fafc;
 }
+
+.providerTracking {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fbfdfd;
+  align-self: start;
+}
+
+.providerTracking strong {
+  color: #17312e;
+  font-size: 13px;
+}
+
+.trackingHint {
+  color: #64748b;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.trackingFresh {
+  color: #08735f;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.trackingStale {
+  color: #9a6700;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.trackingOffline {
+  color: #64748b;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.trackingArrived {
+  color: #08735f;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.trackingMap {
+  position: relative;
+  width: min(100%, 420px);
+  min-height: 180px;
+  overflow: hidden;
+  border: 1px solid #cbd5e1;
+  border-radius: 10px;
+  background:
+    linear-gradient(135deg, rgb(15 118 110 / 8%) 25%, transparent 25%) 0 0 / 32px 32px,
+    linear-gradient(315deg, rgb(37 99 235 / 8%) 25%, transparent 25%) 0 0 / 32px 32px,
+    #f8fafc;
+}
+
+.trackingMarker {
+  position: absolute;
+  width: 18px;
+  height: 18px;
+  border: 3px solid #fff;
+  border-radius: 999px;
+  box-shadow: 0 2px 7px rgb(15 23 42 / 28%);
+  transform: translate(50%, -50%);
+}
+
+.providerMarker {
+  background: #2563eb;
+}
+
+.serviceMarker {
+  background: #0b6e69;
+}
+
+.trackingMapLegend {
+  position: absolute;
+  inset-inline-start: 8px;
+  bottom: 8px;
+  padding: 5px 8px;
+  border-radius: 7px;
+  color: #334155;
+  background: rgb(255 255 255 / 92%);
+  font-size: 11px;
+  font-weight: 700;
+}

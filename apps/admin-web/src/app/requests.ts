@@ -61,6 +61,12 @@ export type ApiServiceRequest = {
   details?: string;
   timing: string;
   status: string;
+  location?: {
+    point: { latitude: number; longitude: number };
+    displayAddress: string;
+    source: string;
+    confirmedAt: string;
+  };
   assignedProvider?: { name: string };
   quote?: ApiServiceQuote;
   opportunities?: ApiServiceOpportunitySummary;
@@ -79,7 +85,9 @@ export type DashboardRequest = {
   service: string;
   area: string;
   status: string;
+  statusKey: string;
   provider: string;
+  serviceLocation?: { latitude: number; longitude: number };
   quote?: DashboardQuote;
   opportunities?: ApiServiceOpportunitySummary;
   payment?: ApiServicePayment;
@@ -140,7 +148,9 @@ export function toDashboardRequest(request: ApiServiceRequest): DashboardRequest
     service: serviceNames[request.serviceId] ?? request.serviceId,
     area: request.address,
     status: statuses[request.status] ?? request.status,
+    statusKey: request.status,
     provider: request.assignedProvider?.name ?? 'لم يُعيّن بعد',
+    ...(request.location?.point ? { serviceLocation: request.location.point } : {}),
     ...(request.quote ? { quote: request.quote } : {}),
     ...(request.opportunities
       ? { opportunities: request.opportunities }
